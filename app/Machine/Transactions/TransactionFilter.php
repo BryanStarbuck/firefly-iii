@@ -133,7 +133,7 @@ final class TransactionFilter
                 ['unknown' => $unknown, 'accepted' => $accepted],
             );
         }
-        foreach (['without_category', 'without_budget', 'without_tag', 'reconciled'] as $flag) {
+        foreach (self::FLAGS as $flag) {
             if (isset($raw[$flag]) && is_string($raw[$flag])) {
                 $v = strtolower(trim($raw[$flag]));
                 $raw[$flag] = in_array($v, ['true', '1', 'yes', 'on'], true) ? true : (in_array($v, ['false', '0', 'no', 'off'], true) ? false : $raw[$flag]);
@@ -159,13 +159,39 @@ final class TransactionFilter
      */
     public static function isEmpty(array $f): bool
     {
-        foreach ($f as $value) {
+        foreach ($f as $field => $value) {
+            if (in_array($field, self::FLAGS, true)) {
+                if (self::flag($f, $field)) {
+                    return false;
+                }
+
+                continue;
+            }
             if (null !== $value && false !== $value && [] !== $value && '' !== $value) {
                 return false;
             }
         }
 
         return true;
+    }
+
+    /** The boolean filter fields. */
+    public const array FLAGS = ['without_category', 'without_budget', 'without_tag', 'reconciled'];
+
+    /**
+     * A flag as given — true/false, 1/0, "1"/"0", "true"/"false" (Laravel's boolean rule accepts
+     * all of these, and a "1" the plan reads as "not true" is a filter silently dropped, which on a
+     * bulk write is a selection silently WIDENED to everything).
+     *
+     * @param array<string, mixed> $f
+     */
+    public static function flag(array $f, string $field): bool
+    {
+        if (!array_key_exists($field, $f) || null === $f[$field]) {
+            return false;
+        }
+
+        return true === filter_var($f[$field], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
     }
 
     /**
@@ -200,7 +226,7 @@ final class TransactionFilter
         // type — and "without a budget" means withdrawals unless a type says otherwise:
         // budgets only ever apply to withdrawals in Firefly.
         $type  = $f['type'] ?? null;
-        if (null === $type && true === ($f['without_budget'] ?? false)) {
+        if (null === $type && self::flag($f, 'without_budget')) {
             $type = 'withdrawal';
         }
         $types = null === $type ? self::DEFAULT_TYPES : self::TYPES[$type];
@@ -229,7 +255,7 @@ final class TransactionFilter
 
         // category
         $category = self::one($f, 'category', Category::class, 'name', $resolve);
-        if (null !== $category && true === ($f['without_category'] ?? false)) {
+        if (null !== $category && self::flag($f, 'without_category')) {
             throw MachineException::invalid('category and without_category contradict each other.', 'Pass either a category or without_category=true');
         }
         if (null !== $category) {
@@ -237,14 +263,14 @@ final class TransactionFilter
             $collector->setCategory($category);
             $echo['category'] = ['id' => (string) $category->id, 'name' => $category->name];
         }
-        if (true === ($f['without_category'] ?? false)) {
+        if (self::flag($f, 'without_category')) {
             $collector->withoutCategory();
             $echo['without_category'] = true;
         }
 
         // budget
         $budget   = self::one($f, 'budget', Budget::class, 'name', $resolve);
-        if (null !== $budget && true === ($f['without_budget'] ?? false)) {
+        if (null !== $budget && self::flag($f, 'without_budget')) {
             throw MachineException::invalid('budget and without_budget contradict each other.', 'Pass either a budget or without_budget=true');
         }
         if (null !== $budget) {
@@ -252,14 +278,14 @@ final class TransactionFilter
             $collector->setBudget($budget);
             $echo['budget'] = ['id' => (string) $budget->id, 'name' => $budget->name];
         }
-        if (true === ($f['without_budget'] ?? false)) {
+        if (self::flag($f, 'without_budget')) {
             $collector->withoutBudget();
             $echo['without_budget'] = true;
         }
 
         // tag
         $tagRef   = $f['tag'] ?? null;
-        if (null !== $tagRef && '' !== $tagRef && true === ($f['without_tag'] ?? false)) {
+        if (null !== $tagRef && '' !== $tagRef && self::flag($f, 'without_tag')) {
             throw MachineException::invalid('tag and without_tag contradict each other.', 'Pass either a tag or without_tag=true');
         }
         if (null !== $tagRef && '' !== $tagRef) {
@@ -268,7 +294,7 @@ final class TransactionFilter
             $collector->setTag($tag);
             $echo['tag'] = ['id' => (string) $tag->id, 'tag' => $tag->tag];
         }
-        if (true === ($f['without_tag'] ?? false)) {
+        if (self::flag($f, 'without_tag')) {
             $collector->withoutTags();
             $echo['without_tag'] = true;
         }
@@ -310,8 +336,8 @@ final class TransactionFilter
 
         // reconciled
         if (array_key_exists('reconciled', $f) && null !== $f['reconciled']) {
-            true === (bool) $f['reconciled'] ? $collector->isReconciled() : $collector->isNotReconciled();
-            $echo['reconciled'] = (bool) $f['reconciled'];
+            self::flag($f, 'reconciled') ? $collector->isReconciled() : $collector->isNotReconciled();
+            $echo['reconciled'] = self::flag($f, 'reconciled');
         }
 
         // free text in the description (every word must appear)

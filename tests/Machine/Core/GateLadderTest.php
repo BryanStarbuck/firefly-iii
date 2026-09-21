@@ -161,12 +161,13 @@ final class GateLadderTest extends MachineTestCase
         $this->assertStringContainsString('code=write_disabled', $audit);
     }
 
-    public function testWriteWithTheTierOnReachesThePlannedHandler(): void
+    public function testWriteWithTheTierOnReachesTheHandler(): void
     {
         $this->operatorUser();
         $this->enableWrites();
-        $env = $this->assertPlaneError($this->machine('POST', '/transactions', ['transactions' => []]), 503, 'not_ready');
-        $this->assertSame('P3', $env['error']['details']['phase']);
+        // The tier gate passes and the live handler's own validation answers (gate 5), not the tier gate (gate 4).
+        $env = $this->assertPlaneError($this->machine('POST', '/transactions', ['transactions' => []]), 400, 'invalid_input');
+        $this->assertArrayHasKey('transactions', $env['error']['details']['fields']);
     }
 
     public function testAdminWithOnlyTheWriteTierIsForbidden(): void
@@ -184,8 +185,10 @@ final class GateLadderTest extends MachineTestCase
         $this->enableAdmin();
         $env = $this->assertPlaneError($this->machine('POST', '/admin/cron', headers: ['X-Firefly-Client' => 'mcp']), 403, 'forbidden');
         $this->assertStringContainsString('MCP', $env['error']['message']);
-        // the same call from ffx reaches the (planned) handler
-        $this->assertPlaneError($this->machine('POST', '/admin/cron', headers: ['X-Firefly-Client' => 'ffx']), 503, 'not_ready');
+        // the same call from ffx reaches the live handler (a dry run by default — apis.mdx §7.2)
+        $env = $this->envelope($this->machine('POST', '/admin/cron', headers: ['X-Firefly-Client' => 'ffx']));
+        $this->assertTrue($env['ok']);
+        $this->assertTrue($env['data']['dry_run']);
     }
 
     public function testEveryResponseIsNoStoreVaryOriginAndHasNoCorsGrant(): void

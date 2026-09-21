@@ -75,7 +75,7 @@ final class Converter
 
         /** @var TransactionJournal $journal */
         foreach ($group->transactionJournals()->with(['transactionType', 'transactions.account'])->get() as $journal) {
-            self::convertJournal($journal, $destinationType, self::sides($journal, $toType, $given), $user, $userGroup);
+            self::convertJournal($journal, $destinationType, self::sides($journal, $toType, $given, $userGroup), $user, $userGroup);
             ++$count;
         }
 
@@ -108,7 +108,7 @@ final class Converter
      *
      * @return array{source_id: null|int, source_name: null|string, destination_id: null|int, destination_name: null|string}
      */
-    private static function sides(TransactionJournal $journal, string $toType, array $given): array
+    private static function sides(TransactionJournal $journal, string $toType, array $given, UserGroup $userGroup): array
     {
         /** @var null|Transaction $out */
         $out     = $journal->transactions->first(static fn (Transaction $t): bool => -1 === bccomp((string) $t->amount, '0'));
@@ -143,6 +143,18 @@ final class Converter
         if ($noDest) {
             $sides['destination_id']   = isset($defaults['destination_id']) ? (int) $defaults['destination_id'] : null;
             $sides['destination_name'] = $defaults['destination_name'] ?? null;
+        }
+        // a name the caller gave resolves like every name on the plane (§8, §14.4): a unique
+        // case-insensitive match is that account, an ambiguous one is refused with the candidates
+        foreach (['source', 'destination'] as $side) {
+            if (null !== $sides[$side.'_id'] || null === $sides[$side.'_name'] || null === ($given[$side.'_name'] ?? null)) {
+                continue;
+            }
+            $found = SplitInput::accountByName($side, $toType, $sides[$side.'_name'], $userGroup, $side.'_name');
+            if ($found instanceof Account) {
+                $sides[$side.'_id']   = (int) $found->id;
+                $sides[$side.'_name'] = null;
+            }
         }
         if (null === $sides['source_id'] && null === $sides['source_name']) {
             throw MachineException::invalid(

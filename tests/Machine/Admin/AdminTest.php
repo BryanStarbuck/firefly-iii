@@ -125,17 +125,30 @@ final class AdminTest extends MachineTestCase
         }
     }
 
-    public function testCronRunsAndUndoRefusesIt(): void
+    public function testCronIsADryRunFirstAndUndoRefusesIt(): void
     {
-        $env = $this->envelope($this->machine('POST', '/admin/cron', ['date' => '2026-09-21']));
+        // §7.1 (LOCKED): cron creates ledger rows (recurring transactions, budget limits), so it
+        // previews first and needs the token — like every write that changes a transaction
+        $plan = $this->envelope($this->machine('POST', '/admin/cron', ['date' => '2026-09-21']));
+        $this->assertTrue($plan['ok'], (string) json_encode($plan));
+        $this->assertTrue($plan['data']['dry_run'], 'the dry run is the default');
+        $this->assertArrayHasKey('recurring_transactions', $plan['data']['jobs']);
+        $this->assertArrayHasKey('auto_budgets', $plan['data']['jobs']);
+        $this->assertTrue($plan['data']['jobs']['recurring_transactions']['fired'], 'the plan ran the job for real, rolled back');
+        $this->assertSame('2026-09-21', $plan['data']['date']);
+        $this->assertMatchesRegularExpression('/^cf_[0-9a-f]{32}$/', $plan['data']['confirm_token']);
+        $this->assertSame(0, DB::table('machine_operations')->count(), 'a plan is not an operation');
+        $this->assertNull(AppConfiguration::getFresh('last_rt_job_'.$this->user->id), 'the dry run\'s "last run" stamp was rolled back');
+        $this->assertPlaneError($this->machine('POST', '/admin/cron', ['date' => '2026-09-21', 'dry_run' => false]), 403, 'forbidden');
+
+        $env = $this->envelope($this->machine('POST', '/admin/cron', ['date' => '2026-09-21', 'dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
         $this->assertTrue($env['ok'], (string) json_encode($env));
-        $this->assertFalse($env['data']['dry_run'], 'cron has no dry run');
-        $this->assertArrayHasKey('recurring_transactions', $env['data']['jobs']);
-        $this->assertArrayHasKey('auto_budgets', $env['data']['jobs']);
-        $this->assertSame('2026-09-21', $env['data']['date']);
+        $this->assertFalse($env['data']['dry_run']);
+        $this->assertTrue($env['data']['jobs']['recurring_transactions']['fired'], 'the rolled-back plan did not stop the apply from firing');
         $this->assertIsInt($env['data']['operation_id']);
+        $this->assertNotNull(AppConfiguration::getFresh('last_rt_job_'.$this->user->id), 'the apply stamped the run');
         $this->assertPlaneError($this->machine('POST', '/admin/cron', ['date' => 'tomorrow']), 400, 'invalid_input');
-        $this->assertPlaneError($this->machine('POST', '/admin/cron', ['dry_run' => true]), 400, 'invalid_input');
+        $this->assertPlaneError($this->machine('POST', '/admin/cron', ['force' => 'maybe']), 400, 'invalid_input');
 
         $undo = $this->envelope($this->machine('GET', '/undo/last'));
         $this->assertSame('POST /admin/cron', $undo['data']['route']);
@@ -159,6 +172,49 @@ final class AdminTest extends MachineTestCase
         $apply = $this->envelope($this->machine('POST', '/admin/correct-database', ['dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
         $this->assertTrue($apply['ok'], (string) json_encode($apply));
         $this->assertFalse($apply['data']['dry_run']);
+    }
+
+    /**
+     * Regression: "changed" was counted from the correctors' chatter, so "[i] Done recalculating…"
+     * on a clean ledger counted as a correction (and marked the operation irreversible). What a
+     * corrector changed is measured on the tables it touched.
+     */
+    public function testCorrectDatabaseCountsTablesThatMovedNotChatter(): void
+    {
+        $plan  = $this->envelope($this->machine('POST', '/admin/correct-database'));
+        $this->assertTrue($plan['ok'], (string) json_encode($plan));
+        $byCommand = array_column($plan['data']['correctors'], null, 'command');
+        $talker    = $byCommand['correction:recalculate-pc-amounts'];
+        $this->assertNotEmpty($talker['lines'], 'this corrector always says something');
+        $this->assertSame(0, $talker['changed'], 'saying something is not changing something');
+        $this->assertSame([], $talker['changed_tables']);
+        $sum = 0;
+        foreach ($plan['data']['correctors'] as $corrector) {
+            $this->assertSame(count($corrector['changed_tables']), $corrector['changed']);
+            $sum += $corrector['changed'];
+        }
+        $this->assertSame($sum, $plan['data']['corrected']);
+        $this->assertSame($sum, $plan['data']['change_count'], 'the ceiling counts tables that moved');
+        $this->assertSame(['corrected' => $sum], $plan['data']['changes']);
+        $this->assertIsArray($plan['data']['changed_tables']);
+    }
+
+    /** §7.2: a cron plan holds every outside effect — no mail, no notification, no queued job, no exchange-rate download. */
+    public function testACronPlanSendsNothing(): void
+    {
+        AppConfiguration::set('enable_external_rates', true);
+        $plan = $this->envelope($this->machine('POST', '/admin/cron', ['force' => true]));
+        $this->assertTrue($plan['ok'], (string) json_encode($plan));
+        $this->assertTrue($plan['data']['dry_run']);
+        $this->assertFalse($plan['data']['jobs']['exchange_rates']['fired'], 'the download is skipped in the plan');
+        $this->assertStringContainsString('Skipped in the dry run', $plan['data']['jobs']['exchange_rates']['message']);
+        $this->assertSame(0, $plan['data']['would_fire_webhooks']);
+        $this->assertSame(0, $plan['data']['held']['mail']);
+        $this->assertSame(0, $plan['data']['held']['notifications']);
+        $this->assertIsInt($plan['data']['held']['jobs'], 'the queued jobs the recorder caught are reported, not run');
+        $this->assertSame(0, DB::table('machine_operations')->count());
+        $this->assertSame(0, $plan['data']['change_count'], 'nothing is due on an empty ledger');
+        $this->assertSame([], (array) $plan['data']['created']);
     }
 
     public function testDestroyCountsFirstThenDestroysAndCannotBeUndone(): void
@@ -226,7 +282,13 @@ final class AdminTest extends MachineTestCase
 
         $submit = $this->envelope($this->machine('POST', '/webhooks/'.$id.'/submit'));
         $this->assertTrue($submit['ok'], (string) json_encode($submit));
+        $this->assertTrue($submit['data']['dry_run'], 'a submit is an outbound call: it previews first');
         $this->assertSame(0, $submit['data']['queued']);
+        $this->assertSame(0, $submit['data']['would_fire_webhooks']);
+        $this->assertPlaneError($this->machine('POST', '/webhooks/'.$id.'/submit', ['dry_run' => false]), 403, 'forbidden');
+        $sent = $this->envelope($this->machine('POST', '/webhooks/'.$id.'/submit', ['dry_run' => false, 'confirm_token' => $submit['data']['confirm_token']]));
+        $this->assertTrue($sent['ok'], (string) json_encode($sent));
+        $this->assertFalse($sent['data']['dry_run']);
 
         $del  = $this->envelope($this->machine('DELETE', '/webhooks/'.$id));
         $this->assertTrue($del['data']['dry_run']);
@@ -235,5 +297,29 @@ final class AdminTest extends MachineTestCase
         $this->assertSame(0, Webhook::query()->count());
         $again = $this->envelope($this->machine('DELETE', '/webhooks/'.$id));
         $this->assertSame(0, $again['data']['deleted'], 'a DELETE of something already gone is ok with deleted: 0');
+    }
+
+    /**
+     * Regression: a webhook URL without a host ("javascript:alert(1)", "http://") reached Firefly's
+     * IsValidWebhookUrl, whose host lookup threw a TypeError — answered as `internal` (500)
+     * instead of invalid_input naming the field. The url rule now bails before it.
+     */
+    public function testAMalformedWebhookUrlIsInvalidInputNotInternal(): void
+    {
+        AppConfiguration::set('allow_webhooks', true);
+        $body = ['title' => 'Bad', 'triggers' => ['STORE_TRANSACTION'], 'responses' => ['TRANSACTIONS'], 'deliveries' => ['JSON']];
+        foreach (['javascript:alert(1)', 'http://', 'not a url', 'gopher://127.0.0.1/x', ''] as $url) {
+            $env = $this->assertPlaneError($this->machine('POST', '/webhooks', $body + ['url' => $url]), 400, 'invalid_input');
+            $this->assertArrayHasKey('url', $env['error']['details']['fields'], $url);
+        }
+        $this->assertPlaneError($this->machine('POST', '/webhooks', $body + ['url' => 'http://127.0.0.1:9/x', 'active' => 'maybe']), 400, 'invalid_input');
+        $this->assertSame(0, Webhook::query()->count());
+
+        $plan = $this->envelope($this->machine('POST', '/webhooks', $body + ['url' => 'http://127.0.0.1:9/x']));
+        $this->assertTrue($plan['ok'], (string) json_encode($plan));
+        $made = $this->envelope($this->machine('POST', '/webhooks', $body + ['url' => 'http://127.0.0.1:9/x', 'dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
+        $this->assertTrue($made['ok']);
+        $env  = $this->assertPlaneError($this->machine('PUT', '/webhooks/'.$made['data']['webhook']['id'], ['url' => 'javascript:alert(1)']), 400, 'invalid_input');
+        $this->assertArrayHasKey('url', $env['error']['details']['fields']);
     }
 }

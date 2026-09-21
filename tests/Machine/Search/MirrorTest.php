@@ -126,6 +126,35 @@ final class MirrorTest extends MachineTestCase
         $this->assertSame(['title' => 'x', 'secret' => '[redacted]', 'nested' => [['client_secret' => '[redacted]', 'ok' => 1]]], MirrorController::scrubSecrets(['title' => 'x', 'secret' => 'abc', 'nested' => [['client_secret' => 'y', 'ok' => 1]]]));
     }
 
+    /** §15: over 8 MiB a mirrored list is cut, meta.truncated says so, and a single object over it is a refusal, not a partial. */
+    public function testTheByteCapCutsAListAndRefusesAnObjectOverIt(): void
+    {
+        $full = $this->envelope($this->machine('GET', '/mirror/transactions'));
+        $this->assertCount(3, $full['data']['result']);
+        $one  = strlen((string) json_encode($full['data']['result'][0]));
+        config(['machine.limits.max_response_bytes' => 65536 + $one + 50]);
+        $cut  = $this->envelope($this->machine('GET', '/mirror/transactions'));
+        $this->assertTrue($cut['ok'], json_encode($cut));
+        $this->assertCount(1, $cut['data']['result']);
+        $this->assertTrue($cut['meta']['truncated']);
+        $this->assertSame(2, $cut['meta']['dropped_rows']);
+        $this->assertStringContainsString('8 MiB', $cut['meta']['hint']);
+
+        config(['machine.limits.max_response_bytes' => 65536 + 10]);
+        $env  = $this->assertPlaneError($this->machine('GET', '/mirror/about'), 400, 'invalid_input');
+        $this->assertStringContainsString('8 MiB', $env['error']['message']);
+    }
+
+    /** The sub-request never leaks into the caller's request: the plane's own meta and path are the caller's afterwards. */
+    public function testTheSubRequestIsIsolatedFromTheCallersRequest(): void
+    {
+        $env = $this->envelope($this->machine('GET', '/mirror/accounts', ['type' => 'asset']));
+        $this->assertTrue($env['ok']);
+        $this->assertSame('read', $env['meta']['tier']);
+        $this->assertSame('machine/v1/mirror/accounts', app('request')->path(), 'the container request is the caller\'s again');
+        $this->assertSame('machine/v1/mirror/accounts', \Illuminate\Support\Facades\Request::path(), 'the Request facade was cleared with it');
+    }
+
     /**
      * §8.12: every GET in upstream's route table is either mirrored or denied BY NAME. A new
      * upstream route is a failure here (add it to upstream_get_routes.txt, or deny it) — never a

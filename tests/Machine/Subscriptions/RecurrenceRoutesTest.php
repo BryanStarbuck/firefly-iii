@@ -79,6 +79,9 @@ final class RecurrenceRoutesTest extends MachineTestCase
         $this->assertSame('withdrawal', $done['data']['recurrence']['type']);
         $this->assertSame('1200.00', $done['data']['recurrence']['transactions'][0]['amount']);
         $this->assertSame('USD', $done['data']['recurrence']['transactions'][0]['currency_code']);
+        $this->assertNull($done['data']['recurrence']['transactions'][0]['foreign_amount'], 'no foreign currency: no foreign amount (§14.2), not upstream\'s "0.00"');
+        $this->assertSame('Housing', $done['data']['recurrence']['transactions'][0]['category_name'], 'category_name is stored (upstream validates it, then drops it)');
+        $this->assertSame('Meridian Property', $done['data']['recurrence']['transactions'][0]['destination_name']);
 
         $list   = $this->envelope($this->machine('GET', '/recurrences'));
         $this->assertSame($id, $list['data']['recurrences'][0]['id']);
@@ -158,6 +161,40 @@ final class RecurrenceRoutesTest extends MachineTestCase
         $this->assertSame($groups + 1, TransactionGroup::query()->count());
     }
 
+    public function testALinkNameThatDoesNotExistIsRefusedNotDropped(): void
+    {
+        $this->enableWrites();
+        $bad = $this->rent();
+        $bad['transactions'][0]['budget_name'] = 'No such budget';
+        $env = $this->assertPlaneError($this->machine('POST', '/recurrences', ['recurrence' => $bad]), 404, 'not_found');
+        $this->assertSame('recurrence.transactions.0.budget_name', $env['error']['details']['field']);
+        $this->assertSame(0, Recurrence::query()->count());
+    }
+
+    public function testUpdateWithAnEmptyShapeSaysWhatItAccepts(): void
+    {
+        $this->enableWrites();
+        $id  = $this->storeRent();
+        $env = $this->assertPlaneError($this->machine('PUT', '/recurrences/'.$id, ['recurrence' => []]), 400, 'invalid_input');
+        $this->assertStringContainsString('Nothing to change', $env['error']['message']);
+        $this->assertStringContainsString('repetitions', $env['error']['hint']);
+        $this->assertPlaneError($this->machine('PUT', '/recurrences/'.$id, ['recurrence' => 'Rent']), 400, 'invalid_input');
+    }
+
+    public function testTriggerTakesAnIdempotencyKeyAndReplaysTheOriginal(): void
+    {
+        $this->enableWrites();
+        $id     = $this->storeRent();
+        $groups = TransactionGroup::query()->count();
+        $first  = $this->envelope($this->machine('POST', '/recurrences/'.$id.'/trigger', ['idempotency_key' => 'rent-oct']));
+        $this->assertTrue($first['ok'], (string) json_encode($first));
+        $again  = $this->envelope($this->machine('POST', '/recurrences/'.$id.'/trigger', ['idempotency_key' => 'rent-oct']));
+        $this->assertTrue($again['ok'], (string) json_encode($again));
+        $this->assertTrue($again['meta']['replayed'] ?? false, 'the repeat returns the original answer (§5.6)');
+        $this->assertSame($first['data']['operation_id'], $again['data']['operation_id']);
+        $this->assertSame($groups + 1, TransactionGroup::query()->count(), 'created once');
+    }
+
     public function testTriggerNeedsTheWriteTierAndRefusesAnInactiveRecurrence(): void
     {
         $this->enableWrites();
@@ -201,6 +238,7 @@ final class RecurrenceRoutesTest extends MachineTestCase
                 'currency_code'    => 'USD',
                 'source_id'        => (string) $this->checking->id,
                 'destination_name' => 'Meridian Property',
+                'category_name'    => 'Housing',
             ]],
         ];
     }

@@ -24,7 +24,9 @@ declare(strict_types=1);
 
 namespace FireflyIII\Machine\Http\Controllers;
 
+use FireflyIII\Machine\Audit;
 use FireflyIII\Machine\MachineException;
+use FireflyIII\Machine\RouteTable;
 use FireflyIII\Machine\Undo\OperationLog;
 use FireflyIII\Machine\WriteResult;
 use FireflyIII\Models\Account;
@@ -69,7 +71,7 @@ final class UndoController extends MachineController
                 'description'   => 'Nothing to undo: no plane write (ffx or the MCP) is recorded for this administration in the last 30 days. Changes made in the Firefly web UI are never in this log.',
             ]);
         }
-        $data = $last + ['description' => self::describe($last)];
+        $data = $last + ['tier' => self::tierOf((string) $last['route']), 'description' => self::describe($last)];
         if (true === $last['reversible']) {
             return $this->ok($data + $this->planToken($request, self::APPLY_ROUTE, [], self::planFingerprint($last), ['operation_id' => $last['operation_id']]));
         }
@@ -81,6 +83,7 @@ final class UndoController extends MachineController
     {
         $args = $this->input($request, ['confirm_token' => ['required', 'string', 'max:64']]);
         unset($args['confirm_token']);
+        $this->refuseBelowTier($request, OperationLog::last());
 
         return $this->write($request, $args, static function (bool $dryRun) use ($request): WriteResult {
             $entry   = (array) $request->attributes->get('machine.confirm', []);
@@ -126,6 +129,49 @@ final class UndoController extends MachineController
     }
 
     // ------------------------------------------------------------------------
+
+    /** "POST /webhooks" → admin: the tier of the route that made an operation (unknown routes count as write). */
+    private static function tierOf(string $routeKey): string
+    {
+        $parts = explode(' ', trim($routeKey), 2);
+        $def   = 2 === count($parts) ? RouteTable::find($parts[0], $parts[1]) : null;
+
+        return null === $def ? 'write' : $def->tier;
+    }
+
+    /**
+     * §7.6: every destructive delete is admin-tier and the MCP never has it. Undoing an admin
+     * write (a webhook created by the operator in a terminal) deletes what it made, so it needs
+     * the admin tier too — the write tier must not become a back door to it.
+     *
+     * @param null|array<string, mixed> $last
+     */
+    private function refuseBelowTier(Request $request, ?array $last): void
+    {
+        if (null === $last || 'admin' !== self::tierOf((string) $last['route'])) {
+            return;
+        }
+        $route   = (string) $last['route'];
+        $refusal = null;
+        if ('mcp' === Audit::caller($request)) {
+            $refusal = MachineException::forbidden(
+                sprintf('The last plane write was %s, an admin route — undoing it is admin work, which is never available to the MCP.', $route),
+                'Undo it yourself in a terminal (ffx undo, with FIREFLY_MACHINE_ALLOW_ADMIN=1) or in the Firefly III web UI',
+                ['operation_id' => $last['operation_id'], 'route' => $route, 'tier' => 'admin'],
+            );
+        } elseif (true !== (bool) config('machine.allow_admin')) {
+            $refusal = MachineException::forbidden(
+                sprintf('The last plane write was %s, an admin route — undoing it needs the admin tier, which is off on this server.', $route),
+                'Set FIREFLY_MACHINE_ALLOW_ADMIN=1 in the app\'s .env and restart it (ffx stop && ffx up), then retry',
+                ['operation_id' => $last['operation_id'], 'route' => $route, 'tier' => 'admin', 'switch' => 'FIREFLY_MACHINE_ALLOW_ADMIN'],
+            );
+        }
+        if (null !== $refusal) {
+            Audit::line($request, ['route' => self::APPLY_ROUTE, 'tier' => 'admin', 'ok' => false, 'code' => $refusal->errorCode]);
+
+            throw $refusal;
+        }
+    }
 
     /**
      * The token's fingerprint: the operation, and the state of every row it touched as the plan
@@ -185,10 +231,11 @@ final class UndoController extends MachineController
             if (null === $row) {
                 return [];
             }
-            $touched  = json_decode((string) $row->touched, true);
-            $accounts = [];
-            $journals = [];
-            $groups   = [];
+            $touched      = json_decode((string) $row->touched, true);
+            $accounts     = [];
+            $transactions = [];
+            $journals     = [];
+            $groups       = [];
             foreach (is_array($touched) ? $touched : [] as $t) {
                 if (!is_array($t)) {
                     continue;
@@ -196,19 +243,38 @@ final class UndoController extends MachineController
                 $class  = (string) ($t['class'] ?? '');
                 $id     = $t['id'] ?? null;
                 $before = is_array($t['before'] ?? null) ? $t['before'] : [];
-                match ($class) {
-                    Transaction::class        => array_push($accounts, (int) ($before['account_id'] ?? 0), ...DB::table('transactions')->where('id', $id)->pluck('account_id')->map(static fn ($v): int => (int) $v)->all()),
-                    TransactionJournal::class => $journals[] = $id,
-                    TransactionGroup::class   => $groups[] = $id,
-                    Account::class            => $accounts[] = (int) $id,
-                    default                   => null,
-                };
+                switch ($class) {
+                    case Transaction::class:
+                        $accounts[]     = (int) ($before['account_id'] ?? 0);
+                        $transactions[] = $id;
+
+                        break;
+
+                    case TransactionJournal::class:
+                        $journals[] = $id;
+
+                        break;
+
+                    case TransactionGroup::class:
+                        $groups[] = $id;
+
+                        break;
+
+                    case Account::class:
+                        $accounts[] = (int) $id;
+
+                        break;
+                }
             }
-            if ([] !== $groups) {
-                $journals = array_merge($journals, DB::table('transaction_journals')->whereIn('transaction_group_id', $groups)->pluck('id')->all());
+            // one query per kind, never one per touched row (an operation may touch thousands)
+            foreach (array_chunk($transactions, 500) as $chunk) {
+                $accounts = array_merge($accounts, DB::table('transactions')->whereIn('id', $chunk)->pluck('account_id')->map(static fn ($v): int => (int) $v)->all());
             }
-            if ([] !== $journals) {
-                $accounts = array_merge($accounts, DB::table('transactions')->whereIn('transaction_journal_id', $journals)->pluck('account_id')->map(static fn ($v): int => (int) $v)->all());
+            foreach (array_chunk($groups, 500) as $chunk) {
+                $journals = array_merge($journals, DB::table('transaction_journals')->whereIn('transaction_group_id', $chunk)->pluck('id')->all());
+            }
+            foreach (array_chunk(array_values(array_unique($journals)), 500) as $chunk) {
+                $accounts = array_merge($accounts, DB::table('transactions')->whereIn('transaction_journal_id', $chunk)->pluck('account_id')->map(static fn ($v): int => (int) $v)->all());
             }
 
             return array_values(array_filter(array_unique($accounts), static fn (int $id): bool => $id > 0));

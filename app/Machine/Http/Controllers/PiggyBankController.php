@@ -29,12 +29,14 @@ use FireflyIII\Api\V1\Requests\Models\PiggyBank\StoreRequest as PiggyStoreReques
 use FireflyIII\Api\V1\Requests\Models\PiggyBank\UpdateRequest as PiggyUpdateRequest;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Money;
+use FireflyIII\Machine\Subscriptions\Pivots\AccountPiggyBankRow;
 use FireflyIII\Machine\WriteResult;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\Note;
 use FireflyIII\Models\PiggyBank;
 use FireflyIII\Models\PiggyBankEvent;
 use FireflyIII\Models\TransactionCurrency;
+use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Repositories\Account\AccountRepositoryInterface;
 use FireflyIII\Repositories\PiggyBank\PiggyBankRepositoryInterface;
 use FireflyIII\Support\JsonApi\Enrichments\PiggyBankEnrichment;
@@ -53,16 +55,20 @@ use Illuminate\Support\Collection;
  * (details.max_amount, left_on_account, left_to_save); remove runs canRemoveAmount(). Both then
  * call addAmount()/removeAmount(), which also write the piggy bank event.
  * Create/edit: upstream's PiggyBank\StoreRequest / UpdateRequest validation, then the repository.
+ *
+ * Two things upstream does silently are refused here instead, with the figure: a create or edit
+ * whose accounts[].current_amount the account cannot spare (upstream drops the link and leaves an
+ * orphan), and an edit whose accounts[] drops an account that still holds saved money (upstream
+ * discards the amount). Remove the money first, or keep the account — the hint says which.
  */
 final class PiggyBankController extends MachineController
 {
     /**
      * The record class the undo log stores for rows of the account_piggy_bank pivot (where the
-     * saved amount per account lives). Upstream has no Eloquent model for that pivot; until the
-     * core ships one under this name, POST /undo reports these rows as "unknown record type" and
-     * REFUSES — it never half-reverses a piggy bank move (see open issue in the family report).
+     * saved amount per account lives). Upstream has no Eloquent model for that pivot, so the
+     * plane carries one: POST /undo writes the amount back through it.
      */
-    public const string PIVOT_RECORD = 'FireflyIII\Machine\Undo\Rows\AccountPiggyBank';
+    public const string PIVOT_RECORD = AccountPiggyBankRow::class;
 
     // ------------------------------------------------------------------ reads ---
 
@@ -71,7 +77,10 @@ final class PiggyBankController extends MachineController
     {
         $this->input($request, self::LIST_RULES, true);
         $params = $this->listParams($request, ['id', 'name', 'order', 'target_date', 'current_amount', 'left_to_save'], 'order');
-        $rows   = $this->applyList($this->present($this->repository()->getPiggyBanks()), $params);
+        // the administration's piggy banks (§4.9) — PiggyBankRepository::getPiggyBanks() would return the operator's own only
+        $query  = PiggyBank::query()->with(['objectGroups'])->orderBy('piggy_banks.order');
+        ($this->scope())($query);
+        $rows   = $this->applyList($this->present($query->get()), $params);
 
         return $this->ok(['piggy_banks' => $rows]);
     }
@@ -97,33 +106,43 @@ final class PiggyBankController extends MachineController
 
         /** @var PiggyBankEvent $event */
         foreach ($this->repository()->getEvents($piggy) as $event) {
-            $amount  = (string) $event->amount;
-            $journal = $event->transactionJournal;
-            $account = null;
-            if (null !== $journal) {
-                // money in: the account the transfer went to; money out: the account it came from
-                $side    = $journal->transactions()->with('account')->where('amount', Money::compare($amount, '0') >= 0 ? '>' : '<', 0)->first();
-                $account = $side?->account;
-            }
-            if (null === $account && 1 === $piggy->accounts->count()) {
-                $account = $piggy->accounts->first();
-            }
-            $rows[]  = [
+            $amount = (string) $event->amount;
+            $rows[] = [
                 'id'                     => (int) $event->id,
                 'date'                   => $event->date?->format('Y-m-d'),
                 'direction'              => Money::compare($amount, '0') >= 0 ? 'add' : 'remove',
                 'amount'                 => Money::format(Money::abs($amount), $places), // positive; direction says which way (§14.1)
                 'currency_code'          => (string) $currency->code,
-                'account_id'             => null === $account ? null : (int) $account->id,
-                'account_name'           => $account?->name,
+                'account_id'             => null,
+                'account_name'           => null,
                 'transaction_journal_id' => null === $event->transaction_journal_id ? null : (int) $event->transaction_journal_id,
-                'transaction_group_id'   => null === $journal ? null : (int) $journal->transaction_group_id,
+                'transaction_group_id'   => null,
             ];
         }
+        // order, offset and limit first; only the page returned is enriched with its journal's account (no N+1 over the history)
+        $page     = $this->applyList($rows, $params);
+        $only     = 1 === $piggy->accounts->count() ? $piggy->accounts->first() : null;
+        foreach ($page as &$row) {
+            $account = null;
+            if (null !== $row['transaction_journal_id']) {
+                /** @var null|TransactionJournal $journal */
+                $journal = TransactionJournal::query()->find($row['transaction_journal_id']);
+                if (null !== $journal) {
+                    // money in: the account the transfer went to; money out: the account it came from
+                    $side                        = $journal->transactions()->with('account')->where('amount', 'add' === $row['direction'] ? '>' : '<', 0)->first();
+                    $account                     = $side?->account;
+                    $row['transaction_group_id'] = (int) $journal->transaction_group_id;
+                }
+            }
+            $account ??= $only;
+            $row['account_id']   = null === $account ? null : (int) $account->id;
+            $row['account_name'] = $account?->name;
+        }
+        unset($row);
 
         return $this->ok([
             'piggy_bank' => ['id' => (int) $piggy->id, 'name' => (string) $piggy->name, 'currency_code' => (string) $currency->code],
-            'events'     => $this->applyList($rows, $params),
+            'events'     => $page,
         ]);
     }
 
@@ -155,6 +174,7 @@ final class PiggyBankController extends MachineController
             $specs  = $this->specs(null, array_map(static fn (array $a): int => (int) $a['account_id'], $data['accounts']));
             $before = SubscriptionController::snapshot($specs);
             $piggy  = $this->repository()->store($form->getAll());
+            $this->assertLinked($piggy->refresh(), $data['accounts']);
             $result = new WriteResult();
             SubscriptionController::diffInto($result, $before, SubscriptionController::snapshot($specs));
 
@@ -185,18 +205,31 @@ final class PiggyBankController extends MachineController
         if (!array_key_exists('currency_code', $args)) {
             unset($data['transaction_currency_code']);
         }
+        if (array_key_exists('currency_code', $args)) {
+            // upstream's update honours transaction_currency_id only; the code it validates is then ignored
+            $data['transaction_currency_id'] = (int) $currency->id;
+        }
+        if (null !== $accounts) {
+            $this->assertNoFundedAccountDropped($piggy, $accounts);
+        }
         // no `accounts` = upstream's "leave the links and the saved amounts alone" (an empty list to linkToAccountIds)
         $piggyId  = (int) $piggy->id;
 
         return $this->write($request, $args, function (bool $dryRun) use ($data, $piggyId): WriteResult {
             /** @var PiggyBank $piggy */
             $piggy   = PiggyBank::query()->findOrFail($piggyId);
+            if (array_key_exists('accounts', $data)) {
+                $this->assertHoldable($piggy, $data['accounts']);
+            }
             $form    = SubscriptionController::upstreamForm(PiggyUpdateRequest::class, $data, ['piggyBank' => $piggy]);
             $ids     = array_merge($piggy->accounts->pluck('id')->map(static fn ($v): int => (int) $v)->all(), array_map(static fn (array $a): int => (int) $a['account_id'], $data['accounts'] ?? []));
             $specs   = $this->specs($piggy, $ids);
             $before  = SubscriptionController::snapshot($specs);
             self::stringPivots($piggy);
             $updated = $this->repository()->update($piggy, $form->getAll());
+            if (array_key_exists('accounts', $data)) {
+                $this->assertLinked($updated->refresh(), $data['accounts']);
+            }
             $result  = new WriteResult();
             SubscriptionController::diffInto($result, $before, SubscriptionController::snapshot($specs));
             $result->count([] === $result->touched ? 'unchanged' : 'updated');
@@ -223,7 +256,7 @@ final class PiggyBankController extends MachineController
         $args  = $this->input($request, []);
         $piggy = $this->findPiggyOrGone($id);
         if (null === $piggy) {
-            return $this->write($request, $args, static fn (bool $dryRun): WriteResult => (new WriteResult(['deleted' => 0]))->with(['piggy_bank' => null, 'deleted' => 0]));
+            return SubscriptionController::alreadyGone($args, ['piggy_bank' => null], sprintf('Piggy bank #%s is already deleted — nothing to do.', trim(urldecode($id))));
         }
         $attachments = $piggy->attachments()->count();
         if ($attachments > 0) {
@@ -255,7 +288,7 @@ final class PiggyBankController extends MachineController
     {
         $args     = $this->input($request, [
             'amount'       => ['required'],
-            'account_id'   => ['sometimes', 'nullable'],
+            'account_id'   => ['sometimes', 'nullable', self::scalarRule()],
             'account_name' => ['sometimes', 'nullable', 'string'],
         ]);
         $piggy    = $this->findPiggy($id);
@@ -290,6 +323,16 @@ final class PiggyBankController extends MachineController
                 'piggy_bank'    => $this->present(new Collection([$piggy]))[0],
             ]);
         });
+    }
+
+    /** An id is a string or a JSON number; a list or object here is a caller's mistake, not a 500. */
+    private static function scalarRule(): Closure
+    {
+        return static function (string $attribute, mixed $value, Closure $fail): void {
+            if (!is_string($value) && !is_int($value)) {
+                $fail(sprintf('%s must be one account id (or name), as a string.', $attribute));
+            }
+        };
     }
 
     /**
@@ -340,6 +383,110 @@ final class PiggyBankController extends MachineController
     }
 
     /**
+     * After a create/edit: every requested account must be linked and, when an amount was asked
+     * for, hold exactly that amount. Upstream's linkToAccountIds() silently SKIPS an account whose
+     * current_amount the account cannot spare (leaving a piggy bank with no accounts at all on a
+     * create, or the old amount on an edit) — refuse instead, with the figure, inside the write so
+     * the dry run and the apply roll back alike.
+     *
+     * @param list<array{account_id: int, current_amount?: string}> $requested
+     */
+    private function assertLinked(PiggyBank $piggy, array $requested): void
+    {
+        $saved = self::savedPerAccount($piggy);
+        foreach ($requested as $i => $entry) {
+            $accountId = (int) $entry['account_id'];
+            $wanted    = array_key_exists('current_amount', $entry) ? Money::strip((string) $entry['current_amount']) : null;
+            if (array_key_exists($accountId, $saved) && (null === $wanted || 0 === Money::compare($saved[$accountId], $wanted))) {
+                continue;
+            }
+
+            throw $this->cannotHold($piggy, $accountId, $i, $wanted ?? '0', $saved[$accountId] ?? '0');
+        }
+    }
+
+    /**
+     * Before an edit: the same check up front, so the refusal carries the figures (upstream's
+     * UpdateRequest refuses the amount too, but without saying how much the account could take).
+     *
+     * @param list<array{account_id: int, current_amount?: string}> $requested
+     */
+    private function assertHoldable(PiggyBank $piggy, array $requested): void
+    {
+        $saved = self::savedPerAccount($piggy);
+        foreach ($requested as $i => $entry) {
+            if (!array_key_exists('current_amount', $entry)) {
+                continue;
+            }
+            $accountId = (int) $entry['account_id'];
+            $wanted    = Money::strip((string) $entry['current_amount']);
+            $held      = $saved[$accountId] ?? '0';
+            if (Money::compare($wanted, $held) <= 0) {
+                continue; // no more than it holds now: nothing needs adding
+            }
+            /** @var Account $account */
+            $account = Account::query()->findOrFail($accountId);
+            if (Money::compare(Money::sub($wanted, $held), $this->addFigures($piggy, $account)['max_amount']) > 0) {
+                throw $this->cannotHold($piggy, $accountId, $i, $wanted, $held);
+            }
+        }
+    }
+
+    /** @return array<int, string> account id => the amount saved there (stripped decimal string) */
+    private static function savedPerAccount(PiggyBank $piggy): array
+    {
+        $saved = [];
+        foreach ($piggy->accounts as $account) {
+            $saved[(int) $account->id] = Money::strip((string) ($account->pivot->current_amount ?? '0'));
+        }
+
+        return $saved;
+    }
+
+    private function cannotHold(PiggyBank $piggy, int $accountId, int $i, string $wanted, string $held): MachineException
+    {
+        /** @var Account $account */
+        $account  = Account::query()->findOrFail($accountId);
+        $currency = $piggy->transactionCurrency;
+        $places   = (int) $currency->decimal_places;
+        $figures  = $this->addFigures($piggy, $account);
+        // what this account could hold: what it holds now plus what can still be added
+        $max      = self::floor(Money::add($held, $figures['max_amount']), $places);
+
+        return MachineException::invalid(
+            sprintf('Account "%s" cannot hold %s %s of piggy bank "%s": it can hold at most %s %s.', $account->name, $currency->code, Money::format($wanted, $places), $piggy->name, $currency->code, $max),
+            sprintf('Set accounts.%d.current_amount to at most "%s" (saved there now: %s, left on the account: %s, left to save: %s), or leave current_amount out to keep what is saved', $i, $max, Money::format($held, $places), $figures['left_on_account'], $figures['left_to_save'] ?? 'no target'),
+            ['field' => sprintf('accounts.%d.current_amount', $i), 'account_id' => $accountId, 'max_amount' => $max, 'saved_on_account' => Money::format($held, $places), 'left_on_account' => $figures['left_on_account'], 'left_to_save' => $figures['left_to_save'], 'currency_code' => (string) $currency->code],
+        );
+    }
+
+    /**
+     * An edit whose accounts[] leaves out an account that still holds saved money would make
+     * upstream discard that amount (the pivot row is dropped with it). Refuse, naming the fix.
+     *
+     * @param list<array{account: Account, current_amount: null|string}> $accounts the complete new list
+     */
+    private function assertNoFundedAccountDropped(PiggyBank $piggy, array $accounts): void
+    {
+        $keep     = array_map(static fn (array $a): int => (int) $a['account']->id, $accounts);
+        $currency = $piggy->transactionCurrency;
+        $places   = (int) $currency->decimal_places;
+        foreach ($piggy->accounts as $account) {
+            $saved = (string) ($account->pivot->current_amount ?? '0');
+            if (in_array((int) $account->id, $keep, true) || !Money::isPositive(Money::strip($saved))) {
+                continue;
+            }
+            $saved = Money::format($saved, $places);
+
+            throw MachineException::invalid(
+                sprintf('Account "%s" still holds %s %s of piggy bank "%s"; dropping it from accounts would discard that amount.', $account->name, $currency->code, $saved, $piggy->name),
+                sprintf('Keep "%s" in accounts, or take the money out first: POST /machine/v1/piggy-banks/%d/remove with account_id "%d" and amount "%s"', $account->name, $piggy->id, $account->id, $saved),
+                ['field' => 'accounts', 'account_id' => (int) $account->id, 'saved_on_account' => $saved, 'currency_code' => (string) $currency->code],
+            );
+        }
+    }
+
+    /**
      * What the UI's add-money dialog shows for one account (AmountController::add()).
      *
      * @return array{left_on_account: string, left_to_save: null|string, max_amount: string}
@@ -362,6 +509,20 @@ final class PiggyBankController extends MachineController
             'left_to_save'    => null === $leftToSave ? null : Money::format($leftToSave, $places),
             'max_amount'      => self::floor($max, $places),
         ];
+    }
+
+    /** The primary-currency saved amount as Firefly has converted it (sum of native_current_amount), or null when it never has. */
+    private static function nativeSaved(PiggyBank $piggy): ?string
+    {
+        $sum = null;
+        foreach ($piggy->accounts as $account) {
+            $native = $account->pivot->native_current_amount;
+            if (null !== $native && '' !== (string) $native) {
+                $sum = Money::add($sum ?? '0', (string) $native);
+            }
+        }
+
+        return $sum;
     }
 
     /** Round DOWN to the currency's places: a figure offered as "at most" must itself be addable. */
@@ -616,6 +777,7 @@ final class PiggyBankController extends MachineController
             }
             $target   = $fmt($meta['target_amount'] ?? null);
             $current  = $fmt($meta['current_amount'] ?? '0') ?? Money::format('0', $places);
+            $isPc     = (int) $currency->id === (int) $primary->id;
             $rows[]   = [
                 'id'                    => (int) $piggy->id,
                 'name'                  => (string) $piggy->name,
@@ -623,11 +785,14 @@ final class PiggyBankController extends MachineController
                 'target_amount'         => $target,
                 'current_amount'        => $current,
                 'left_to_save'          => null === $target ? null : $fmt(Money::sub((string) ($meta['target_amount'] ?? '0'), (string) ($meta['current_amount'] ?? '0'))),
-                'save_per_month'        => $fmt($meta['save_per_month'] ?? null),
+                // no target, or no date to reach it by: there is no monthly figure (§14.2) — "0.00" is a reached goal
+                'save_per_month'        => null === $target || null === $piggy->target_date ? null : $fmt($meta['save_per_month'] ?? null),
                 'percentage'            => null === $target || Money::isZero((string) $meta['target_amount']) ? null : Money::format((string) Money::div(Money::mul((string) ($meta['current_amount'] ?? '0'), '100'), (string) $meta['target_amount']), 0),
                 'primary_currency_code' => (string) $primary->code,
-                'pc_current_amount'     => $pfmt($meta['pc_current_amount'] ?? null),
-                'pc_target_amount'      => $pfmt($meta['pc_target_amount'] ?? null),
+                // in the primary currency the amounts ARE the primary-currency amounts (upstream leaves the native columns empty);
+                // in another currency the converted figure exists only once Firefly has written native_current_amount — else null, never "0.00"
+                'pc_current_amount'     => $isPc ? $current : $pfmt(self::nativeSaved($piggy)),
+                'pc_target_amount'      => $isPc ? $target : $pfmt($meta['pc_target_amount'] ?? null),
                 'start_date'            => $piggy->start_date?->format('Y-m-d'),
                 'target_date'           => $piggy->target_date?->format('Y-m-d'),
                 'order'                 => (int) $piggy->order,

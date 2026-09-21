@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <GrpHdr>
+      <MsgId>MERIDIAN-2026-07-3308</MsgId>
+      <CreDtTm>2026-08-01T06:00:00</CreDtTm>
+    </GrpHdr>
+    <Stmt>
+      <Id>STMT-2026-07</Id>
+      <CreDtTm>2026-08-01T06:00:00</CreDtTm>
+      <FrToDt>
+        <FrDtTm>2026-07-01T00:00:00</FrDtTm>
+        <ToDtTm>2026-07-31T23:59:59</ToDtTm>
+      </FrToDt>
+      <Acct>
+        <Id><Othr><Id>000088883308</Id></Othr></Id>
+        <Ccy>USD</Ccy>
+        <Svcr><FinInstnId><Nm>Meridian</Nm></FinInstnId></Svcr>
+      </Acct>
+      <Ntry>
+        <Amt Ccy="USD">250.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Sts>BOOK</Sts>
+        <BookgDt><Dt>2026-07-03</Dt></BookgDt>
+        <ValDt><Dt>2026-07-03</Dt></ValDt>
+        <NtryDtls><TxDtls><RmtInf><Ustrd>TRANSFER FROM CHECKING</Ustrd></RmtInf></TxDtls></NtryDtls>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="USD">1.75</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <Sts>BOOK</Sts>
+        <BookgDt><Dt>2026-07-31</Dt></BookgDt>
+        <AddtlNtryInf>INTEREST PAID</AddtlNtryInf>
+      </Ntry>
+      <Ntry>
+        <Amt Ccy="USD">40.00</Amt>
+        <CdtDbtInd>DBIT</CdtDbtInd>
+        <Sts>BOOK</Sts>
+        <BookgDt><Dt>2026-07-20</Dt></BookgDt>
+        <NtryDtls><TxDtls><RmtInf><Ustrd>ATM WITHDRAWAL MAIN ST</Ustrd></RmtInf></TxDtls></NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>

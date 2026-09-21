@@ -29,6 +29,7 @@ use Closure;
 use FireflyIII\Api\V1\Requests\Models\Bill\StoreRequest as BillStoreRequest;
 use FireflyIII\Api\V1\Requests\Models\Bill\UpdateRequest as BillUpdateRequest;
 use FireflyIII\Helpers\Collector\GroupCollectorInterface;
+use FireflyIII\Machine\Envelope;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Money;
 use FireflyIII\Machine\WriteResult;
@@ -114,7 +115,7 @@ final class SubscriptionController extends MachineController
 
         /** @var GroupCollectorInterface $collector */
         $collector = app(GroupCollectorInterface::class);
-        $collector->setUser($this->operator())->setBill($bill)->withAPIInformation();
+        $collector->setUser($this->operator())->setUserGroup($this->administration())->setBill($bill)->withAPIInformation(); // the bound books, not the operator's own rows only
         if (null !== $start && null !== $end) {
             $collector->setRange($start, $end);
         }
@@ -318,7 +319,7 @@ final class SubscriptionController extends MachineController
         $args = $this->input($request, []);
         $bill = $this->findBillOrGone($id);
         if (null === $bill) {
-            return $this->write($request, $args, static fn (bool $dryRun): WriteResult => (new WriteResult(['deleted' => 0]))->with(['subscription' => null, 'deleted' => 0]));
+            return self::alreadyGone($args, ['subscription' => null], sprintf('Subscription #%s is already deleted — nothing to do.', trim(urldecode($id))));
         }
         $attachments = $bill->attachments()->count();
         if ($attachments > 0) {
@@ -356,12 +357,20 @@ final class SubscriptionController extends MachineController
         return $repository;
     }
 
-    /** @return Collection<int, Bill> the administration's subscriptions */
+    /**
+     * The administration's subscriptions (§4.9: the bound set of books, whoever entered them —
+     * BillRepository::getBills() would return the operator's own rows only), in upstream's order.
+     *
+     * @return Collection<int, Bill>
+     */
     private function bills(): Collection
     {
-        $groupId = (int) $this->administration()->id;
-
-        return $this->repository()->getBills()->filter(static fn (Bill $bill): bool => (int) $bill->user_group_id === $groupId)->values();
+        return Bill::query()
+            ->where('user_group_id', (int) $this->administration()->id)
+            ->orderBy('order')
+            ->orderBy('active', 'DESC')
+            ->orderBy('name')
+            ->get();
     }
 
     private function findBill(string $id): Bill
@@ -370,13 +379,28 @@ final class SubscriptionController extends MachineController
             /** @var Bill */
             return $this->resolve(Bill::class, urldecode($id));
         } catch (MachineException $e) {
-            // Firefly's model is "Bill"; the plane and the UI say "subscription"
-            $message = str_replace(['bills', 'bill'], ['subscriptions', 'subscription'], $e->getMessage());
+            // Firefly's model is "Bill"; the plane and the UI say "subscription". The message is
+            // rebuilt from the details rather than rewritten, so a name like "water bill" is quoted as given.
+            $details = $e->details;
+            $name    = (string) ($details['name'] ?? trim(urldecode($id)));
             if ('not_found' === $e->errorCode) {
-                throw MachineException::notFound($message, 'GET /machine/v1/subscriptions lists them — pass an id or the exact name', $e->details);
+                throw MachineException::notFound(
+                    isset($details['id']) ? sprintf('No subscription with id %s.', $details['id']) : sprintf('No subscription named "%s".', $name),
+                    'GET /machine/v1/subscriptions lists them — pass an id or the exact name',
+                    $details,
+                );
             }
             if ('invalid_input' === $e->errorCode) {
-                throw MachineException::invalid($message, str_replace('bill', 'subscription', (string) $e->hint), $e->details);
+                $candidates = (array) ($details['candidates'] ?? []);
+                if ([] === $candidates) {
+                    throw MachineException::invalid('An empty subscription name was given.', 'Pass the subscription\'s id or its exact name', $details);
+                }
+
+                throw MachineException::invalid(
+                    sprintf('"%s" matches %d subscriptions%s.', $name, count($candidates), count($candidates) >= 10 ? ' or more' : ''),
+                    'Pass the subscription\'s id instead — the candidates are in details.candidates',
+                    $details,
+                );
             }
 
             throw $e;
@@ -488,16 +512,14 @@ final class SubscriptionController extends MachineController
             }],
         ];
         if (null !== $bill) {
-            $name    = (string) $bill->name;
-            $userId  = (int) $bill->user_id;
-            $specs[] = [RuleTrigger::class, 'rule_triggers', static function (QueryBuilder $q) use ($name, $userId): void {
-                $q->whereIn('trigger_type', ['bill_is', 'bill_ends', 'bill_starts', 'bill_contains'])->where('trigger_value', $name)
-                    ->whereIn('rule_id', DB::table('rules')->where('user_id', $userId)->select('id'));
-            }];
-            $specs[] = [RuleAction::class, 'rule_actions', static function (QueryBuilder $q) use ($name, $userId): void {
-                $q->where('action_type', 'link_to_bill')->where('action_value', $name)
-                    ->whereIn('rule_id', DB::table('rules')->where('user_id', $userId)->select('id'));
-            }];
+            // the rows are pinned by id NOW, so after upstream renames them (UpdatesRulesForChangedBill)
+            // the after-image still finds them and records them as updated, with the old name to restore
+            $name       = (string) $bill->name;
+            $ruleIds    = DB::table('rules')->where('user_id', (int) $bill->user_id)->select('id');
+            $triggerIds = DB::table('rule_triggers')->whereIn('trigger_type', ['bill_is', 'bill_ends', 'bill_starts', 'bill_contains'])->where('trigger_value', $name)->whereIn('rule_id', $ruleIds)->pluck('id')->all();
+            $actionIds  = DB::table('rule_actions')->where('action_type', 'link_to_bill')->where('action_value', $name)->whereIn('rule_id', $ruleIds)->pluck('id')->all();
+            $specs[]    = [RuleTrigger::class, 'rule_triggers', static function (QueryBuilder $q) use ($triggerIds): void { $q->whereIn('id', $triggerIds); }];
+            $specs[]    = [RuleAction::class, 'rule_actions', static function (QueryBuilder $q) use ($actionIds): void { $q->whereIn('id', $actionIds); }];
         }
         if (null !== $currencyCode) {
             $specs[] = [TransactionCurrency::class, 'transaction_currencies', static function (QueryBuilder $q) use ($currencyCode): void { $q->where('code', $currencyCode); }];
@@ -590,6 +612,25 @@ final class SubscriptionController extends MachineController
     }
 
     // ------------------------------------------------ shared family helpers ---
+
+    /**
+     * §5.6: a DELETE of something already gone is ok with deleted: 0 — answered directly, with no
+     * plan to confirm and no token to redeem, so the retry that re-sends a consumed token ends the
+     * loop instead of conflicting. Nothing changes, so there is no operation-log row either.
+     *
+     * @param array<string, mixed> $args
+     * @param array<string, null>  $entity the route's entity key, null
+     */
+    public static function alreadyGone(array $args, array $entity, string $note): JsonResponse
+    {
+        return Envelope::ok(array_merge($entity, [
+            'deleted'      => 0,
+            'dry_run'      => (bool) ($args['dry_run'] ?? true),
+            'changes'      => ['deleted' => 0],
+            'change_count' => 0,
+            'note'         => $note,
+        ]), self::standardMeta(request()));
+    }
 
     public static function today(): Carbon
     {
@@ -721,7 +762,7 @@ final class SubscriptionController extends MachineController
                 continue;
             }
             $a = $after[$key]['row'];
-            if ($a == $b['row']) {
+            if (!self::rowChanged($b['row'], $a)) {
                 continue;
             }
             $softDeleted       = array_key_exists('deleted_at', $b['row']) && null === $b['row']['deleted_at'] && null !== ($a['deleted_at'] ?? null);
@@ -732,6 +773,28 @@ final class SubscriptionController extends MachineController
                 $result->touched[] = ['class' => $a['class'], 'id' => $a['id'], 'op' => 'created', 'before' => null];
             }
         }
+    }
+
+    /**
+     * Strict, column by column: PHP's loose `==` calls null and "" equal, null and 0 equal, and
+     * "1.0" and "1" equal, so a real change could go unrecorded. Both rows come from the same
+     * driver in the same request, so their types agree.
+     *
+     * @param array<string, mixed> $before
+     * @param array<string, mixed> $after
+     */
+    private static function rowChanged(array $before, array $after): bool
+    {
+        if (array_keys($before) !== array_keys($after)) {
+            return true;
+        }
+        foreach ($before as $column => $value) {
+            if ($value !== $after[$column]) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

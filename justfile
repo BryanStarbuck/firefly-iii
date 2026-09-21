@@ -95,7 +95,7 @@ logs:
 # The CLI's tests and canaries; the machine plane's PHPUnit suite when it exists.
 test: build
     cd "{{root}}/cli" && node --test code/dist/test/
-    if [ -d "{{root}}/tests/Machine" ] && [ -x "{{root}}/vendor/bin/phpunit" ]; then cd "{{root}}" && vendor/bin/phpunit --no-coverage tests/Machine; fi
+    if [ -d "{{root}}/tests/Machine" ] && [ -x "{{root}}/vendor/bin/phpunit" ]; then cd "{{root}}" && php vendor/bin/phpunit -c phpunit.machine.xml; fi
     if [ -f "{{root}}/mcp/package.json" ]; then cd "{{root}}/mcp" && npm test --silent; fi
 
 # Print the PATH line for ~/.zshrc (never edits your profile).

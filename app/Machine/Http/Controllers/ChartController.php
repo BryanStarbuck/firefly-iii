@@ -148,7 +148,11 @@ final class ChartController extends ScopedController
      */
     public function series(Request $request): JsonResponse
     {
-        $raw    = (string) $request->query('source', '');
+        $raw    = $request->query('source', '');
+        if (!is_string($raw)) {
+            // source[]=… is an array: refused as input, never a PHP "Array to string" warning turned internal error
+            throw MachineException::invalid('source must be one string.', sprintf('Send source=/analytics/<route>, one of: %s', implode(', ', self::SERIES_SOURCES)), ['field' => 'source']);
+        }
         $source = (string) preg_replace('#^(/?machine/v1)?/?(analytics/)?#', '', trim($raw));
         if ('' === $raw) {
             throw MachineException::invalid('source is required.', sprintf('Send source=/analytics/<route>, one of: %s', implode(', ', self::SERIES_SOURCES)));

@@ -27,6 +27,7 @@ namespace Tests\Machine\Accounts;
 use Carbon\Carbon;
 use FireflyIII\Factory\TransactionGroupFactory;
 use FireflyIII\Models\Account;
+use FireflyIII\Models\TransactionCurrency;
 use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Support\Facades\Amount;
 use FireflyIII\User;
@@ -92,6 +93,41 @@ trait AccountFixtures
                 'source_id'      => $source,
                 'destination_id' => $destination,
                 'reconciled'     => false,
+            ]],
+        ]);
+
+        return (int) $group->transactionJournals()->first()->id;
+    }
+
+    /** A transfer of $amount ($inCurrency, the source's currency) from $source to $destination, with $foreignAmount in the primary currency; returns the journal id. */
+    protected function transfer(int $source, int $destination, string $amount, string $date, TransactionCurrency $inCurrency, string $foreignAmount): int
+    {
+        auth()->setUser($this->user);
+
+        /** @var TransactionGroupFactory $factory */
+        $factory = app(TransactionGroupFactory::class);
+        $factory->setUser($this->user);
+        $primary = Amount::getPrimaryCurrencyByUserGroup($this->user->userGroup);
+
+        /** @var TransactionGroup $group */
+        $group   = $factory->create([
+            'user'         => $this->user,
+            'user_group'   => $this->user->userGroup,
+            'group_title'  => null,
+            'transactions' => [[
+                'user'                => $this->user,
+                'user_group'          => $this->user->userGroup,
+                'type'                => 'transfer',
+                'date'                => Carbon::parse($date),
+                'order'               => 0,
+                'currency_id'         => $inCurrency->id,
+                'amount'              => $amount,
+                'foreign_currency_id' => $primary->id,
+                'foreign_amount'      => $foreignAmount,
+                'description'         => 'Moved home',
+                'source_id'           => $source,
+                'destination_id'      => $destination,
+                'reconciled'          => false,
             ]],
         ]);
 

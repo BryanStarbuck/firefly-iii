@@ -61,8 +61,8 @@ final class AnalyticsRoutes implements RouteFamily
             RouteDef::live('GET', '/charts/category-overview', 'read', 'Chart series: categories, spent and earned.', [ChartController::class, 'categoryOverview'], ['phase' => 'P7']),
             RouteDef::live('GET', '/charts/spending-by-category', 'read', 'Chart series: spending by category per interval.', [ChartController::class, 'spendingByCategory'], ['phase' => 'P7']),
             RouteDef::live('GET', '/charts/income-vs-expense', 'read', 'Chart series: income vs expense per interval.', [ChartController::class, 'incomeVsExpense'], ['phase' => 'P7']),
-            RouteDef::live('GET', '/charts/piggy-bank/{id}', 'read', 'Chart series: one piggy bank\'s progress.', [ChartController::class, 'piggyBank'], ['phase' => 'P7', 'where' => ['id' => '[0-9]+']]),
-            RouteDef::live('GET', '/charts/subscription/{id}', 'read', 'Chart series: one subscription\'s payments.', [ChartController::class, 'subscription'], ['phase' => 'P7', 'where' => ['id' => '[0-9]+']]),
+            RouteDef::live('GET', '/charts/piggy-bank/{id}', 'read', 'Chart series: one piggy bank\'s progress (id or name).', [ChartController::class, 'piggyBank'], ['phase' => 'P7']),
+            RouteDef::live('GET', '/charts/subscription/{id}', 'read', 'Chart series: one subscription\'s payments (id or name).', [ChartController::class, 'subscription'], ['phase' => 'P7']),
             RouteDef::live('GET', '/charts/tag-overview', 'read', 'Chart series: tags, spent and earned.', [ChartController::class, 'tagOverview'], ['phase' => 'P7']),
             RouteDef::live('GET', '/charts/series', 'read', 'Any analytics route as chart series (source=/analytics/cash-flow&interval=month).', [ChartController::class, 'series'], ['phase' => 'P7']),
         ];

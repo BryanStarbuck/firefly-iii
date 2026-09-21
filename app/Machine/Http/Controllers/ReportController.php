@@ -50,11 +50,45 @@ final class ReportController extends ScopedController
         return $this->ok($this->reports()->default($this->scope($args, null, self::REPORT_ACCOUNT_TYPES, 'none')));
     }
 
+    /**
+     * Every journal with the running balance after it. The journals section is a list, so it is
+     * bounded like every list (§5.5): `limit` (default and cap 5,000 — clamped, never rejected)
+     * and `offset`, in date order; meta.truncated says when a cap bound it. The per-account
+     * summaries count the whole account, not the page.
+     */
     public function audit(Request $request): JsonResponse
     {
-        $args = $this->input($request, array_merge(self::RANGE_RULES, self::ACCOUNT_RULES, ['currency_code' => self::FILTER_RULES['currency_code']]), true);
+        $args      = $this->input($request, array_merge(self::RANGE_RULES, self::ACCOUNT_RULES, [
+            'currency_code' => self::FILTER_RULES['currency_code'],
+            'limit'         => ['sometimes', 'integer', 'min:0', 'max:1000000000'],
+            'offset'        => ['sometimes', 'integer', 'min:0', 'max:1000000000'],
+        ]), true);
+        $requested = (int) ($args['limit'] ?? Reports::AUDIT_MAX_ROWS);
+        $limit     = max(1, min($requested, Reports::AUDIT_MAX_ROWS)); // clamped, never rejected (§5.5)
+        $offset    = (int) ($args['offset'] ?? 0);
+        $report    = $this->reports()->audit($this->scope($args, null, self::REPORT_ACCOUNT_TYPES));
+        $total     = count($report['journals']);
+        $page      = array_slice($report['journals'], $offset, $limit);
+        $truncated = $offset + count($page) < $total;
+        $meta      = [
+            'truncated'     => $truncated,
+            'limit_applied' => $limit,
+            'offset'        => $offset,
+            'order'         => 'account_id,date,journal_id',
+            'count'         => count($page),
+            'total'         => $total,
+            'next_offset'   => $truncated ? $offset + $limit : null,
+        ];
+        if ($requested !== $limit) {
+            $meta['limit_requested'] = $requested;
+        }
+        $this->addMeta($meta);
+        $report['journals'] = $page;
+        if ($truncated) {
+            $report['notes'][] = sprintf('journals is a page: %d of %d — continue with offset=%d, or narrow with start/end or account_ids', count($page), $total, $offset + $limit);
+        }
 
-        return $this->ok($this->reports()->audit($this->scope($args, null, self::REPORT_ACCOUNT_TYPES)));
+        return $this->ok($report);
     }
 
     public function budget(Request $request): JsonResponse
@@ -107,12 +141,19 @@ final class ReportController extends ScopedController
         $types = [AccountTypeEnum::EXPENSE->value, AccountTypeEnum::REVENUE->value, AccountTypeEnum::BENEFICIARY->value];
         $group = $this->administration()->id;
         $found = [];
-        foreach ([...($args['counterparty_ids'] ?? []), ...($args['counterparty_names'] ?? [])] as $ref) {
+        $only  = static function ($query) use ($group, $types): void {
+            // whereHas, not a join: a join on account_types would overwrite accounts.id
+            $query->where('accounts.user_group_id', $group)->whereHas('accountType', static fn ($t) => $t->whereIn('type', $types));
+        };
+        foreach ($args['counterparty_ids'] ?? [] as $id) {
             /** @var Account $account */
-            $account = $this->resolve(Account::class, (string) $ref, 'name', static function ($query) use ($group, $types): void {
-                // whereHas, not a join: a join on account_types would overwrite accounts.id
-                $query->where('accounts.user_group_id', $group)->whereHas('accountType', static fn ($t) => $t->whereIn('type', $types));
-            });
+            $account             = $this->resolve(Account::class, (string) $id, 'name', $only);
+            $found[$account->id] = $account;
+        }
+        foreach ($args['counterparty_names'] ?? [] as $name) {
+            // a name is a name, even "4021" (§14.4) — never read as an id
+            /** @var Account $account */
+            $account             = $this->resolveByName(Account::class, (string) $name, 'name', $only);
             $found[$account->id] = $account;
         }
         ksort($found);

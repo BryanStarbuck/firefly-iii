@@ -26,9 +26,9 @@ namespace FireflyIII\Machine\Http\Controllers;
 
 use Carbon\Carbon;
 use Closure;
-use FireflyIII\Helpers\Collector\GroupCollectorInterface;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Money;
+use FireflyIII\Machine\Transactions\GroupRenderer;
 use FireflyIII\Machine\WriteResult;
 use FireflyIII\Models\Category;
 use FireflyIII\Models\Note;
@@ -38,9 +38,7 @@ use FireflyIII\Models\RuleTrigger;
 use FireflyIII\Repositories\Category\CategoryRepositoryInterface;
 use FireflyIII\Support\Facades\Navigation;
 use FireflyIII\Support\JsonApi\Enrichments\CategoryEnrichment;
-use FireflyIII\Support\JsonApi\Enrichments\TransactionGroupEnrichment;
 use FireflyIII\Transformers\CategoryTransformer;
-use FireflyIII\Transformers\TransactionGroupTransformer;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
@@ -65,7 +63,11 @@ final class CategoryController extends MachineController
         'end'   => ['sometimes', 'nullable', 'date_format:Y-m-d'],
     ];
 
-    /** A pseudo record type: journal links in a pivot table are not in the undo log, so undo refuses rather than half-restores. */
+    /**
+     * A pseudo record type for the journal↔category links (a pivot table with no model): they are
+     * not in the undo log row by row, so the operation carries one 'irreversible' marker and undo
+     * refuses, naming why, rather than half-restoring (§7.5).
+     */
     private const string PIVOT_MARKER = 'FireflyIII\Machine\Pivot\CategoryTransactionJournal';
 
     // ================================================================= reads ===
@@ -99,7 +101,12 @@ final class CategoryController extends MachineController
         ]);
     }
 
-    /** GET /categories/{id}/transactions — the category's transaction groups (all time when no range is given). */
+    /**
+     * GET /categories/{id}/transactions — the category's transaction groups (all time when no range
+     * is given), one row per GROUP, in the same shape GET /transactions renders (amounts at the
+     * currency's places, §14.1). Only the page is rendered — the collector's light journal rows are
+     * paged first, then the page's groups go through Firefly's enrichment and transformer.
+     */
     public function transactions(Request $request, string $id): JsonResponse
     {
         $args      = $this->input($request, self::PERIOD_RULES + self::LIST_RULES, true);
@@ -108,40 +115,33 @@ final class CategoryController extends MachineController
         $start     = null;
         $end       = null;
 
-        /** @var GroupCollectorInterface $collector */
-        $collector = app(GroupCollectorInterface::class);
-        $collector->setUser($this->operator())->setCategory($category)->withAPIInformation();
+        $collector = GroupRenderer::collector($this->operator(), $this->administration());
+        $collector->setCategory($category);
         if (null !== ($args['start'] ?? null) || null !== ($args['end'] ?? null)) {
             [$start, $end] = $this->resolvePeriod($args, true);
             $collector->setRange($start->copy(), $end->copy()->endOfDay());
         }
-        $groups    = [];
-        foreach ($collector->getGroups() as $group) {
-            $first    = is_array($group['transactions'] ?? null) ? reset($group['transactions']) : null;
-            $date     = is_array($first) && ($first['date'] ?? null) instanceof Carbon ? $first['date']->format('Y-m-d H:i:s') : '';
-            $groups[] = ['id' => (int) $group['id'], 'date' => $date, 'group' => $group];
+        $rows      = [];
+        foreach ($collector->getExtractedJournals() as $journal) {
+            $groupId = (int) $journal['transaction_group_id'];
+            if (array_key_exists($groupId, $rows)) {
+                continue;
+            }
+            $rows[$groupId] = [
+                'id'   => $groupId,
+                'date' => ($journal['date'] ?? null) instanceof Carbon ? $journal['date']->format('Y-m-d H:i:s') : (string) ($journal['date'] ?? ''),
+            ];
         }
-        $page      = $this->applyList($groups, $params);
-
-        $enrichment = new TransactionGroupEnrichment();
-        $enrichment->setUser($this->operator());
-        $enriched   = $enrichment->enrich(new Collection(array_map(static fn (array $row): array => $row['group'], $page)));
-
-        /** @var TransactionGroupTransformer $transformer */
-        $transformer  = app(TransactionGroupTransformer::class);
-        $transactions = [];
-        foreach ($enriched as $group) {
-            $row = $transformer->transform($group);
-            unset($row['links']);
-            $transactions[] = $row;
-        }
+        $page      = $this->applyList(array_values($rows), $params);
+        $groups    = GroupRenderer::groups(array_map(static fn (array $row): int => $row['id'], $page), $this->operator(), $this->administration());
 
         return $this->ok([
             'category_id'   => (string) $category->id,
             'category_name' => (string) $category->name,
             'start'         => $start?->format('Y-m-d'),
             'end'           => $end?->format('Y-m-d'),
-            'transactions'  => $transactions,
+            'transactions'  => $groups,
+            'total'         => count($rows),
         ]);
     }
 
@@ -301,7 +301,12 @@ final class CategoryController extends MachineController
                 $this->repo()->destroy($category);
             }
             if ($journalsMoved > 0) {
-                $result->touched[] = ['class' => self::PIVOT_MARKER, 'id' => $keepId, 'op' => 'updated', 'before' => ['moved_to' => $keepId, 'links' => $pivotBefore]];
+                $result->touched[] = ['class' => self::PIVOT_MARKER, 'id' => $keepId, 'op' => 'irreversible', 'before' => [
+                    'what'   => 'category links of transaction journals',
+                    'did'    => sprintf('re-pointed %d journal(s) to "%s"', $journalsMoved, $keep->name),
+                    'reason' => sprintf('%d journal(s) were moved from %d merged categor%s to "%s" (#%d); undo cannot move them back — the re-pointing is final', $journalsMoved, count($merged), 1 === count($merged) ? 'y' : 'ies', $keep->name, $keepId),
+                    'links'  => $pivotBefore,
+                ]];
             }
 
             return $result->with([
@@ -335,7 +340,18 @@ final class CategoryController extends MachineController
                 $result->deleting($note);
             }
             if ($journals > 0) {
-                $result->touched[] = ['class' => self::PIVOT_MARKER, 'id' => (int) $category->id, 'op' => 'deleted', 'before' => ['category_id' => (int) $category->id, 'journals' => $journals]];
+                $result->touched[] = ['class' => self::PIVOT_MARKER, 'id' => (int) $category->id, 'op' => 'irreversible', 'before' => [
+                    'what'   => 'category links of transaction journals',
+                    'did'    => sprintf('removed the category from %d journal(s)', $journals),
+                    'reason' => sprintf('%d journal(s) lost category "%s" (#%d); undo cannot restore those links', $journals, $category->name, $category->id),
+                ]];
+            }
+            // Firefly's CategoryDestroyService hard-deletes the recurring transactions' `category_id`
+            // meta rows (every user's — it does not scope them); record them so undo re-inserts them
+            $recurrences = 0;
+            foreach (RecurrenceTransactionMeta::query()->where('name', 'category_id')->where('value', (string) $category->id)->orderBy('id')->get() as $meta) {
+                $result->deleting($meta)->count('recurrences_unlinked');
+                ++$recurrences;
             }
             $result->deleting($category)->count('deleted');
             $this->repo()->destroy($category);
@@ -344,6 +360,7 @@ final class CategoryController extends MachineController
                 'deleted'               => 1,
                 'category'              => $rendered,
                 'journals_uncategorized' => $journals,
+                'recurrences_unlinked'  => $recurrences,
                 'undoable'              => 0 === $journals,
                 'message'               => 0 === $journals
                     ? sprintf('Category "%s" deleted.', $category->name)
@@ -401,10 +418,11 @@ final class CategoryController extends MachineController
         return (string) $value;
     }
 
+    /** Laravel hands route parameters already URL-decoded; decoding again would turn "A+B" into "A B". */
     private function findCategory(string $idOrName): Category
     {
         /** @var Category */
-        return $this->resolve(Category::class, urldecode($idOrName));
+        return $this->resolve(Category::class, $idOrName);
     }
 
     private function findCategoryOrNull(string $idOrName): ?Category

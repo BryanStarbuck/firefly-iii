@@ -104,14 +104,19 @@ final class AnomalyDetector
 
                 continue;
             }
-            if (Money::isZero($stddev)) {
-                ++$flat;
+            $size     = Money::compare($now, $mean) >= 0 ? $now : $mean;
+            $flatNorm = Money::isZero($stddev);
+            if ($flatNorm && 0 === Money::compare($now, $mean)) {
+                ++$flat; // the norm never varied and this window matches it: nothing to flag
 
                 continue;
             }
-            $score    = (string) Stats::zScore($now, $mean, $stddev);
-            $size     = Money::compare($now, $mean) >= 0 ? $now : $mean;
-            if (Money::compare(Money::abs($score), $z) < 0 || Money::compare($size, $minAmount) < 0) {
+            // a norm that never varied (rent, a subscription: 30, 30, 30…) has no spread to
+            // measure a deviation in, so z is undefined — but ANY change from it is a deviation
+            // (a missed payment, a doubled bill), and the most certain kind: flagged, with
+            // deviation null and the reason beside it, never skipped as "no variation"
+            $score    = $flatNorm ? null : (string) Stats::zScore($now, $mean, $stddev);
+            if (Money::compare($size, $minAmount) < 0 || (null !== $score && Money::compare(Money::abs($score), $z) < 0)) {
                 continue;
             }
             $items[]  = [
@@ -122,14 +127,26 @@ final class AnomalyDetector
                 'amount'          => $this->ledger->fmt($now, $code),
                 'trailing_mean'   => $this->ledger->fmt($mean, $code),
                 'trailing_stddev' => $this->ledger->fmt($stddev, $code),
-                'deviation'       => Money::format($score, 2),
-                'direction'       => Money::compare($score, '0') > 0 ? 'above' : 'below',
+                'deviation'       => null === $score ? null : Money::format($score, 2),
+                'direction'       => Money::compare($now, $mean) > 0 ? 'above' : 'below',
                 'difference'      => $this->ledger->fmt(Money::sub($now, $mean), $code),
+                'reason'          => null === $score
+                    ? 'the trailing norm never varied (stddev 0), so z is undefined — any change from it is a deviation'
+                    : sprintf('|z| ≥ %s', $z),
                 'trailing_values' => array_map(fn (array $w, string $v): array => ['start' => $w['start'], 'end' => $w['end'], 'amount' => $this->ledger->fmt($v, $code)], array_slice($windows, 0, $current), $history),
-                '_abs'            => Money::abs($score),
+                '_abs'            => null === $score ? null : Money::abs($score),
             ];
         }
-        usort($items, static fn (array $a, array $b): int => 0 !== ($c = Money::compare($b['_abs'], $a['_abs'])) ? $c : strcmp($a['kind'].$a['name'], $b['kind'].$b['name']));
+        // the flat-norm deviations first (the most certain), then by |z| descending, then by name
+        usort($items, static function (array $a, array $b): int {
+            if (null === $a['_abs'] || null === $b['_abs']) {
+                $c = (null === $b['_abs']) <=> (null === $a['_abs']);
+            } else {
+                $c = Money::compare($b['_abs'], $a['_abs']);
+            }
+
+            return 0 !== $c ? $c : strcmp($a['kind'].$a['name'], $b['kind'].$b['name']);
+        });
         foreach ($items as &$item) {
             unset($item['_abs']);
         }
@@ -145,8 +162,8 @@ final class AnomalyDetector
             'notes'          => [
                 'a detector, not an oracle: each item carries its trailing values, mean, standard deviation and z (deviation) — show the work before acting on it',
                 sprintf('flagged when |z| ≥ %s and the larger of the current amount and the norm is at least %s', $z, $minAmount),
+                'a norm that never varied (stddev 0) has no z: any change from it is flagged with deviation null and the reason; one that matches it is counted under skipped_no_variation',
                 'new_spending lists categories and payees with no spending in any trailing window (no norm to compare with)',
-                'categories and payees with an unvarying trailing norm (stddev 0) are skipped and counted',
             ],
             'excluded'       => $scope->excluded(),
             'provenance'     => $scope->provenance(['z' => $z, 'min_amount' => $minAmount, 'trailing_windows' => $trailing, 'window_shape' => $windows[$current]['shape']]),

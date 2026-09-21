@@ -160,7 +160,9 @@ final class RawIngestTest extends IngestTestCase
         $this->assertStringStartsWith('ff1:4021:20261020:-1200:0:', $meta['external_id']);
         $this->assertSame('RENT EXAMPLE PROPERTIES', $meta['internal_reference']);
         $this->assertArrayHasKey('import_hash_v2', $meta);
-        $this->assertSame('ff-machine-ingest|v1', $meta['original_source']);
+        // upstream's TransactionJournalFactory::hashArray() unsets original_source on the very row
+        // object it then stores, so no importer (the Data Importer included) ever lands it in meta
+        $this->assertArrayNotHasKey('original_source', $meta, 'original_source is stripped by upstream before the meta fields are stored');
 
         $account = (int) $journal->transactions()->where('amount', '<', 0)->value('account_id');
         $row     = ['date' => '2026-10-20', 'amount' => '-1200', 'description' => 'RENT EXAMPLE PROPERTIES', 'internal_reference' => 'RENT EXAMPLE PROPERTIES', 'external_id' => $meta['external_id']];

@@ -34,7 +34,8 @@ namespace FireflyIII\Machine\Ingest;
  *   prepared  the manifest's account directories; importable files (.ofx .qfx camt .xml .csv).
  *             One source set per account: OFX/QFX over camt over CSV (the bank's FITID is the
  *             best key there is), and a combined "…_ALL" file over the monthly files of its
- *             format — the rest are `not_chosen`, reported, never parsed into rows twice.
+ *             format — a lesser file is still read when it is the only source of some month;
+ *             the rest are `not_chosen`, reported, never parsed into rows twice.
  *   raw       {ENTITY}/{BANK}/{ACCOUNT}/{YYYY}/{MM}/: each PDF with its _claude/_brew/_ocr
  *             sidecars is one statement; an importable file dropped there is one too.
  */
@@ -55,8 +56,13 @@ final class Collector
         $staging     = new Staging($root);
         $preferences = Preferences::load($staging);
         $out         = [];
+        $phase       = true === ($opts['extract_pdf'] ?? false) ? 'extracting' : 'reading';
+        $n           = count($accounts);
+        $i           = 0;
+        Progress::tick($phase, 0, $n);
         foreach ($accounts as $account) {
             $out[$account['key']] = self::account($root, $mode, $account, $staging, $preferences, $opts);
+            Progress::tick($phase, ++$i, $n);
         }
 
         return ['mode' => $mode, 'accounts' => $out];
@@ -154,50 +160,71 @@ final class Collector
     }
 
     /**
+     * A prepared account's source set. Files are ranked by format — OFX/QFX (the bank's FITID is
+     * the best key there is) over camt over CSV — and a combined "…_ALL" file over the monthly
+     * files of its format. A file of a lesser format, or a monthly file beside a combined one, is
+     * still read when it is the ONLY source of some month: a CSV-only August beside OFX
+     * September–October is never dropped. Everything else is `not_chosen` with its rule, so no
+     * month is ever parsed into rows twice.
+     *
      * @param array<string, mixed> $account
      *
      * @return array{0: list<ParsedStatement>, 1: list<array<string, string>>}
      */
     private static function preparedStatements(string $root, string $dir, array $account): array
     {
-        $files    = [];
+        $candidates = [];
         foreach (self::walk($dir) as $path) {
             $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
-            if (in_array($ext, StatementReader::IMPORTABLE, true)) {
-                $files[] = $path;
-            }
-        }
-        sort($files, SORT_STRING);
-        // one format per account, best first
-        $byFormat = [];
-        foreach ($files as $f) {
-            $ext = strtolower(pathinfo($f, PATHINFO_EXTENSION));
-            if ('xml' === $ext && !self::isCamt($f)) {
+            if (!in_array($ext, StatementReader::IMPORTABLE, true) || ('xml' === $ext && !self::isCamt($path))) {
                 continue;
             }
-            $byFormat[self::FORMAT_RANK[$ext]][] = $f;
+            $candidates[] = [
+                'path'     => $path,
+                'rank'     => self::FORMAT_RANK[$ext],
+                'combined' => 1 === preg_match('/(?:^|[_\-. ])(?:ALL|COMBINED|FULL)(?:[_\-. ]|$)/i', pathinfo($path, PATHINFO_FILENAME)),
+            ];
         }
-        ksort($byFormat);
-        $chosen   = [] === $byFormat ? [] : reset($byFormat);
-        $combined = array_values(array_filter($chosen, static fn (string $f): bool => 1 === preg_match('/(?:^|[_\-. ])(?:ALL|COMBINED|FULL)(?:[_\-. ]|$)/i', pathinfo($f, PATHINFO_FILENAME))));
-        $use      = [] === $combined ? $chosen : $combined;
-        $skipped  = [];
-        foreach ($byFormat as $rank => $list) {
-            foreach ($list as $f) {
-                if (!in_array($f, $use, true)) {
-                    $skipped[] = [
-                        'file' => StatementsRoot::relative($root, $f),
-                        'rule' => in_array($f, $chosen, true) ? 'combined_file_preferred' : 'better_format_present',
-                    ];
+        if ([] === $candidates) {
+            return [[], []];
+        }
+        // best format first; within a format the combined file(s) first; then the path
+        usort($candidates, static fn (array $a, array $b): int => [$a['rank'], $a['combined'] ? 0 : 1, $a['path']] <=> [$b['rank'], $b['combined'] ? 0 : 1, $b['path']]);
+        $bestRank    = $candidates[0]['rank'];
+        $hasCombined = [];
+        foreach ($candidates as $c) {
+            if ($c['combined']) {
+                $hasCombined[$c['rank']] = true;
+            }
+        }
+        $covered = [];
+        $out     = [];
+        $skipped = [];
+        foreach ($candidates as $c) {
+            $statement = StatementReader::readFile($root, $c['path'], $account);
+            if (null === $statement) {
+                continue;
+            }
+            $preferred = $c['rank'] === $bestRank && ($c['combined'] || !isset($hasCombined[$c['rank']]));
+            $months    = $statement->months();
+            $uncovered = array_values(array_filter($months, static fn (string $m): bool => !isset($covered[$m])));
+            if ($preferred || [] !== $uncovered) {
+                foreach ($months as $m) {
+                    $covered[$m] ??= $c['rank'];
                 }
+                if (!$preferred) {
+                    $statement->warnings[] = sprintf('read although a better source exists for this account: it is the only source of %s', implode(', ', $uncovered));
+                }
+                $out[] = $statement;
+
+                continue;
             }
-        }
-        $out      = [];
-        foreach ($use as $f) {
-            $s = StatementReader::readFile($root, $f, $account);
-            if (null !== $s) {
-                $out[] = $s;
-            }
+            // every month it covers is already covered: by a combined file of its own format, or by a better format
+            $sameFormat = [] === $months || count(array_filter($months, static fn (string $m): bool => $covered[$m] === $c['rank'])) === count($months);
+            $skipped[]  = [
+                'file' => StatementsRoot::relative($root, $c['path']),
+                'rule' => $sameFormat ? 'combined_file_preferred' : 'better_format_present',
+            ];
         }
 
         return [$out, $skipped];

@@ -1,0 +1,33 @@
+{
+  "accounts": [
+    {
+      "entity": "household",
+      "institution": "Meridian",
+      "label": "Savings_x3308",
+      "last4": "3308",
+      "kind": "savings",
+      "currency": "USD",
+      "path": "bank/household/Meridian/Savings_x3308",
+      "statements": 1,
+      "transactions": 3,
+      "first": "2026-07",
+      "last": "2026-07",
+      "opening_balance": "1500.00",
+      "opening_balance_date": "2026-06-30"
+    },
+    {
+      "entity": "acme_llc",
+      "institution": "Meridian",
+      "label": "Card_x9901",
+      "last4": "9901",
+      "kind": "card",
+      "currency": "USD",
+      "path": "bank/acme_llc/Meridian/Card_x9901",
+      "statements": 1,
+      "transactions": 2,
+      "first": "2026-07",
+      "last": "2026-07",
+      "payment_date": "2026-07-25"
+    }
+  ]
+}

@@ -109,6 +109,7 @@ final class StatementsRoot
         if (!str_starts_with($candidate, '/')) {
             throw MachineException::invalid('root must be an absolute path.', 'Pass the statements root as an absolute path (GET /machine/v1/ingest/roots)', ['field' => 'root']);
         }
+        self::refuseDotDot($candidate, 'root');
         $real       = realpath($candidate);
         if (false === $real) {
             // do not confirm or deny the existence of a path outside the roots
@@ -134,6 +135,7 @@ final class StatementsRoot
         if ('' === $path) {
             throw MachineException::invalid('An empty path was given.', 'Pass a file inside the statements root', ['field' => 'path']);
         }
+        self::refuseDotDot($path, 'path');
         $abs  = str_starts_with($path, '/') ? $path : $root.'/'.$path;
         $real = realpath($abs);
         $test = false === $real ? self::realOrSelf($abs) : $real;
@@ -171,6 +173,24 @@ final class StatementsRoot
         }
 
         throw MachineException::forbidden('That path is outside the statements root.', 'Every statements path must resolve (symlinks followed) to somewhere inside the configured root', ['field' => 'path']);
+    }
+
+    /**
+     * A `..` segment is refused before anything is resolved: realpath() only answers for a path
+     * whose every component exists, and a lexical `a/../../etc` under a missing `a` would otherwise
+     * be compared as text. Nothing a statements tree needs is spelled with `..`.
+     */
+    private static function refuseDotDot(string $path, string $field): void
+    {
+        foreach (explode('/', str_replace('\\', '/', $path)) as $segment) {
+            if ('..' === $segment) {
+                throw MachineException::forbidden(
+                    'That path is outside the statements root.',
+                    'Every statements path must resolve (symlinks followed) to somewhere inside the configured root — spell it without ".."',
+                    ['field' => $field],
+                );
+            }
+        }
     }
 
     public static function isInside(string $outer, string $inner): bool

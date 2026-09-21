@@ -27,6 +27,7 @@ namespace Tests\Machine\Subscriptions;
 use FireflyIII\Machine\Http\Controllers\PiggyBankController;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\PiggyBank;
+use FireflyIII\Models\TransactionCurrency;
 use FireflyIII\User;
 use Illuminate\Support\Facades\DB;
 use Tests\Machine\MachineTestCase;
@@ -87,6 +88,109 @@ final class PiggyBankRoutesTest extends MachineTestCase
         $env = $this->envelope($this->machine('GET', '/piggy-banks/Rainy%20day'));
         $this->assertNull($env['data']['piggy_bank']['target_amount'], '§14.2 absent is not zero');
         $this->assertNull($env['data']['piggy_bank']['left_to_save']);
+        $this->assertNull($env['data']['piggy_bank']['save_per_month'], 'no target: no monthly figure, not "0.00"');
+        $this->assertNull($env['data']['piggy_bank']['pc_target_amount']);
+        $this->assertSame('0.00', $env['data']['piggy_bank']['pc_current_amount'], 'in the primary currency the saved amount is the primary-currency amount');
+
+        // a target with no date to reach it by has no monthly figure either; a goal with one does
+        $this->enableWrites();
+        $this->apply('PUT', '/piggy-banks/Vacation', ['target_date' => null]);
+        $env = $this->envelope($this->machine('GET', '/piggy-banks/Vacation'));
+        $this->assertNull($env['data']['piggy_bank']['target_date']);
+        $this->assertNull($env['data']['piggy_bank']['save_per_month']);
+        $this->assertSame('100.00', $env['data']['piggy_bank']['pc_current_amount']);
+        $this->assertSame('1000.00', $env['data']['piggy_bank']['pc_target_amount']);
+    }
+
+    public function testCreateRefusesACurrentAmountTheAccountCannotSpareInsteadOfAnOrphan(): void
+    {
+        // upstream's linkToAccountIds() silently skips the account and leaves a piggy bank with no accounts at all
+        $this->enableWrites();
+        $savings = $this->checking($this->user, 'Meridian Savings 7734'); // balance 0
+        $piggies = PiggyBank::query()->count();
+        $env     = $this->assertPlaneError($this->machine('POST', '/piggy-banks', ['name' => 'Car', 'accounts' => [['account_id' => (string) $savings->id, 'current_amount' => '5.00']]]), 400, 'invalid_input');
+        $this->assertSame('accounts.0.current_amount', $env['error']['details']['field']);
+        $this->assertSame('0.00', $env['error']['details']['max_amount']);
+        $this->assertSame($savings->id, $env['error']['details']['account_id']);
+        $this->assertStringContainsString('at most "0.00"', $env['error']['hint']);
+        $this->assertSame($piggies, PiggyBank::query()->count(), 'nothing was created');
+
+        // an amount the account CAN spare is accepted, and every requested account is linked
+        $plan    = $this->envelope($this->machine('POST', '/piggy-banks', ['name' => 'Car', 'accounts' => [['account_id' => (string) $this->checking->id, 'current_amount' => '50.00'], (string) $savings->id]]));
+        $this->assertTrue($plan['ok'], (string) json_encode($plan));
+        $linked  = array_column($plan['data']['piggy_bank']['accounts'], 'current_amount', 'account_id');
+        ksort($linked);
+        $this->assertSame([$this->checking->id => '50.00', $savings->id => '0.00'], $linked);
+    }
+
+    public function testEditRefusesACurrentAmountTheAccountCannotTakeInsteadOfKeepingTheOldOne(): void
+    {
+        // upstream's linkToAccountIds() keeps the OLD saved amount, silently, when the new one cannot be added
+        $this->enableWrites();
+        $env = $this->assertPlaneError($this->machine('PUT', '/piggy-banks/Vacation', ['accounts' => [['account_id' => (string) $this->checking->id, 'current_amount' => '600.00']]]), 400, 'invalid_input');
+        $this->assertSame('accounts.0.current_amount', $env['error']['details']['field']);
+        $this->assertSame('500.00', $env['error']['details']['max_amount'], '100 held + 400 the account can still spare');
+        $this->assertSame('100.00', $env['error']['details']['saved_on_account']);
+        $this->assertSame(0, bccomp('100', (string) DB::table('account_piggy_bank')->where('piggy_bank_id', $this->vacation->id)->value('current_amount'), 12));
+
+        $done = $this->apply('PUT', '/piggy-banks/Vacation', ['accounts' => [['account_id' => (string) $this->checking->id, 'current_amount' => '500.00']]]);
+        $this->assertSame('500.00', $done['data']['piggy_bank']['current_amount']);
+    }
+
+    public function testEditChangesTheCurrency(): void
+    {
+        // upstream's update honours transaction_currency_id only and silently ignores the code it validated
+        $this->enableWrites();
+        $eur = TransactionCurrency::query()->where('code', 'EUR')->first() ?? TransactionCurrency::create(['code' => 'EUR', 'name' => 'Euro', 'symbol' => 'E', 'decimal_places' => 2, 'enabled' => true]);
+        $this->user->userGroup->currencies()->syncWithoutDetaching([$eur->id => ['group_default' => false]]);
+        $plan = $this->envelope($this->machine('PUT', '/piggy-banks/Vacation', ['currency_code' => 'EUR']));
+        $this->assertTrue($plan['ok'], (string) json_encode($plan));
+        $this->assertSame(['updated' => 1], $plan['data']['changes']);
+        $this->assertSame('EUR', $plan['data']['piggy_bank']['currency_code']);
+        $this->assertSame('USD', $this->vacation->refresh()->transactionCurrency->code, 'dry run');
+        $done = $this->envelope($this->machine('PUT', '/piggy-banks/Vacation', ['currency_code' => 'EUR', 'dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
+        $this->assertTrue($done['ok'], (string) json_encode($done));
+        $this->assertSame('EUR', $this->vacation->refresh()->transactionCurrency->code);
+        $this->assertNull($done['data']['piggy_bank']['pc_current_amount'], 'Firefly has not converted the saved amount yet: unknown, not "0.00"');
+        $this->assertPlaneError($this->machine('PUT', '/piggy-banks/Vacation', ['currency_code' => 'XXZ']), 404, 'not_found');
+    }
+
+    public function testEditRefusesToDropAnAccountThatStillHoldsMoney(): void
+    {
+        // upstream's sync() would discard the 100.00 saved on the checking account
+        $this->enableWrites();
+        $savings = $this->checking($this->user, 'Meridian Savings 7734');
+        $env     = $this->assertPlaneError($this->machine('PUT', '/piggy-banks/Vacation', ['accounts' => [(string) $savings->id]]), 400, 'invalid_input');
+        $this->assertSame('100.00', $env['error']['details']['saved_on_account']);
+        $this->assertSame($this->checking->id, $env['error']['details']['account_id']);
+        $this->assertStringContainsString('/remove', $env['error']['hint']);
+        $this->assertSame(0, bccomp('100', (string) DB::table('account_piggy_bank')->where('piggy_bank_id', $this->vacation->id)->where('account_id', $this->checking->id)->value('current_amount'), 12));
+
+        // take the money out, then the account can go
+        $this->apply('POST', '/piggy-banks/Vacation/remove', ['amount' => '100.00']);
+        $done    = $this->apply('PUT', '/piggy-banks/Vacation', ['accounts' => [(string) $savings->id]]);
+        $this->assertSame([$savings->id], array_column($done['data']['piggy_bank']['accounts'], 'account_id'));
+    }
+
+    public function testEventsArePagedBeforeTheyAreEnriched(): void
+    {
+        $this->enableWrites();
+        $this->apply('POST', '/piggy-banks/Vacation/add', ['amount' => '10.00']);
+        $this->apply('POST', '/piggy-banks/Vacation/add', ['amount' => '20.00']);
+        $this->apply('POST', '/piggy-banks/Vacation/remove', ['amount' => '5.00']);
+
+        $env = $this->envelope($this->machine('GET', '/piggy-banks/Vacation/events', ['limit' => '2', 'order' => '-amount']));
+        $this->assertTrue($env['ok'], (string) json_encode($env));
+        $this->assertSame(['20.00', '10.00'], array_column($env['data']['events'], 'amount'));
+        $this->assertTrue($env['meta']['truncated']);
+        $this->assertSame(2, $env['meta']['next_offset']);
+        foreach ($env['data']['events'] as $event) {
+            $this->assertSame('Northbank Checking 4021', $event['account_name'], 'the page IS enriched');
+            $this->assertIsString($event['amount']);
+        }
+        $rest = $this->envelope($this->machine('GET', '/piggy-banks/Vacation/events', ['limit' => '2', 'order' => '-amount', 'offset' => '2']));
+        $this->assertSame([['5.00', 'remove']], array_map(static fn (array $e): array => [$e['amount'], $e['direction']], $rest['data']['events']));
+        $this->assertFalse($rest['meta']['truncated']);
     }
 
     public function testAddMoneyDryRunThenApplyAndTheEventIsListed(): void
@@ -214,5 +318,16 @@ final class PiggyBankRoutesTest extends MachineTestCase
         $this->assertNull(PiggyBank::query()->find($this->vacation->id));
         $again = $this->envelope($this->machine('DELETE', '/piggy-banks/'.$this->vacation->id));
         $this->assertSame(0, $again['data']['deleted']);
+    }
+
+    /** @return array<string, mixed> the applied envelope */
+    private function apply(string $method, string $path, array $body): array
+    {
+        $plan = $this->envelope($this->machine($method, $path, $body));
+        $this->assertTrue($plan['ok'], (string) json_encode($plan));
+        $done = $this->envelope($this->machine($method, $path, $body + ['dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
+        $this->assertTrue($done['ok'], (string) json_encode($done));
+
+        return $done;
     }
 }

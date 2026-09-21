@@ -98,6 +98,7 @@ final class Budgets
         }
 
         $rows    = [];
+        $raw     = []; // the stored (unrounded) figures behind every row, for the totals
         $covered = []; // budget id → currency → list of [start, end] limit periods
         usort($limits, static fn (BudgetLimit $a, BudgetLimit $b): int => [$a->budget_id, $a->start_date->format('Y-m-d'), $a->id] <=> [$b->budget_id, $b->start_date->format('Y-m-d'), $b->id]);
         $names   = $budgets->keyBy('id');
@@ -113,7 +114,9 @@ final class Budgets
             $end                                            = $limit->end_date->format('Y-m-d');
             $covered[(int) $limit->budget_id][$code][]      = [$start, $end];
             [$spent, $count]                                = $this->sum($byBudget[(int) $limit->budget_id] ?? [], $code, $start, $end);
-            $left                                           = Money::sub(Money::strip((string) $limit->amount), $spent);
+            $rawLimit                                       = Money::strip((string) $limit->amount);
+            $left                                           = Money::sub($rawLimit, $spent);
+            $raw[]                                          = ['budget_id' => (int) $limit->budget_id, 'name' => (string) ($names[$limit->budget_id]->name ?? ''), 'currency_code' => $code, 'limit' => $rawLimit, 'spent' => $spent];
             $rows[]                                         = [
                 'period'        => self::periodLabel($limit->start_date, $limit->end_date),
                 'period_start'  => $start,
@@ -158,6 +161,7 @@ final class Budgets
             }
             ksort($spentByCode);
             foreach ($spentByCode as $code => $cell) {
+                $raw[]  = ['budget_id' => (int) $budget->id, 'name' => (string) $budget->name, 'currency_code' => $code, 'limit' => null, 'spent' => $cell['spent']];
                 $rows[] = [
                     'period'          => sprintf('%s..%s', $scope->startDate(), $scope->endDate()),
                     'period_start'    => $scope->startDate(),
@@ -179,33 +183,50 @@ final class Budgets
             }
         }
 
-        $totals = [];
-        foreach ($rows as $row) {
+        // totals and per-budget sums add the STORED amounts, not the rounded display strings
+        $totals    = [];
+        $perBudget = [];
+        foreach ($raw as $row) {
             $code = $row['currency_code'];
+            $key  = sprintf('%d|%s', $row['budget_id'], $code);
             $totals[$code] ??= ['currency_code' => $code, 'limit' => null, 'spent' => '0'];
+            $perBudget[$key] ??= ['budget_id' => $row['budget_id'], 'name' => $row['name'], 'currency_code' => $code, 'limit' => null, 'spent' => '0'];
             if (null !== $row['limit']) {
-                $totals[$code]['limit'] = Money::add($totals[$code]['limit'] ?? '0', $row['limit']);
+                $totals[$code]['limit']    = Money::add($totals[$code]['limit'] ?? '0', $row['limit']);
+                $perBudget[$key]['limit']  = Money::add($perBudget[$key]['limit'] ?? '0', $row['limit']);
             }
-            $totals[$code]['spent'] = Money::add($totals[$code]['spent'], $row['spent']);
+            $totals[$code]['spent']   = Money::add($totals[$code]['spent'], $row['spent']);
+            $perBudget[$key]['spent'] = Money::add($perBudget[$key]['spent'], $row['spent']);
         }
         ksort($totals);
-        $totals = array_values(array_map(fn (array $t): array => [
+        ksort($perBudget, SORT_NATURAL);
+        $totals    = array_values(array_map(fn (array $t): array => [
             'currency_code' => $t['currency_code'],
             'limit'         => $this->ledger->fmt($t['limit'], $t['currency_code']),
             'spent'         => $this->ledger->fmt($t['spent'], $t['currency_code']),
         ], $totals));
+        $perBudget = array_values(array_map(fn (array $b): array => [
+            'budget_id'     => $b['budget_id'],
+            'name'          => $b['name'],
+            'currency_code' => $b['currency_code'],
+            'limit'         => $this->ledger->fmt($b['limit'], $b['currency_code']),
+            'spent'         => $this->ledger->fmt($b['spent'], $b['currency_code']),
+            'left'          => null === $b['limit'] ? null : $this->ledger->fmt(Money::sub($b['limit'], $b['spent']), $b['currency_code']),
+        ], $perBudget));
 
         return [
             'rows'                      => $rows,
+            'per_budget'                => $perBudget,
             'totals'                    => $totals,
             'budgets_without_activity'  => $unlimited,
             'notes'                     => [
                 'one row per budget limit (Firefly\'s budget period) that overlaps the range; spent is counted over the limit\'s own period, in the limit\'s currency',
                 'variance = spent − limit (positive means over budget); left = limit − spent',
                 'a row with limit null is spending on a budget outside any limit — no limit was set, which is not a limit of zero',
+                'per_budget adds each budget\'s limits and spending over the whole range, per currency (left null when no limit was set)',
             ],
             'excluded'                  => ['transfers', 'deposits', 'opening balances', 'reconciliations'],
-            'provenance'                => $scope->provenance(['budgets' => array_values(array_map('intval', $budgets->pluck('id')->all()))]),
+            'provenance'                => $scope->provenance(['budgets' => array_values(array_map('intval', $budgets->pluck('id')->all())), 'transfers' => 'not counted (withdrawals only)']),
         ];
     }
 

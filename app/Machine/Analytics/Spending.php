@@ -57,6 +57,7 @@ final class Spending
         $cells     = []; // [period][currency][key] => spent,count,name,id
         $bucketSum = []; // [currency][key] => total
         $totals    = []; // [currency] => spent,count  (per JOURNAL, so a multi-tag journal counts once)
+        $converted = new Converted($this->ledger);
         foreach ($journals as $journal) {
             $dir = Ledger::direction($scope, $journal);
             if (!($inflow ? $dir['in'] : $dir['out'])) {
@@ -71,6 +72,7 @@ final class Spending
             $totals[$code] ??= ['spent' => '0', 'count' => 0];
             $totals[$code]['spent'] = Money::add($totals[$code]['spent'], $amount);
             ++$totals[$code]['count'];
+            $converted->add($journal, 'spent');
             foreach ($this->keysOf($journal, $by) as [$id, $name]) {
                 $key                                = null === $id ? 'none' : (string) $id;
                 $cells[$label][$code][$key] ??= ['id' => $id, 'name' => $name, 'spent' => '0', 'count' => 0];
@@ -138,6 +140,7 @@ final class Spending
         if ($inflow) {
             $notes[] = 'amounts are money in (earned), not spent';
         }
+        $notes[] = $converted->note();
 
         return [
             'by'         => $by,
@@ -145,6 +148,7 @@ final class Spending
             'periods'    => $periods,
             'rows'       => $rows,
             'totals'     => $totalRows,
+            'converted'  => $converted->render(),
             'omitted'    => $omitted,
             'notes'      => $notes,
             'excluded'   => $scope->excluded(),
@@ -159,14 +163,16 @@ final class Spending
      */
     public function payees(Scope $scope, int $topN, string $direction): array
     {
-        $out      = 'out' === $direction;
-        $journals = $this->ledger->journals($scope, $out ? Ledger::outTypes($scope) : Ledger::inTypes($scope));
-        $groups   = [];
+        $out       = 'out' === $direction;
+        $journals  = $this->ledger->journals($scope, $out ? Ledger::outTypes($scope) : Ledger::inTypes($scope));
+        $groups    = [];
+        $converted = new Converted($this->ledger);
         foreach ($journals as $journal) {
             $dir = Ledger::direction($scope, $journal);
             if (!($out ? $dir['out'] : $dir['in'])) {
                 continue;
             }
+            $converted->add($journal, 'amount');
             $code      = (string) $journal['currency_code'];
             $accountId = (int) ($out ? $journal['destination_account_id'] : $journal['source_account_id']);
             $name      = (string) ($out ? $journal['destination_account_name'] : $journal['source_account_name']);
@@ -205,8 +211,9 @@ final class Spending
         return [
             'direction'  => $direction,
             'rows'       => $rows,
+            'converted'  => $converted->render(),
             'omitted'    => $cut,
-            'notes'      => ['a share is amount ÷ total — both are given as strings; the presentation layer divides'],
+            'notes'      => ['a share is amount ÷ total — both are given as strings; the presentation layer divides', $converted->note()],
             'excluded'   => $scope->excluded(),
             'provenance' => $scope->provenance(['direction' => $direction, 'top_n' => $topN]),
         ];
@@ -289,6 +296,7 @@ final class Spending
     {
         $journals  = $this->ledger->journals($scope, [TransactionTypeEnum::WITHDRAWAL->value]);
         $byMonth   = [];
+        $byPeriod  = [];
         $byAccount = [];
         $totals    = [];
         foreach ($journals as $journal) {
@@ -301,17 +309,20 @@ final class Spending
             $accountId = (int) $journal['source_account_id'];
             $name      = (string) $journal['source_account_name'];
             $mKey      = sprintf('%s|%d|%s', $month, $accountId, $code);
+            $pKey      = sprintf('%s|%s', $month, $code);
             $aKey      = sprintf('%d|%s', $accountId, $code);
             $byMonth[$mKey] ??= ['period' => $month, 'account_id' => $accountId, 'account_name' => $name, 'currency_code' => $code, 'count' => 0, 'amount' => '0'];
+            $byPeriod[$pKey] ??= ['period' => $month, 'currency_code' => $code, 'count' => 0, 'amount' => '0'];
             $byAccount[$aKey] ??= ['account_id' => $accountId, 'account_name' => $name, 'currency_code' => $code, 'count' => 0, 'amount' => '0'];
             $totals[$code] ??= ['currency_code' => $code, 'count' => 0, 'amount' => '0'];
-            foreach ([&$byMonth[$mKey], &$byAccount[$aKey], &$totals[$code]] as &$bucket) {
+            foreach ([&$byMonth[$mKey], &$byPeriod[$pKey], &$byAccount[$aKey], &$totals[$code]] as &$bucket) {
                 ++$bucket['count'];
                 $bucket['amount'] = Money::add($bucket['amount'], $amount);
             }
             unset($bucket);
         }
         ksort($byMonth);
+        ksort($byPeriod);
         ksort($byAccount);
         ksort($totals);
         $fmt = function (array $list): array {
@@ -320,11 +331,12 @@ final class Spending
 
         return [
             'rows'       => $fmt($byMonth),
+            'by_period'  => $fmt($byPeriod),
             'by_account' => $fmt($byAccount),
             'totals'     => $fmt($totals),
-            'notes'      => ['withdrawals only; list them with GET /transactions?without_category=true'],
+            'notes'      => ['withdrawals only; rows are per month and account, by_period per month, by_account per account; list them with GET /transactions?without_category=true'],
             'excluded'   => ['transfers', 'deposits', 'opening balances', 'reconciliations'],
-            'provenance' => $scope->provenance(),
+            'provenance' => $scope->provenance(['transfers' => 'not counted (withdrawals only)']),
         ];
     }
 

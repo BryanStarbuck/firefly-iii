@@ -62,22 +62,19 @@ final class RowBuilder
         $last4     = (string) ($account['last4'] ?? '');
         $idLast4   = '' === $last4 ? '0000' : $last4;
         $blocked   = array_flip($blockedMonths);
-        $counters  = [];
-        $rows      = [];
+        $kept      = [];
+        $seen      = [];
+        $dupes     = [];
         $bad       = [];
+        // pass 1: read every primary statement in the merged order; a bank id seen twice
+        // (overlapping OFX downloads) is collapsed here and reported
         foreach ($primaries as $s) {
             $lines = $s->rows;
             usort($lines, static fn (StatementRow $a, StatementRow $b): int => $a->line <=> $b->line);
             foreach ($lines as $r) {
                 $description = Normaliser::description($r->text, $account['institution'] ?? $s->institution);
-                $tie         = sprintf('%s|%s|%s', $r->date, $r->amount, Normaliser::tieKey($description));
-                $ordinal     = $counters[$tie] ?? 0;
-                $counters[$tie] = $ordinal + 1;
-                $externalId  = null !== $r->fitid
-                    ? sprintf('ofx:%s:%s', $idLast4, $r->fitid)
-                    : sprintf('ff1:%s:%s:%s:%d:%s', $idLast4, str_replace('-', '', $r->date), $r->amount, $ordinal, Normaliser::sha1_8($description));
                 $month       = substr($r->date, 0, 7);
-                $rows[]      = [
+                $row         = [
                     'account'            => $account['key'],
                     'date'               => $r->date,
                     'month'              => $month,
@@ -85,49 +82,60 @@ final class RowBuilder
                     'type'               => str_starts_with($r->amount, '-') ? 'withdrawal' : 'deposit',
                     'description'        => $description,
                     'internal_reference' => $r->text,
-                    'external_id'        => $externalId,
-                    'ordinal'            => $ordinal,
-                    'tie_key'            => $tie,
+                    'external_id'        => null,
+                    'ordinal'            => 0,
+                    'tie_key'            => sprintf('%s|%s|%s', $r->date, $r->amount, Normaliser::tieKey($description)),
                     'tie_group'          => 1,
                     'source_file'        => $s->source(),
                     'source_kind'        => $s->sourceKind,
                     'source_line'        => $r->line,
                     'statement'          => $s->relative,
                     'status'             => isset($blocked[$month]) ? 'blocked' : ('0' === $r->amount ? 'zero_amount' : 'ok'),
+                    'bank_id'            => null !== $r->fitid,
                 ];
+                if (null !== $r->fitid) {
+                    $row['external_id'] = sprintf('ofx:%s:%s', $idLast4, $r->fitid);
+                    if (isset($seen[$row['external_id']])) {
+                        $dupes[] = [
+                            'layer'         => 'transaction',
+                            'account'       => $row['account'],
+                            'period'        => $row['month'],
+                            'verdict'       => 'collapsed',
+                            'rule'          => 'same_external_id',
+                            'file'          => $row['source_file'].':'.$row['source_line'],
+                            'superseded_by' => $seen[$row['external_id']],
+                            'external_id'   => $row['external_id'],
+                            'ordinal'       => null,
+                            'tie_group'     => null,
+                        ];
+
+                        continue;
+                    }
+                    $seen[$row['external_id']] = $row['source_file'].':'.$row['source_line'];
+                }
+                $kept[] = $row;
             }
             foreach ($s->bad as $b) {
                 $bad[] = ['account' => $account['key'], 'file' => $s->source(), 'line' => $b['line'], 'text' => $b['text'], 'reason' => $b['reason']];
             }
         }
-        // tie-group sizes, recorded because they are the one thing a human cannot re-derive
-        foreach ($rows as $i => $row) {
-            $rows[$i]['tie_group'] = $counters[$row['tie_key']];
-            unset($rows[$i]['tie_key']);
-        }
-        // collapse repeated external ids (overlapping OFX downloads)
-        $seen      = [];
-        $dupes     = [];
-        $out       = [];
-        foreach ($rows as $row) {
-            if (isset($seen[$row['external_id']])) {
-                $dupes[] = [
-                    'layer'         => 'transaction',
-                    'account'       => $row['account'],
-                    'period'        => $row['month'],
-                    'verdict'       => 'collapsed',
-                    'rule'          => 'same_external_id',
-                    'file'          => $row['source_file'].':'.$row['source_line'],
-                    'superseded_by' => $seen[$row['external_id']],
-                    'external_id'   => $row['external_id'],
-                    'ordinal'       => $row['ordinal'],
-                    'tie_group'     => $row['tie_group'],
-                ];
-
-                continue;
+        // pass 2: ordinals per (date, amount, normalised description) tie-group over the MERGED
+        // account-month; a minted id carries its ordinal, a bank id already differs by itself
+        $counters  = [];
+        foreach ($kept as $i => $row) {
+            $ordinal                 = $counters[$row['tie_key']] ?? 0;
+            $counters[$row['tie_key']] = $ordinal + 1;
+            $kept[$i]['ordinal']     = $ordinal;
+            if (!$row['bank_id']) {
+                $kept[$i]['external_id'] = sprintf('ff1:%s:%s:%s:%d:%s', $idLast4, str_replace('-', '', $row['date']), $row['amount'], $ordinal, Normaliser::sha1_8($row['description']));
             }
-            $seen[$row['external_id']] = $row['source_file'].':'.$row['source_line'];
-            $out[]                     = $row;
+        }
+        // tie-group sizes, recorded because they are the one thing a human cannot re-derive
+        $out       = [];
+        foreach ($kept as $row) {
+            $row['tie_group'] = $counters[$row['tie_key']];
+            unset($row['tie_key'], $row['bank_id']);
+            $out[] = $row;
             if ($row['tie_group'] > 1) {
                 $dupes[] = [
                     'layer'         => 'transaction',

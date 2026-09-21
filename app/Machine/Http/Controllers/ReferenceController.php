@@ -53,6 +53,7 @@ use FireflyIII\Repositories\ObjectGroup\ObjectGroupRepositoryInterface;
 use FireflyIII\Repositories\Tag\TagRepositoryInterface;
 use FireflyIII\Repositories\Webhook\WebhookRepositoryInterface;
 use FireflyIII\Rules\IsValidAttachmentModel;
+use FireflyIII\Support\Facades\Amount;
 use FireflyIII\Support\Facades\AppConfiguration;
 use FireflyIII\Support\Facades\Preferences;
 use FireflyIII\Support\JsonApi\Enrichments\WebhookEnrichment;
@@ -97,7 +98,7 @@ final class ReferenceController extends MachineController
         $query  = Tag::query()->where('user_group_id', $this->administration()->id);
         $search = trim((string) ($args['search'] ?? ''));
         if ('' !== $search) {
-            $query->whereRaw('LOWER(tag) LIKE ?', ['%'.mb_strtolower($search).'%']);
+            $query->whereRaw("LOWER(tag) LIKE ? ESCAPE '\\'", ['%'.RuleController::likeEscape(mb_strtolower($search)).'%']);
         }
         $rows   = $this->applyList($query, $params)->map(fn (Tag $tag): array => $this->renderTag($tag))->all();
         $this->addMeta(['untrusted' => ['tag', 'description']]);
@@ -112,6 +113,15 @@ final class ReferenceController extends MachineController
         [$start, $end] = $this->range($args);
         $model = $this->findTag($tag);
         $repo  = $this->tagRepository();
+        $first = $repo->firstUseDate($model);
+        // Firefly's sumsOfTag() applies a range only when BOTH ends are given; a half-open range
+        // is resolved here (start → the tag's first use, end → today) and echoed (§14.3)
+        if (null !== $start && null === $end) {
+            $end = Carbon::now(config('app.timezone'))->startOfDay()->max($start);
+        }
+        if (null === $start && null !== $end) {
+            $start = ($first?->copy()->startOfDay() ?? $end->copy())->min($end);
+        }
         $sums  = [];
         foreach ($repo->sumsOfTag($model, $start, null === $end ? null : $end->copy()->endOfDay()) as $currencyId => $row) {
             $currency = TransactionCurrency::withTrashed()->find((int) $currencyId);
@@ -135,8 +145,8 @@ final class ReferenceController extends MachineController
             'range'     => ['start' => $start?->format('Y-m-d'), 'end' => $end?->format('Y-m-d')],
             'sums'      => $sums,
             'signed'    => ['spent'],
-            'journals'  => count($repo->getJournalIds($model)),
-            'first_use' => $repo->firstUseDate($model)?->format('Y-m-d'),
+            'journals'  => self::journalCount($model),
+            'first_use' => $first?->format('Y-m-d'),
             'last_use'  => $repo->lastUseDate($model)?->format('Y-m-d'),
         ]);
     }
@@ -163,6 +173,7 @@ final class ReferenceController extends MachineController
                 'zoom_level'  => null,
             ]);
             RuleController::recordRowChanges($result, $specs, $before);
+            $this->marked($dryRun);
 
             return $result->count('created')->with(['tag' => $this->renderTag($tag->refresh())]);
         });
@@ -192,17 +203,22 @@ final class ReferenceController extends MachineController
             }
             $this->tagRepository()->update($fresh, $data);
             RuleController::recordRowChanges($result, $specs, $before);
+            $this->marked($dryRun);
 
             return $result->count('updated', [] === $result->touched ? 0 : 1)->count('unchanged', [] === $result->touched ? 1 : 0)
-                ->with(['tag' => $this->renderTag($fresh->refresh()), 'journals' => count($this->tagRepository()->getJournalIds($fresh))]);
+                ->with(['tag' => $this->renderTag($fresh->refresh()), 'journals' => self::journalCount($fresh)]);
         });
     }
 
-    /** DELETE /tags/{tag} — admin. Firefly unlinks the tag from every journal and deletes its attachments. */
+    /**
+     * DELETE /tags/{tag} — admin. Firefly's TagRepository::destroy() unlinks the tag from every
+     * journal and soft-deletes it; attachments filed under the tag are NOT removed (their records
+     * stay, pointing at the deleted tag), and the response says so rather than claiming otherwise.
+     */
     public function destroyTag(Request $request, string $tag): JsonResponse
     {
         $args  = $this->input($request, []);
-        $model = $this->findOrGone(fn (): Tag => $this->findTag($tag), $tag);
+        $model = $this->findOrGone(fn (): Tag => $this->findTag($tag), $tag, true); // a tag is addressed by name (§8.8)
 
         return $this->write($request, $args, function (bool $dryRun) use ($model, $tag): WriteResult {
             $result = new WriteResult();
@@ -214,15 +230,23 @@ final class ReferenceController extends MachineController
             $attachments = $fresh->attachments()->count();
             $specs       = $this->tagSpecs();
             $before      = RuleController::snapshotRows($specs);
-            $this->holdingFiles($dryRun, fn () => $this->tagRepository()->destroy($fresh));
+            $this->tagRepository()->destroy($fresh);
             RuleController::recordRowChanges($result, $specs, $before);
+            if ($links > 0) {
+                // the tag_transaction_journal rows Firefly removes have no model: undo restores the
+                // tag but cannot re-link the journals, so the log must refuse instead of half-undoing
+                self::irreversible($result, 'tag_links', sprintf('untagged %d journal(s)', $links), 'Firefly removes the tag\'s journal links with a raw delete the operation log cannot restore — re-tag them with a rule or by hand');
+            }
+            $this->marked($dryRun);
 
-            return $result->count('deleted')->count('journals_untagged', $links)->count('attachments_deleted', $attachments)->with([
-                'deleted'             => 1,
-                'tag'                 => $fresh->tag,
-                'journals_untagged'   => $links,
-                'attachments_deleted' => $attachments,
-                'undo_note'           => 'POST /undo restores the tag itself, but not its links to journals or its attachment files — Firefly keeps those outside a model.',
+            return $result->count('deleted')->count('journals_untagged', $links)->with([
+                'deleted'           => 1,
+                'tag'               => $fresh->tag,
+                'journals_untagged' => $links,
+                'attachments_kept'  => $attachments,
+                'undo_note'         => $links > 0
+                    ? 'POST /undo cannot reverse this: the tag\'s links to its journals are gone. Re-create the tag and re-tag the journals with a rule.'
+                    : 'POST /undo restores the tag (it was on no journal).',
             ]);
         });
     }
@@ -273,6 +297,7 @@ final class ReferenceController extends MachineController
             $repo->update($fresh, $data);
             $repo->resetOrder();
             RuleController::recordRowChanges($result, $specs, $before);
+            $this->marked($dryRun);
             $self   = 0;
             foreach ($result->touched as $t) {
                 $self += (int) ((int) $t['id'] === $group->id);
@@ -300,8 +325,21 @@ final class ReferenceController extends MachineController
             $before  = RuleController::snapshotRows($specs);
             $this->objectGroupRepository()->destroy($fresh);
             RuleController::recordRowChanges($result, $specs, $before);
+            $this->marked($dryRun);
 
-            return $result->count('deleted')->with(['deleted' => 1, 'object_group_id' => (string) $fresh->id, 'title' => $fresh->title, 'members_ungrouped' => $members, 'undo_note' => 'POST /undo restores the group, not its membership.']);
+            if ($members > 0) {
+                // the object_groupables pivot rows have no model: undo could bring the group back
+                // empty, which is a half-undo (§7.5) — the log refuses instead
+                self::irreversible($result, 'object_group_members', sprintf('ungrouped %d piggy bank(s) / subscription(s)', $members), 'Firefly removes the group\'s membership pivot rows, which the operation log cannot restore — re-create the group and re-add its members');
+            }
+
+            return $result->count('deleted')->with([
+                'deleted'           => 1,
+                'object_group_id'   => (string) $fresh->id,
+                'title'             => $fresh->title,
+                'members_ungrouped' => $members,
+                'undo_note'         => $members > 0 ? 'POST /undo cannot reverse this: the group\'s membership is gone with it.' : 'POST /undo restores the group (it was empty).',
+            ]);
         });
     }
 
@@ -366,7 +404,7 @@ final class ReferenceController extends MachineController
             $result  = new WriteResult();
             $repo    = $this->currencyRepository();
             $fresh   = TransactionCurrency::query()->findOrFail($currency->id);
-            $fresh->refreshForUser($this->operator());
+            $this->decorateCurrency($fresh);
             $enabled = (bool) $fresh->userGroupEnabled;
             if ($enabled === $enable) {
                 return $result->count('unchanged')->with(['currency' => $this->renderCurrency($fresh)]);
@@ -387,14 +425,17 @@ final class ReferenceController extends MachineController
             if ($enable) {
                 $repo->enable($fresh);
             }
-            $fresh->refreshForUser($this->operator());
+            $this->decorateCurrency($fresh);
             $result->count($enable ? 'enabled' : 'disabled');
             $result->basis = [$fresh->code, $enable];
+            $reverse       = sprintf('POST /machine/v1/currencies/%s/%s', $fresh->code, $enable ? 'disable' : 'enable');
+            self::irreversible($result, 'currency', sprintf('%s %s', $enable ? 'enabled' : 'disabled', $fresh->code), sprintf('Firefly keeps enabled currencies in a pivot outside a model; %s reverses it', $reverse));
+            $this->marked($dryRun);
 
             return $result->with([
                 'currency'   => $this->renderCurrency($fresh),
                 'reversible' => false,
-                'undo_note'  => sprintf('POST /machine/v1/currencies/%s/%s reverses this — Firefly keeps enabled currencies outside a model, so POST /undo cannot.', $fresh->code, $enable ? 'disable' : 'enable'),
+                'undo_note'  => sprintf('%s reverses this — Firefly keeps enabled currencies outside a model, so POST /undo cannot.', $reverse),
             ]);
         });
     }
@@ -463,21 +504,22 @@ final class ReferenceController extends MachineController
             $existing = $repo->getSpecificRateOnDate($from, $to, $date->copy())
                 ?? CurrencyExchangeRate::query()->where('user_group_id', $admin)->where('from_currency_id', $from->id)->where('to_currency_id', $to->id)->whereDate('date', $date->format('Y-m-d'))->orderBy('id')->first();
             if (null !== $existing && 0 === Money::compare((string) $existing->rate, (string) $args['rate'])) {
-                return $result->count('unchanged')->with(['exchange_rate' => $this->renderRate($existing)]);
+                return $result->count('unchanged')->with(['exchange_rate' => $this->renderRate($existing), 'previous_rate' => Money::strip((string) $existing->rate), 'reversible' => true]);
             }
+            $previous = null === $existing ? null : Money::strip((string) $existing->rate);
             if (null !== $existing) {
                 $rate = $repo->updateExchangeRate($existing, (string) $args['rate'], $date->copy());
-                event(new UpdatedCurrencyExchangeRate($rate));
+                RuleController::shieldingCache($dryRun, static fn () => event(new UpdatedCurrencyExchangeRate($rate)));
                 $result->count('updated');
             }
             if (null === $existing) {
                 $rate = $repo->storeExchangeRate($from, $to, (string) $args['rate'], $date->copy());
-                event(new CreatedCurrencyExchangeRate($rate));
+                RuleController::shieldingCache($dryRun, static fn () => event(new CreatedCurrencyExchangeRate($rate)));
                 $result->count('created');
             }
             RuleController::recordRowChanges($result, $specs, $before);
 
-            return $result->with(['exchange_rate' => $this->renderRate($rate->refresh())]);
+            return $result->with(['exchange_rate' => $this->renderRate($rate->refresh()), 'previous_rate' => $previous] + $this->rateUndoNote($dryRun, $result, $from, $to, $date, $previous));
         });
     }
 
@@ -502,11 +544,12 @@ final class ReferenceController extends MachineController
             $from   = $rate->fromCurrency;
             $to     = $rate->toCurrency;
             $date   = $rate->date;
+            $previous = Money::strip((string) $rate->rate);
             $this->exchangeRateRepository()->deleteRate($rate);
-            event(new DestroyedCurrencyExchangeRate($from, $to, $admin, $date));
+            RuleController::shieldingCache($dryRun, static fn () => event(new DestroyedCurrencyExchangeRate($from, $to, $admin, $date)));
             RuleController::recordRowChanges($result, $specs, $before);
 
-            return $result->count('deleted')->with(['deleted' => 1, 'exchange_rate' => $render]);
+            return $result->count('deleted')->with(['deleted' => 1, 'exchange_rate' => $render] + $this->rateUndoNote($dryRun, $result, $from, $to, Carbon::parse($date), $previous));
         });
     }
 
@@ -536,11 +579,13 @@ final class ReferenceController extends MachineController
             'inward'  => ['required', 'string', 'min:1', 'max:1024', 'unique:link_types,inward', 'different:outward'],
             'outward' => ['required', 'string', 'min:1', 'max:1024', 'unique:link_types,outward', 'different:inward'],
         ]);
+        $this->assertLinkTypeOwner();
 
         return $this->write($request, $args, function (bool $dryRun) use ($args): WriteResult {
             $result = new WriteResult();
             $type   = $this->linkTypeRepository()->store(['name' => $args['name'], 'inward' => $args['inward'], 'outward' => $args['outward']]);
             $result->created($type);
+            $this->marked($dryRun);
 
             return $result->count('created')->with(['link_type' => $this->renderLinkType($type->refresh())]);
         });
@@ -555,6 +600,7 @@ final class ReferenceController extends MachineController
             'inward'  => ['sometimes', 'string', 'min:1', 'max:1024', 'unique:link_types,inward,'.$type->id],
             'outward' => ['sometimes', 'string', 'min:1', 'max:1024', 'unique:link_types,outward,'.$type->id],
         ]);
+        $this->assertLinkTypeOwner();
         $this->assertEditable($type);
         if ([] === array_diff_key($args, self::CONTROL_RULES)) {
             throw MachineException::invalid('Nothing to change.', 'Pass at least one of name, inward, outward');
@@ -565,6 +611,7 @@ final class ReferenceController extends MachineController
             $fresh  = LinkType::query()->findOrFail($type->id);
             $result->updating($fresh);
             $this->linkTypeRepository()->update($fresh, array_intersect_key($args, array_flip(['name', 'inward', 'outward'])));
+            $this->marked($dryRun);
 
             return $result->count('updated')->with(['link_type' => $this->renderLinkType($fresh->refresh())]);
         });
@@ -574,6 +621,7 @@ final class ReferenceController extends MachineController
     public function destroyLinkType(Request $request, string $id): JsonResponse
     {
         $args = $this->input($request, []);
+        $this->assertLinkTypeOwner();
         $type = $this->findOrGone(fn (): LinkType => $this->findLinkType($id), $id);
         if (null !== $type) {
             $this->assertEditable($type);
@@ -588,6 +636,7 @@ final class ReferenceController extends MachineController
             $links  = $this->linkTypeRepository()->countJournals($fresh);
             $result->deleting($fresh);
             $this->linkTypeRepository()->destroy($fresh);
+            $this->marked($dryRun);
 
             return $result->count('deleted')->with(['deleted' => 1, 'link_type' => $this->renderLinkType($fresh), 'links_using_it' => $links]);
         });
@@ -607,11 +656,24 @@ final class ReferenceController extends MachineController
         }
         $params = $this->listParams($request, ['id' => 'id', 'created_at' => 'created_at', 'filename' => 'filename', 'size' => 'size'], '-created_at');
         $query  = $this->attachmentQuery();
-        if (isset($args['attachable_type'])) {
-            $query->where('attachable_type', 'FireflyIII\Models\\'.$args['attachable_type']);
+        $type   = $args['attachable_type'] ?? null;
+        $id     = isset($args['attachable_id']) ? (int) $args['attachable_id'] : null;
+        if ('Transaction' === $type) {
+            // Firefly files a Transaction's attachment on its journal (AttachmentFactory::create)
+            $type = 'TransactionJournal';
+            if (null !== $id) {
+                $transaction = $this->operator()->transactions()->find($id);
+                if (null === $transaction) {
+                    throw MachineException::notFound(sprintf('No transaction with id %d.', $id), 'GET /machine/v1/transactions lists journals with their transaction ids', ['attachable_id' => $id]);
+                }
+                $id = (int) $transaction->transaction_journal_id;
+            }
         }
-        if (isset($args['attachable_id'])) {
-            $query->where('attachable_id', (int) $args['attachable_id']);
+        if (null !== $type) {
+            $query->where('attachable_type', 'FireflyIII\Models\\'.$type);
+        }
+        if (null !== $id) {
+            $query->where('attachable_id', $id);
         }
         $rows   = $this->applyList($query, $params)->map(fn (Attachment $a): array => $this->renderAttachment($a))->all();
         $this->addMeta(['untrusted' => ['filename', 'title', 'notes']]);
@@ -674,6 +736,10 @@ final class ReferenceController extends MachineController
         if (false === $bytes || '' === $bytes) {
             throw MachineException::invalid('content_base64 is not valid base64, or it is empty.', 'Send the file\'s bytes base64-encoded (the whole body is capped at 8 MiB)', ['field' => 'content_base64']);
         }
+        $maxUpload = (int) config('firefly.maxUploadSize');
+        if ($maxUpload > 0 && strlen($bytes) > $maxUpload) {
+            throw MachineException::invalid(sprintf('The file is %d bytes; Firefly accepts up to %d.', strlen($bytes), $maxUpload), 'Compress or split the file, or raise maxUploadSize in the app\'s configuration', ['bytes' => strlen($bytes), 'max_upload_bytes' => $maxUpload]);
+        }
         $finfo = finfo_open(FILEINFO_MIME_TYPE);
         $mime  = false === $finfo ? '' : (string) finfo_buffer($finfo, $bytes);
         if (!in_array($mime, (array) config('firefly.allowedMimes'), true)) {
@@ -703,6 +769,7 @@ final class ReferenceController extends MachineController
                 }
             }
             RuleController::recordRowChanges($result, $specs, $before);
+            $this->marked($dryRun);
 
             return $result->count('created')->with([
                 'attachment' => $this->renderAttachment($attachment->refresh()),
@@ -729,11 +796,23 @@ final class ReferenceController extends MachineController
                 [Attachment::class, static fn (): EloquentBuilder => Attachment::query()->where('id', $fresh->id)],
                 [Note::class, static fn (): EloquentBuilder => Note::query()->where('noteable_type', Attachment::class)->where('noteable_id', $fresh->id)],
             ];
-            $before = RuleController::snapshotRows($specs);
+            $before  = RuleController::snapshotRows($specs);
+            $hadFile = (bool) $fresh->uploaded && $this->attachmentRepository()->exists($fresh);
             $this->holdingFiles($dryRun, fn () => $this->attachmentRepository()->destroy($fresh));
             RuleController::recordRowChanges($result, $specs, $before);
+            if ($hadFile) {
+                // the file is gone from the attachment disk; restoring only the record would be a
+                // half-undo (§7.5), so the log refuses
+                self::irreversible($result, 'attachment_file', sprintf('deleted the file of attachment #%d', $fresh->id), 'the stored file was removed from the attachment disk and cannot be restored — upload it again with POST /machine/v1/attachments');
+            }
+            $this->marked($dryRun);
 
-            return $result->count('deleted')->with(['deleted' => 1, 'attachment' => $render, 'file_removed' => true, 'undo_note' => 'POST /undo restores the attachment record, not the deleted file.']);
+            return $result->count('deleted')->with([
+                'deleted'      => 1,
+                'attachment'   => $render,
+                'file_removed' => $hadFile,
+                'undo_note'    => $hadFile ? 'POST /undo cannot reverse this: the stored file is gone. Upload it again with POST /machine/v1/attachments.' : 'POST /undo restores the attachment record (it had no file).',
+            ]);
         });
     }
 
@@ -882,18 +961,58 @@ final class ReferenceController extends MachineController
     }
 
     /**
+     * With "convert to primary" on, Firefly's exchange-rate listener (ProcessesExchangeRates)
+     * recalculates the converted (pc_*) amounts of every affected transaction, account, budget
+     * and piggy bank — rows the operation log does not trace. Restoring only the rate row would
+     * be a half-undo (§7.5), so the operation is marked irreversible and the response names the
+     * reverse: re-posting the previous rate, which runs the same recalculation.
+     *
+     * @return array{reversible: bool, undo_note: string}
+     */
+    private function rateUndoNote(bool $dryRun, WriteResult $result, TransactionCurrency $from, TransactionCurrency $to, Carbon $date, ?string $previous): array
+    {
+        // the same switch the listener reads; its default-storing reads stay in the rolled-back
+        // transaction and, during a dry run, in the throwaway cache
+        $converts = RuleController::shieldingCache($dryRun, static fn (): bool => Amount::convertToPrimary());
+        if (!$converts) {
+            return ['reversible' => true, 'undo_note' => 'POST /undo restores the rate row (converted amounts are not maintained on this install).'];
+        }
+        $reverse = null === $previous
+            ? sprintf('DELETE /machine/v1/exchange-rates/{id} (admin) removes the rate for %s → %s on %s', $from->code, $to->code, $date->format('Y-m-d'))
+            : sprintf('POST /machine/v1/exchange-rates {"from": "%s", "to": "%s", "date": "%s", "rate": "%s"} puts the previous rate back', $from->code, $to->code, $date->format('Y-m-d'), $previous);
+        self::irreversible($result, 'exchange_rate_recalculation', sprintf('changed the %s → %s rate on %s and recalculated the converted amounts', $from->code, $to->code, $date->format('Y-m-d')), 'Firefly recalculated every converted (pc_*) amount for that currency, which the operation log does not trace — '.$reverse);
+
+        return ['reversible' => false, 'undo_note' => 'POST /undo cannot reverse this: Firefly recalculated the converted amounts of the books for this rate. '.$reverse.'.'];
+    }
+
+    /** After a REAL write, what upstream's controllers do: mark activity so Firefly's own caches refresh. */
+    private function marked(bool $dryRun): void
+    {
+        if (!$dryRun) {
+            Preferences::mark();
+        }
+    }
+
+    /** An operation the log must refuse to undo, naming why (OperationLog's 'irreversible' marker). */
+    private static function irreversible(WriteResult $result, string $what, string $did, string $reason): void
+    {
+        $result->touched[] = ['class' => self::class, 'id' => 0, 'op' => 'irreversible', 'before' => ['what' => $what, 'did' => $did, 'reason' => $reason]];
+    }
+
+    /**
      * @template T of object
      *
      * @param Closure(): T $find
      *
-     * @return null|T  null when a numeric id is already gone (a DELETE answers deleted: 0, §5.6)
+     * @return null|T  null when the thing is already gone (a DELETE answers deleted: 0, §5.6):
+     *                 a numeric id always; a name too when $names is true (tags are addressed by name)
      */
-    private function findOrGone(Closure $find, string $ref): ?object
+    private function findOrGone(Closure $find, string $ref, bool $names = false): ?object
     {
         try {
             return $find();
         } catch (MachineException $e) {
-            if ('not_found' === $e->code() && 1 === preg_match('/^\d{1,19}$/', trim($ref))) {
+            if ('not_found' === $e->code() && ($names || 1 === preg_match('/^\d{1,19}$/', trim($ref)))) {
                 return null;
             }
 
@@ -925,21 +1044,52 @@ final class ReferenceController extends MachineController
         return [[Tag::class, static fn (): EloquentBuilder => Tag::query()->where('user_group_id', $admin)]];
     }
 
+    /**
+     * A tag is addressed by NAME (§8.8: /tags/{tag}), and tags are very often years ("2025"). A
+     * numeric segment is therefore looked up both as a name and as an id: one hit wins, two
+     * different hits are an ambiguity error carrying both candidates (§14.4) — never a silent
+     * pick of the id. Route segments arrive already URL-decoded and are not decoded again.
+     */
     private function findTag(string $ref): Tag
     {
-        /** @var Tag */
-        return $this->resolve(Tag::class, urldecode($ref), 'tag');
+        $value = trim($ref);
+        if (1 !== preg_match('/^\d{1,19}$/', $value)) {
+            /** @var Tag */
+            return $this->resolve(Tag::class, $value, 'tag');
+        }
+        $admin  = $this->administration()->id;
+        $byName = Tag::query()->where('user_group_id', $admin)->where('tag', $value)->first();
+        $byId   = Tag::query()->where('user_group_id', $admin)->where('id', (int) $value)->first();
+        if (null !== $byName && null !== $byId && $byName->id !== $byId->id) {
+            throw MachineException::invalid(
+                sprintf('"%s" is both a tag name and a tag id.', $value),
+                'Pass the tag\'s id instead — the candidates are in details.candidates',
+                ['name' => $value, 'candidates' => [['id' => $byId->id, 'name' => $byId->tag], ['id' => $byName->id, 'name' => $byName->tag]]],
+            );
+        }
+        $found  = $byName ?? $byId;
+        if (null === $found) {
+            throw MachineException::notFound(sprintf('No tag named "%s", and no tag with that id.', $value), 'GET /machine/v1/tags lists them', ['name' => $value]);
+        }
+
+        return $found;
+    }
+
+    /** How many journals carry the tag — a COUNT, never the journals themselves (a tag can sit on thousands). */
+    private static function journalCount(Tag $tag): int
+    {
+        return (int) $tag->transactionJournals()->count();
     }
 
     private function findObjectGroup(string $ref): ObjectGroup
     {
         /** @var ObjectGroup */
-        return $this->resolve(ObjectGroup::class, urldecode($ref), 'title');
+        return $this->resolve(ObjectGroup::class, $ref, 'title');
     }
 
     private function findCurrency(string $code): TransactionCurrency
     {
-        $value = trim(urldecode($code));
+        $value = trim($code);
         if (1 === preg_match('/^\d{1,19}$/', $value)) {
             $found = TransactionCurrency::query()->find((int) $value);
         }
@@ -956,7 +1106,24 @@ final class ReferenceController extends MachineController
     private function findLinkType(string $ref): LinkType
     {
         /** @var LinkType */
-        return $this->resolve(LinkType::class, urldecode($ref), 'name', static fn ($q) => $q);
+        return $this->resolve(LinkType::class, $ref, 'name', static fn ($q) => $q);
+    }
+
+    /**
+     * Link types are install-wide (no user or administration column). Upstream mounts their
+     * writes behind the "api-admin" middleware — the operator must hold the install's `owner`
+     * role — and the plane keeps that gate rather than widening who may change every user's
+     * link vocabulary (routes/api.php, IsAdminApi).
+     */
+    private function assertLinkTypeOwner(): void
+    {
+        if (!$this->operator()->hasRole('owner')) {
+            throw MachineException::forbidden(
+                'Link types are shared by every user of this install; only its owner may change them.',
+                'Firefly III gives the owner role to its first user — run the plane as that user (FIREFLY_MACHINE_OPERATOR), or edit link types in the UI as the owner',
+                ['operator' => (string) $this->operator()->email],
+            );
+        }
     }
 
     private function assertEditable(LinkType $type): void
@@ -971,13 +1138,13 @@ final class ReferenceController extends MachineController
         $userId = $this->operator()->id;
 
         /** @var Attachment */
-        return $this->resolve(Attachment::class, urldecode($ref), 'filename', static fn ($q) => $q->where('user_id', $userId));
+        return $this->resolve(Attachment::class, $ref, 'filename', static fn ($q) => $q->where('user_id', $userId));
     }
 
     private function findWebhook(string $ref): Webhook
     {
         /** @var Webhook */
-        return $this->resolve(Webhook::class, urldecode($ref), 'title');
+        return $this->resolve(Webhook::class, $ref, 'title');
     }
 
     /** @return EloquentBuilder<Attachment> */
@@ -992,9 +1159,13 @@ final class ReferenceController extends MachineController
         return array_values(array_map(static fn (string $c): string => str_replace('FireflyIII\Models\\', '', $c), (array) config('firefly.valid_attachment_models')));
     }
 
+    /** Firefly's webhook switch, read WITHOUT storing the default (a read must not write, R8). */
     private function webhooksEnabled(): bool
     {
-        return (bool) AppConfiguration::get('allow_webhooks', config('firefly.allow_webhooks'))->data;
+        $row = AppConfiguration::get('allow_webhooks');
+        $raw = null === $row ? config('firefly.allow_webhooks', false) : $row->data;
+
+        return true === filter_var($raw, FILTER_VALIDATE_BOOLEAN);
     }
 
     /** Firefly's default for a preference, as PreferencesController shows it. */
@@ -1111,10 +1282,26 @@ final class ReferenceController extends MachineController
         return $row;
     }
 
+    /**
+     * The per-administration flags the CurrencyTransformer renders (enabled, primary) — from two
+     * plain queries. Firefly's own TransactionCurrency::refreshForUser() goes through
+     * Amount::getPrimaryCurrencyByUserGroup(), whose CacheProperties key reads the `anonymous`
+     * preference with a default and STORES it, and which syncs a default currency when none is
+     * set: two writes a read route must not make (R8).
+     */
+    private function decorateCurrency(TransactionCurrency $currency): TransactionCurrency
+    {
+        $group                      = $this->administration();
+        $currency->userGroupEnabled = $group->currencies()->where('transaction_currencies.id', $currency->id)->exists();
+        $currency->userGroupNative  = $currency->id === $this->primaryCurrency()->id;
+
+        return $currency;
+    }
+
     /** @return array<string, mixed> */
     private function renderCurrency(TransactionCurrency $currency): array
     {
-        $currency->refreshForUser($this->operator());
+        $this->decorateCurrency($currency);
 
         /** @var CurrencyTransformer $transformer */
         $transformer = app(CurrencyTransformer::class);

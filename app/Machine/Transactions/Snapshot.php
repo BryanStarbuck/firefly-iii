@@ -127,20 +127,45 @@ final class Snapshot
         if ([] === $groupIds) {
             return $out;
         }
-        $out[TransactionGroup::class]   = self::rows(TransactionGroup::class, static fn ($q) => $q->whereIn('id', $groupIds));
-        $out[TransactionJournal::class] = self::rows(TransactionJournal::class, static fn ($q) => $q->whereIn('transaction_group_id', $groupIds));
+        $out[TransactionGroup::class]   = self::rowsIn(TransactionGroup::class, 'id', $groupIds);
+        $out[TransactionJournal::class] = self::rowsIn(TransactionJournal::class, 'transaction_group_id', $groupIds);
         $journalIds = array_map('intval', array_keys($out[TransactionJournal::class]));
         if ([] === $journalIds) {
             return $out;
         }
         foreach ([Transaction::class, TransactionJournalMeta::class, CategoryJournalRow::class, BudgetJournalRow::class, TagJournalRow::class, PiggyBankEvent::class] as $class) {
-            $out[$class] = self::rows($class, static fn ($q) => $q->whereIn('transaction_journal_id', $journalIds));
+            $out[$class] = self::rowsIn($class, 'transaction_journal_id', $journalIds);
         }
         $morph      = (new TransactionJournal())->getMorphClass();
-        $out[Note::class]                   = self::rows(Note::class, static fn ($q) => $q->where('noteable_type', $morph)->whereIn('noteable_id', $journalIds));
-        $out[TransactionJournalLink::class] = self::rows(TransactionJournalLink::class, static fn ($q) => $q->where(static function ($w) use ($journalIds): void {
-            $w->whereIn('source_id', $journalIds)->orWhereIn('destination_id', $journalIds);
-        }));
+        $out[Note::class]                   = self::rowsIn(Note::class, 'noteable_id', $journalIds, static fn ($q) => $q->where('noteable_type', $morph));
+        $out[TransactionJournalLink::class] = self::rowsIn(TransactionJournalLink::class, 'source_id', $journalIds)
+            + self::rowsIn(TransactionJournalLink::class, 'destination_id', $journalIds);
+        ksort($out[TransactionJournalLink::class], SORT_NUMERIC);
+
+        return $out;
+    }
+
+    /** A filter can select more journals than a database binds in one statement, so every id list is chunked. */
+    private const int CHUNK = 500;
+
+    /**
+     * @param class-string<Model> $class
+     * @param list<int>           $ids
+     *
+     * @return array<string, array<string, mixed>> id => raw row, ordered by id
+     */
+    private static function rowsIn(string $class, string $column, array $ids, ?\Closure $also = null): array
+    {
+        $out = [];
+        foreach (array_chunk($ids, self::CHUNK) as $chunk) {
+            $out += self::rows($class, static function ($q) use ($column, $chunk, $also): void {
+                $q->whereIn($column, $chunk);
+                if (null !== $also) {
+                    $also($q);
+                }
+            });
+        }
+        ksort($out, SORT_NUMERIC);
 
         return $out;
     }

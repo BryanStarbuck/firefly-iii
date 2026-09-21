@@ -25,6 +25,7 @@ declare(strict_types=1);
 namespace FireflyIII\Machine\Analytics;
 
 use Carbon\Carbon;
+use Closure;
 use FireflyIII\Machine\Http\Controllers\MachineController;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Models\Account;
@@ -32,7 +33,10 @@ use FireflyIII\Models\Budget;
 use FireflyIII\Models\Category;
 use FireflyIII\Models\Tag;
 use FireflyIII\Models\TransactionCurrency;
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * The base of the analytics, chart and report controllers: the shared arguments of apis.mdx
@@ -161,9 +165,11 @@ abstract class ScopedController extends MachineController
     }
 
     /**
-     * Resolve a list of ids and a list of names to models (each one exactly, §14.4).
+     * Resolve a list of ids and a list of names to models (each one exactly, §14.4). An id is
+     * looked up as an id; a NAME is looked up as a name even when it looks like a number — a tag
+     * called "2026" or a category called "4021" is a name, never an id.
      *
-     * @template TModel of \Illuminate\Database\Eloquent\Model
+     * @template TModel of Model
      *
      * @param class-string<TModel> $class
      * @param array<int, mixed>    $ids
@@ -174,13 +180,82 @@ abstract class ScopedController extends MachineController
     protected function resolveMany(string $class, array $ids, array $names, string $nameColumn): Collection
     {
         $found = [];
-        foreach ([...$ids, ...$names] as $value) {
-            $model                  = $this->resolve($class, (string) $value, $nameColumn);
+        foreach ($ids as $id) {
+            $model                   = $this->resolve($class, (string) $id, $nameColumn);
+            $found[$model->getKey()] = $model;
+        }
+        foreach ($names as $name) {
+            $model                   = $this->resolveByName($class, (string) $name, $nameColumn);
             $found[$model->getKey()] = $model;
         }
         ksort($found);
 
         return new Collection(array_values($found));
+    }
+
+    /**
+     * Resolve ONE model by its name only (exact, then case-insensitive) inside the operator's
+     * administration: 0 hits is not_found, more than one is invalid_input carrying the
+     * candidates (§14.4). The value is never read as an id — see resolveMany().
+     *
+     * @template TModel of Model
+     *
+     * @param class-string<TModel>          $class
+     * @param null|Closure(EloquentBuilder): void $scope narrows the query instead of the default user_group_id / user_id scope
+     *
+     * @return TModel
+     */
+    protected function resolveByName(string $class, string $name, string $nameColumn = 'name', ?Closure $scope = null): Model
+    {
+        /** @var Model $prototype */
+        $prototype = new $class();
+        $entity    = strtolower((string) preg_replace('/(?<!^)[A-Z]/', ' $0', class_basename($class)));
+        $value     = trim($name);
+        if ('' === $value) {
+            throw MachineException::invalid(sprintf('An empty %s name was given.', $entity), sprintf('Pass the %s\'s id or its exact name', $entity));
+        }
+        $base      = function () use ($class, $prototype, $scope): EloquentBuilder {
+            $query = $class::query();
+            if (null !== $scope) {
+                $scope($query);
+
+                return $query;
+            }
+            $columns = self::tableColumns($prototype->getTable());
+            if (in_array('user_group_id', $columns, true)) {
+                $query->where($prototype->qualifyColumn('user_group_id'), $this->administration()->id);
+            } elseif (in_array('user_id', $columns, true)) {
+                $query->where($prototype->qualifyColumn('user_id'), $this->operator()->id);
+            }
+
+            return $query;
+        };
+        $column    = $prototype->qualifyColumn($nameColumn);
+        $exact     = $base()->where($column, $value)->limit(11)->get();
+        if (1 === $exact->count()) {
+            return $exact->first();
+        }
+        $matches   = $exact->count() > 1 ? $exact : $base()->whereRaw(sprintf('LOWER(%s) = ?', $column), [mb_strtolower($value)])->limit(11)->get();
+        if (1 === $matches->count()) {
+            return $matches->first();
+        }
+        if (0 === $matches->count()) {
+            throw MachineException::notFound(sprintf('No %s named "%s".', $entity, $value), sprintf('List them with the matching GET route, or pass the %s\'s id', $entity), ['name' => $value]);
+        }
+
+        throw MachineException::invalid(
+            sprintf('"%s" matches %s%d %ss.', $value, $matches->count() > 10 ? 'more than ' : '', min(10, $matches->count()), $entity),
+            sprintf('Pass the %s\'s id instead — the candidates are in details.candidates', $entity),
+            ['name' => $value, 'candidates' => $matches->take(10)->map(static fn (Model $m): array => ['id' => $m->getKey(), 'name' => (string) $m->getAttribute($nameColumn)])->values()->all()],
+        );
+    }
+
+    /** @return list<string> */
+    private static function tableColumns(string $table): array
+    {
+        static $cache = [];
+
+        return $cache[$table] ??= Schema::getColumnListing($table);
     }
 
     protected function currencyCode(mixed $code): ?string
@@ -214,7 +289,9 @@ abstract class ScopedController extends MachineController
         }
 
         /** @var Category $category */
-        $category = $this->resolve(Category::class, (string) $ref);
+        $category = isset($args['category_id'])
+            ? $this->resolve(Category::class, (string) $ref)
+            : $this->resolveByName(Category::class, (string) $ref);
         $scope    = $this->scope(array_merge($args, ['category_ids' => [(string) $category->id], 'category_names' => []]));
 
         return [$category, $scope];

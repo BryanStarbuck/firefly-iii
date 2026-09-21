@@ -25,6 +25,7 @@ declare(strict_types=1);
 namespace FireflyIII\Machine\Analytics;
 
 use Carbon\Carbon;
+use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Money;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\Bill;
@@ -39,6 +40,9 @@ use Illuminate\Support\Collection;
  */
 final class Charts
 {
+    /** The account-balances chart draws at most this many account × period points (§15). */
+    public const int MAX_ACCOUNT_CELLS = 2400;
+
     public function __construct(private readonly Ledger $ledger) {}
 
     /** Spending (by category, budget or tag) per period: one series per bucket and currency. */
@@ -79,24 +83,19 @@ final class Charts
         return $series->render(self::prov($data), ['stats' => $data['stats'], 'excluded' => $data['excluded'] ?? []]);
     }
 
-    /** Budgets as categories on x: limit, spent and left per currency over the range. */
+    /**
+     * Budgets as categories on x: limit, spent and left per currency over the range — from the
+     * calculator's per_budget section, which adds the stored amounts (never the rounded display
+     * strings of the rows).
+     */
     public function fromBudgets(array $data, string $chart = 'budget-overview'): array
     {
         $series = new Series($chart, 'category', []);
-        $sums   = [];
-        foreach ($data['rows'] as $row) {
-            $k = sprintf('%d|%s', $row['budget_id'], $row['currency_code']);
-            $sums[$k] ??= ['name' => $row['name'], 'code' => $row['currency_code'], 'limit' => null, 'spent' => '0'];
-            if (null !== $row['limit']) {
-                $sums[$k]['limit'] = Money::add($sums[$k]['limit'] ?? '0', $row['limit']);
-            }
-            $sums[$k]['spent'] = Money::add($sums[$k]['spent'], (string) $row['spent']);
-        }
-        foreach ($sums as $sum) {
-            $code = $sum['code'];
-            $series->set('limit|'.$code, 'limit-'.strtolower($code), 'Limit', $code, $sum['name'], $this->ledger->fmt($sum['limit'], $code));
-            $series->set('spent|'.$code, 'spent-'.strtolower($code), 'Spent', $code, $sum['name'], $this->ledger->fmt($sum['spent'], $code));
-            $series->set('left|'.$code, 'left-'.strtolower($code), 'Left', $code, $sum['name'], null === $sum['limit'] ? null : $this->ledger->fmt(Money::sub($sum['limit'], $sum['spent']), $code));
+        foreach ($data['per_budget'] as $sum) {
+            $code = $sum['currency_code'];
+            $series->set('limit|'.$code, 'limit-'.strtolower($code), 'Limit', $code, $sum['name'], $sum['limit']);
+            $series->set('spent|'.$code, 'spent-'.strtolower($code), 'Spent', $code, $sum['name'], $sum['spent']);
+            $series->set('left|'.$code, 'left-'.strtolower($code), 'Left', $code, $sum['name'], $sum['left']);
         }
 
         return $series->render(self::prov($data), ['excluded' => $data['excluded'] ?? []]);
@@ -130,21 +129,17 @@ final class Charts
 
     public function fromUncategorized(array $data, string $chart = 'uncategorized-summary'): array
     {
-        $labels = array_values(array_unique(array_column($data['rows'], 'period')));
+        // the calculator's by_period section adds the stored amounts once; the chart never
+        // re-adds rounded display strings
+        $labels = array_values(array_unique(array_column($data['by_period'], 'period')));
         sort($labels);
-        $sums   = [];
-        foreach ($data['rows'] as $row) {
-            $sums[$row['currency_code']][$row['period']] = Money::add($sums[$row['currency_code']][$row['period']] ?? '0', $row['amount']);
-        }
-        ksort($sums);
         $series = new Series($chart, 'period', $labels);
-        foreach ($sums as $code => $byPeriod) {
-            foreach ($byPeriod as $period => $amount) {
-                $series->set($code, 'uncategorized-'.strtolower((string) $code), 'Uncategorised', (string) $code, (string) $period, $this->ledger->fmt($amount, (string) $code));
-            }
+        foreach ($data['by_period'] as $row) {
+            $code = (string) $row['currency_code'];
+            $series->set($code, 'uncategorized-'.strtolower($code), 'Uncategorised', $code, (string) $row['period'], $row['amount']);
         }
 
-        return $series->render(self::prov($data));
+        return $series->render(self::prov($data), ['excluded' => $data['excluded'] ?? []]);
     }
 
     /**
@@ -156,6 +151,14 @@ final class Charts
     public function accountBalances(Scope $scope): array
     {
         $periods = Periods::split($scope->start, $scope->end, $scope->interval);
+        $cells   = $scope->accounts->count() * count($periods);
+        if ($cells > self::MAX_ACCOUNT_CELLS) {
+            throw MachineException::invalid(
+                sprintf('%d accounts × %d periods is %d balance points; the ceiling is %d.', $scope->accounts->count(), count($periods), $cells, self::MAX_ACCOUNT_CELLS),
+                'Narrow the range, use a coarser interval (quarter, year), or pass account_ids[] for the accounts you want drawn',
+                ['cells' => $cells, 'max' => self::MAX_ACCOUNT_CELLS, 'accounts' => $scope->accounts->count(), 'periods' => count($periods)],
+            );
+        }
         $series  = new Series('account-balances', 'period', array_column($periods, 'label'));
 
         /** @var AccountRepositoryInterface $repository */
@@ -170,6 +173,9 @@ final class Charts
                     continue;
                 }
                 foreach ($this->ledger->balances(new Collection([$account]), Carbon::parse($period['end'])) as $code => $balance) {
+                    if (null !== $scope->currencyCode && $code !== $scope->currencyCode) {
+                        continue;
+                    }
                     $scope->noteCurrency($code);
                     $multi[(int) $account->id][$code] = true;
                     $points[]                         = [$account, $code, $period['label'], $this->ledger->fmt($balance, $code)];
@@ -182,7 +188,7 @@ final class Charts
         }
         $scope->countRows(count($points));
 
-        return $series->render($scope->provenance(['interval' => $scope->interval, 'balances' => 'end of each period, virtual balance excluded']), [
+        return $series->render($scope->provenance(['interval' => $scope->interval, 'balances' => 'end of each period, '.Ledger::BALANCE_NOTE]), [
             'notes' => ['a period before the account\'s first transaction is a gap (null), not a zero'],
         ]);
     }

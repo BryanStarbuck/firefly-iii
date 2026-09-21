@@ -41,7 +41,7 @@ final class AdminRoutes implements RouteFamily
 
         return [
             RouteDef::live('POST', '/admin/key/rotate', 'admin', 'Mint a new machine key; the response is the fingerprint only.', [$a, 'rotateKey'], ['phase' => 'P10', 'dryRun' => false]),
-            RouteDef::live('POST', '/admin/cron', 'admin', 'Run Firefly\'s cron now (recurring transactions, auto-budgets, bill warnings).', [$a, 'cron'], ['phase' => 'P10', 'dryRun' => false]),
+            RouteDef::live('POST', '/admin/cron', 'admin', 'Run Firefly\'s cron now (recurring transactions, auto-budgets, bill warnings, webhooks). The dry run reports what each job would create.', [$a, 'cron'], ['phase' => 'P10']),
             RouteDef::live('POST', '/admin/correct-database', 'admin', 'Run Firefly\'s integrity repairs; the response lists what each corrector changed.', [$a, 'correctDatabase'], ['phase' => 'P10']),
             RouteDef::live('POST', '/admin/data/destroy', 'admin', 'Firefly\'s data/destroy for the listed object types.', [$a, 'destroyData'], ['phase' => 'P10']),
             RouteDef::live('POST', '/admin/data/purge', 'admin', 'Permanently remove soft-deleted rows — after which undo of those rows is impossible.', [$a, 'purgeData'], ['phase' => 'P10']),
@@ -49,7 +49,7 @@ final class AdminRoutes implements RouteFamily
             RouteDef::live('GET', '/admin/configuration', 'admin', 'The install\'s dynamic configuration values.', [$a, 'configuration'], ['phase' => 'P10']),
             RouteDef::live('POST', '/webhooks', 'admin', 'Create a webhook.', [$a, 'createWebhook'], ['phase' => 'P10']),
             RouteDef::live('PUT', '/webhooks/{id}', 'admin', 'Edit a webhook.', [$a, 'updateWebhook'], ['phase' => 'P10']),
-            RouteDef::live('POST', '/webhooks/{id}/submit', 'admin', 'Send a webhook\'s pending messages now.', [$a, 'submitWebhook'], ['phase' => 'P10', 'dryRun' => false]),
+            RouteDef::live('POST', '/webhooks/{id}/submit', 'admin', 'Send a webhook\'s pending messages now. The dry run says how many would leave.', [$a, 'submitWebhook'], ['phase' => 'P10']),
             RouteDef::live('DELETE', '/webhooks/{id}', 'admin', 'Delete a webhook.', [$a, 'deleteWebhook'], ['phase' => 'P10']),
         ];
     }

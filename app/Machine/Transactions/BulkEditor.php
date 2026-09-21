@@ -35,7 +35,7 @@ use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Services\Internal\Update\JournalUpdateService;
 use FireflyIII\Support\Facades\Preferences;
-use Illuminate\Support\Collection;
+use Illuminate\Database\Eloquent\Collection;
 
 /**
  * The UI's bulk edit (upstream's Http\Controllers\Transaction\BulkController::update()) over a
@@ -56,16 +56,25 @@ final class BulkEditor
      * @param array{category?: array{id: null|int, name: null|string}, budget?: array{id: null|int, name: null|string}, tags_add?: list<string>, tags_remove?: list<string>, tags_replace?: list<string>} $set
      *                                                       category/budget with id null and name null = clear it
      *
-     * @return array{changes: array<string, int>, affected: list<array<string, mixed>>, affected_truncated: bool, changed_group_ids: list<int>}
+     * @param null|int $applyLimit the caller's max_changes ceiling: once more journals than this
+     *                             would change, the rest are counted but not written — the count
+     *                             is the real one either way, and a plan over the ceiling is refused
+     *                             (apis.mdx §7.1), so writing rows past it only burns time in a
+     *                             transaction that will be rolled back
+     *
+     * @return array{changes: array<string, int>, affected: list<array<string, mixed>>, affected_truncated: bool, changed_group_ids: list<int>, applied: int}
      */
-    public static function apply(Collection $journals, array $set): array
+    public static function apply(Collection $journals, array $set, ?int $applyLimit = null): array
     {
         $changes  = ['updated' => 0, 'unchanged' => 0, 'skipped' => 0];
         $affected = [];
         $groups   = [];
+        $applied  = 0;
+
+        // one query per relation for the whole selection, never one per journal
+        $journals->load(['transactionType', 'categories', 'budgets', 'tags', 'transactions.account', 'transactions.transactionCurrency']);
 
         foreach ($journals as $journal) {
-            $journal->loadMissing(['transactionType', 'categories', 'budgets', 'tags', 'transactions.account', 'transactions.transactionCurrency']);
             $type          = (string) $journal->transactionType?->type;
             $category      = $journal->categories->first();
             $budget        = $journal->budgets->first();
@@ -121,14 +130,17 @@ final class BulkEditor
                 ++$changes['unchanged'];
                 $row['outcome'] = 'unchanged';
             } else {
-                /** @var JournalUpdateService $service */
-                $service = app(JournalUpdateService::class);
-                $service->setTransactionJournal($journal);
-                $service->setData($data);
-                $service->update();
                 ++$changes['updated'];
-                $row['outcome']                                = 'updated';
-                $groups[(int) $journal->transaction_group_id] = true;
+                $row['outcome'] = 'updated';
+                if (null === $applyLimit || $applied < $applyLimit) {
+                    /** @var JournalUpdateService $service */
+                    $service = app(JournalUpdateService::class);
+                    $service->setTransactionJournal($journal);
+                    $service->setData($data);
+                    $service->update();
+                    ++$applied;
+                    $groups[(int) $journal->transaction_group_id] = true;
+                }
             }
             if (count($affected) < self::AFFECTED_ROWS) {
                 $affected[] = $row;
@@ -153,6 +165,7 @@ final class BulkEditor
             'affected'           => $affected,
             'affected_truncated' => $journals->count() > self::AFFECTED_ROWS,
             'changed_group_ids'  => $changedGroupIds,
+            'applied'            => $applied,
         ];
     }
 

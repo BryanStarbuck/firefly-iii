@@ -228,13 +228,23 @@ final class AnalyticsRoutesTest extends MachineTestCase
     public function testAnomalies(): void
     {
         $data = $this->ok('/analytics/anomalies', ['start' => '2026-09-01', 'end' => '2026-09-30', 'trailing' => 2])['data'];
-        $this->assertSame([['payee', 'Corner Cafe', '250.00', '2.25', '110.11'], ['category', '(no category)', '250.00', '32.25', '96.78']], array_map(static fn (array $i): array => [$i['kind'], $i['name'], $i['amount'], $i['trailing_mean'], $i['deviation']], $data['items']));
+        // the gym was paid 30.00 in July and August (a norm with no spread) and not at all in
+        // September: a deviation from a constant norm, flagged first, with deviation null
+        $this->assertSame(
+            [['payee', 'Iron Gym', '0.00', '30.00', null], ['payee', 'Corner Cafe', '250.00', '2.25', '110.11'], ['category', '(no category)', '250.00', '32.25', '96.78']],
+            array_map(static fn (array $i): array => [$i['kind'], $i['name'], $i['amount'], $i['trailing_mean'], $i['deviation']], $data['items'])
+        );
+        $this->assertSame(['below', '-30.00'], [$data['items'][0]['direction'], $data['items'][0]['difference']]);
+        $this->assertStringContainsString('never varied', $data['items'][0]['reason']);
         $this->assertSame(['2026-07-01', '2026-08-01'], array_column($data['trailing'], 'start'));
-        $this->assertSame(['4.50', '0.00'], array_column($data['items'][0]['trailing_values'], 'amount'));
-        $this->assertGreaterThan(0, $data['summary']['skipped_no_variation']);
+        $this->assertSame(['4.50', '0.00'], array_column($data['items'][1]['trailing_values'], 'amount'));
+        // Streamly (15.99, 15.99, 15.99) and its category match their unvarying norm: counted, not flagged
+        $this->assertSame(2, $data['summary']['skipped_no_variation']);
 
         $high = $this->ok('/analytics/anomalies', ['start' => '2026-09-01', 'end' => '2026-09-30', 'trailing' => 2, 'z' => '100'])['data'];
-        $this->assertSame(['Corner Cafe'], array_column($high['items'], 'name'));
+        $this->assertSame(['Iron Gym', 'Corner Cafe'], array_column($high['items'], 'name'), 'z does not gate a flat-norm deviation (it has no z)');
+        $min  = $this->ok('/analytics/anomalies', ['start' => '2026-09-01', 'end' => '2026-09-30', 'trailing' => 2, 'min_amount' => '31'])['data'];
+        $this->assertNotContains('Iron Gym', array_column($min['items'], 'name'), 'min_amount does gate it');
         $this->assertPlaneError($this->machine('GET', '/analytics/anomalies', ['z' => '2,0']), 400, 'invalid_input');
     }
 

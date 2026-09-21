@@ -71,7 +71,11 @@ Claude Code, so this fork grows:
 1. **A machine-plane API** — `/machine/v1`, loopback-only, mounted inside the same Laravel app and
    calling Firefly's own repositories, factories and rule engine. Every write has a dry run (the real
    write inside a rolled-back DB transaction), a confirm token, a ceiling, and an undo log.
-   Spec: `pm/apis.mdx`. Code: `app/Machine/`, `routes/machine.php`.
+   Spec: `pm/apis.mdx`. Code: `app/Machine/` (`MachinePlaneServiceProvider`, `Http/Middleware/` = the
+   gate ladder, `Http/Controllers/` one per family, `Routes/` one `RouteFamily` per family feeding
+   `RouteTable` — the ONE array behind both the router and `/capabilities`, `Ingest/`, `Analytics/`,
+   `Undo/`), `routes/machine.php`, `config/machine.php`, `tests/Machine/`. The only upstream file
+   touched is `bootstrap/providers.php` (one line).
 2. **A CLI, `ffx`** — a thin Node + TypeScript client of that API. Spec: `pm/cli.mdx`.
    Code: `cli/` (shim `cli/ffx`, implementation under `cli/code/`).
 3. **An MCP server, `firefly_iii`** (every tool prefixed `ff_`) — a thin Node + TypeScript client of
@@ -108,7 +112,16 @@ Upstream code worth knowing when working on the plane:
   PHP 8.5 and Composer on the host (`brew install php composer`). Docker is not supported for the
   machine plane: requests arrive from the bridge IP, so the loopback gate fails closed.
 * Root `justfile` (ours; upstream has none): `just setup`, `just build`, `just run`, `just server-bg`,
-  `just stop`, `just status`, `just test`.
+  `just stop`, `just status`, `just doctor`, `just test`.
+* `just setup` also builds the web UI's Vite assets (`public/build/` is git-ignored upstream; without it
+  every page 500s) and mints the machine key.
+* Tests: `just test` runs the CLI suite (`cli/`), the plane suite (`php vendor/bin/phpunit -c
+  phpunit.machine.xml` — our config: only `tests/Machine`, no coverage block, 2G memory, does not stop on
+  the first failure) and the MCP suite (`mcp/`). Upstream's `phpunit.xml` is left as is.
+* Register the MCP server in Claude Code:
+  `claude mcp add --scope user firefly_iii -- "$HOME/BGit/Bryan_git/firefly-iii/mcp/dist/index.js" serve`
+  (add `"env": {"FFMCP_ALLOW_WRITE": "1"}` to let it write; the app's `.env` needs
+  `FIREFLY_MACHINE_ALLOW_WRITE=1` too).
 * State and logs: `~/T/_firefly_iii/` — `server.log`, `server.pid`, `cli.info`, `cli.err`,
   `mcp.info`, `mcp.err`, `machine.audit`. Laravel's own log stays at `storage/logs/laravel.log`.
 * Database: SQLite **outside the repo** at `~/T/_firefly_iii/db/firefly.sqlite`, set as `DB_DATABASE`

@@ -175,7 +175,8 @@ final class Values
         $ta = strtotime($a.' 00:00:00 UTC');
         $tb = strtotime($b.' 00:00:00 UTC');
 
-        return false === $ta || false === $tb ? 0 : (int) round(abs($tb - $ta) / 86400);
+        // whole days between two UTC midnights — integer arithmetic, never a float
+        return false === $ta || false === $tb ? 0 : intdiv(abs($tb - $ta), 86400);
     }
 
     private static function ymd(int $y, int $m, int $d): ?string

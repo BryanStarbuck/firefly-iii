@@ -181,9 +181,14 @@ final class AnalyticsController extends ScopedController
         return $this->ok(new AnomalyDetector($this->ledger())->detect($scope, $z, Money::strip((string) ($args['min_amount'] ?? '0')), (int) ($args['trailing'] ?? AnomalyDetector::DEFAULT_TRAILING)));
     }
 
+    /**
+     * Takes the shared arguments like every §10.2 route: account_ids[] narrows to the piggy
+     * banks on those accounts; the range is not used (a piggy bank is as of today) and the
+     * response says so rather than silently dropping it.
+     */
     public function piggyProgress(Request $request): JsonResponse
     {
-        $args  = $this->input($request, ['currency_code' => self::FILTER_RULES['currency_code']], true);
+        $args  = $this->input($request, self::commonRules(false), true);
         $today = $this->today();
 
         return $this->ok(new Commitments($this->ledger())->piggyProgress($this->scope($args, [$today, $today], Ledger::ASSET_TYPES), $today));

@@ -32,6 +32,7 @@ use FireflyIII\Models\CurrencyExchangeRate;
 use FireflyIII\Models\LinkType;
 use FireflyIII\Models\ObjectGroup;
 use FireflyIII\Models\Preference;
+use FireflyIII\Models\Role;
 use FireflyIII\Models\Tag;
 use FireflyIII\Models\TransactionCurrency;
 use FireflyIII\Models\TransactionGroup;
@@ -129,7 +130,12 @@ final class ReferenceRoutesTest extends MachineTestCase
         $apply = $this->envelope($this->machine('DELETE', '/tags/'.$tag->id, ['dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
         $this->assertTrue($apply['ok'], (string) json_encode($apply));
         $this->assertNull(Tag::query()->find($tag->id));
+        $this->assertSame(0, $apply['data']['attachments_kept']);
         $this->assertSame(0, $this->envelope($this->machine('DELETE', '/tags/'.$tag->id))['data']['deleted']);
+        // the journal link Firefly removed has no model: undo must refuse rather than restore an unlinked tag
+        $last  = $this->envelope($this->machine('GET', '/undo/last'));
+        $this->assertSame($apply['data']['operation_id'], $last['data']['operation_id']);
+        $this->assertFalse($last['data']['reversible']);
     }
 
     // ---------------------------------------------------------- object groups ---
@@ -236,6 +242,7 @@ final class ReferenceRoutesTest extends MachineTestCase
         $builtIn = LinkType::query()->where('editable', false)->firstOrFail();
 
         $this->enableWrites();
+        $this->user->roles()->attach(Role::query()->where('name', 'owner')->firstOrFail()->id); // link-type writes keep upstream's owner gate
         $body  = ['name' => 'Reimburses', 'inward' => 'is reimbursed by', 'outward' => 'reimburses'];
         $plan  = $this->envelope($this->machine('POST', '/link-types', $body));
         $apply = $this->envelope($this->machine('POST', '/link-types', $body + ['dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
@@ -298,6 +305,9 @@ final class ReferenceRoutesTest extends MachineTestCase
         $this->assertTrue($apply['ok'], (string) json_encode($apply));
         $this->assertNull(Attachment::query()->find($id));
         $this->assertSame([], Storage::disk('upload')->allFiles());
+        $this->assertTrue($apply['data']['file_removed']);
+        $last  = $this->envelope($this->machine('GET', '/undo/last'));
+        $this->assertFalse($last['data']['reversible'], 'the file is gone; restoring only the record would be a half-undo');
     }
 
     // ------------------------------------------------------------ preferences ---
@@ -355,6 +365,108 @@ final class ReferenceRoutesTest extends MachineTestCase
         $this->assertSame(500, $attempts['data']['attempts'][0]['status_code']);
         $this->assertPlaneError($this->machine('GET', '/webhooks/'.$webhook->id.'/messages/999/attempts'), 404, 'not_found');
         $this->assertPlaneError($this->machine('GET', '/webhooks/31337/messages'), 404, 'not_found');
+    }
+
+    // ----------------------------------------------------------- regressions ---
+
+    /**
+     * Firefly's exchange-rate listener calls Cache::clear(). Inside a DRY RUN that must be held
+     * (§7.2): it would otherwise wipe every outstanding confirm token and the write lock.
+     */
+    public function testAnExchangeRateDryRunKeepsOtherPlansTokens(): void
+    {
+        $this->enableWrites();
+        $tagPlan  = $this->envelope($this->machine('POST', '/tags', ['tag' => 'home-office']));
+        $this->assertTrue($tagPlan['ok'], (string) json_encode($tagPlan));
+
+        $ratePlan = $this->envelope($this->machine('POST', '/exchange-rates', ['from' => 'EUR', 'to' => 'USD', 'date' => '2026-09-01', 'rate' => '1.0842']));
+        $this->assertTrue($ratePlan['ok'], (string) json_encode($ratePlan));
+
+        $apply    = $this->envelope($this->machine('POST', '/tags', ['tag' => 'home-office', 'dry_run' => false, 'confirm_token' => $tagPlan['data']['confirm_token']]));
+        $this->assertTrue($apply['ok'], 'the exchange-rate dry run wiped the tag plan\'s token: '.json_encode($apply));
+        $this->assertSame(1, Tag::query()->where('tag', 'home-office')->count());
+    }
+
+    /** Firefly's refreshForUser() stores the `anonymous` preference on the way to the primary flag; the plane's reads must not (R8). */
+    public function testCurrencyReadsStoreNoPreference(): void
+    {
+        $before  = Preference::query()->count();
+        $primary = $this->envelope($this->machine('GET', '/currencies/primary'));
+        $this->assertTrue($primary['data']['currency']['primary']);
+        $this->assertTrue($primary['data']['currency']['enabled']);
+        $this->envelope($this->machine('GET', '/currencies'));
+        $this->assertSame($before, Preference::query()->count(), 'a currency read stored a preference row');
+    }
+
+    /** Reading webhooks must not store the allow_webhooks configuration row (R8). */
+    public function testWebhookReadsStoreNoConfiguration(): void
+    {
+        $before = DB::table('configuration')->count();
+        $env    = $this->envelope($this->machine('GET', '/webhooks'));
+        $this->assertTrue($env['ok']);
+        $this->assertIsBool($env['data']['webhooks_enabled']);
+        $this->assertSame($before, DB::table('configuration')->count(), 'GET /webhooks stored a configuration row');
+    }
+
+    /** Enabling a currency lives in a pivot Firefly keeps outside a model: undo must refuse it, not claim success. */
+    public function testCurrencyToggleIsRecordedAsIrreversible(): void
+    {
+        $this->enableWrites();
+        $plan  = $this->envelope($this->machine('POST', '/currencies/EUR/enable'));
+        $apply = $this->envelope($this->machine('POST', '/currencies/EUR/enable', ['dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
+        $this->assertTrue($apply['ok'], (string) json_encode($apply));
+        $last  = $this->envelope($this->machine('GET', '/undo/last'));
+        $this->assertSame($apply['data']['operation_id'], $last['data']['operation_id']);
+        $this->assertFalse($last['data']['reversible']);
+        $this->assertNull($last['data']['confirm_token']);
+    }
+
+    /** A tag is addressed by its NAME (§8.8); deleting a gone name twice terminates a retry loop (§5.6). */
+    public function testDeletingAGoneTagByNameIsDeletedZero(): void
+    {
+        $this->enableWrites();
+        $this->enableAdmin();
+        Tag::create(['user_id' => $this->user->id, 'user_group_id' => $this->user->user_group_id, 'tag' => 'home-office', 'tag_mode' => 'nothing']);
+        $plan  = $this->envelope($this->machine('DELETE', '/tags/home-office'));
+        $apply = $this->envelope($this->machine('DELETE', '/tags/home-office', ['dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
+        $this->assertTrue($apply['ok'], (string) json_encode($apply));
+        $gone  = $this->envelope($this->machine('DELETE', '/tags/home-office'));
+        $this->assertTrue($gone['ok'], (string) json_encode($gone));
+        $this->assertSame(0, $gone['data']['deleted']);
+        // but a read of a missing tag is still not_found
+        $this->assertPlaneError($this->machine('GET', '/tags/home-office'), 404, 'not_found');
+    }
+
+    /** Firefly ignores a half-open range; the plane resolves the missing end and echoes what it used (§14.3). */
+    public function testTagSumsHonourAHalfOpenRange(): void
+    {
+        $tag     = Tag::create(['user_id' => $this->user->id, 'user_group_id' => $this->user->user_group_id, 'tag' => 'vacation-2026', 'tag_mode' => 'nothing']);
+        $this->coffee->transactionJournals()->first()->tags()->attach($tag->id);
+        $after   = $this->envelope($this->machine('GET', '/tags/vacation-2026', ['start' => '2026-08-04']));
+        $this->assertSame('2026-08-04', $after['data']['range']['start']);
+        $this->assertNotNull($after['data']['range']['end'], 'the resolved end is echoed');
+        $this->assertSame([], $after['data']['sums'], 'the 3 August coffee is before the start');
+        $until   = $this->envelope($this->machine('GET', '/tags/vacation-2026', ['end' => '2026-08-31']));
+        $this->assertSame('2026-08-03', $until['data']['range']['start'], 'start resolves to the tag\'s first use');
+        $this->assertSame('-4.50', $until['data']['sums'][0]['spent']);
+    }
+
+    /** An attachment filed against a Transaction is stored on its journal (Firefly's factory does that); the list filter follows. */
+    public function testAttachmentsListByTransactionFindsTheJournalsFiles(): void
+    {
+        $journal     = $this->coffee->transactionJournals()->first();
+        $transaction = $journal->transactions()->first();
+        $this->enableWrites();
+        $body  = ['attachable_type' => 'Transaction', 'attachable_id' => $transaction->id, 'filename' => 'receipt.txt', 'content_base64' => base64_encode("Bean Cart\n")];
+        $plan  = $this->envelope($this->machine('POST', '/attachments', $body));
+        $this->assertTrue($plan['ok'], (string) json_encode($plan));
+        $apply = $this->envelope($this->machine('POST', '/attachments', $body + ['dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
+        $this->assertTrue($apply['ok'], (string) json_encode($apply));
+        $this->assertSame('TransactionJournal', $apply['data']['attachment']['attachable_type']);
+
+        $list  = $this->envelope($this->machine('GET', '/attachments', ['attachable_type' => 'Transaction', 'attachable_id' => $transaction->id]));
+        $this->assertSame(['receipt.txt'], array_column($list['data']['attachments'], 'filename'));
+        $this->assertPlaneError($this->machine('GET', '/attachments', ['attachable_type' => 'Transaction', 'attachable_id' => 424242]), 404, 'not_found');
     }
 
     public function testEveryReferenceRouteIsLive(): void

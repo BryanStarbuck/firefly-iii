@@ -138,13 +138,12 @@ final class CapabilityParityTest extends MachineTestCase
     public function testStaticSegmentsAreMountedBeforeParameters(): void
     {
         $this->operatorUser();
-        // /transactions/export must not be captured by /transactions/{group_id}
-        $env = $this->envelope($this->machine('GET', '/transactions/export'));
-        $this->assertSame('GET /transactions/export', $env['error']['details']['route'] ?? null);
-        $env = $this->envelope($this->machine('GET', '/subscriptions/status'));
-        $this->assertSame('GET /subscriptions/status', $env['error']['details']['route'] ?? null);
-        $env = $this->envelope($this->machine('GET', '/currencies/primary'));
-        $this->assertSame('GET /currencies/primary', $env['error']['details']['route'] ?? null);
+        // /transactions/export must not be captured by /transactions/{group_id} (which would answer
+        // not_found for a group named "export"); the static route answers ok. Same for the other two.
+        foreach (['/transactions/export', '/subscriptions/status', '/currencies/primary'] as $path) {
+            $env = $this->envelope($this->machine('GET', $path));
+            $this->assertTrue($env['ok'], $path.' reached its static route: '.json_encode($env['error'] ?? null));
+        }
     }
 
     public function testTheDiagnosticsAnswerWithoutAnOperator(): void

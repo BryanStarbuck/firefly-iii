@@ -54,6 +54,7 @@ final class Flows
         $periods   = Periods::split($scope->start, $scope->end, $scope->interval);
         $noneLabel = $periods[0]['label'];
         $cells     = [];
+        $converted = new Converted($this->ledger);
         foreach ($this->ledger->journals($scope, Ledger::flowTypes($scope)) as $journal) {
             $dir    = Ledger::direction($scope, $journal);
             $code   = (string) $journal['currency_code'];
@@ -63,10 +64,12 @@ final class Flows
             if ($dir['in']) {
                 $cells[$label][$code]['income'] = Money::add($cells[$label][$code]['income'], $amount);
                 ++$cells[$label][$code]['income_count'];
+                $converted->add($journal, 'income');
             }
             if ($dir['out']) {
                 $cells[$label][$code]['expense'] = Money::add($cells[$label][$code]['expense'], $amount);
                 ++$cells[$label][$code]['expense_count'];
+                $converted->add($journal, 'expense');
             }
         }
         $rows   = [];
@@ -102,12 +105,30 @@ final class Flows
             ];
         }
 
+        $convertedBlock = $converted->render();
+        if (null !== $convertedBlock) {
+            $primary        = (string) $this->ledger->primary->code;
+            $convertedBlock = [
+                'converted_to' => $primary,
+                'income'       => $this->ledger->fmt($converted->raw('income'), $primary),
+                'expense'      => $this->ledger->fmt($converted->raw('expense'), $primary),
+                'net'          => $this->ledger->fmt(Money::sub($converted->raw('income'), $converted->raw('expense')), $primary),
+                'count'        => $convertedBlock['count'],
+                'complete'     => true,
+            ];
+        }
+
         return [
             'interval'   => $scope->interval,
             'periods'    => $periods,
             'rows'       => $rows,
             'totals'     => $totalRows,
-            'notes'      => ['net = income − expense; expense and income are positive amounts'],
+            'converted'  => $convertedBlock,
+            'notes'      => array_values(array_filter([
+                'net = income − expense; expense and income are positive amounts',
+                $scope->includeTransfers ? 'transfers are counted: one leaving a counted account is expense, one arriving is income, so a transfer between two counted accounts is both and nets to zero' : null,
+                $converted->note(),
+            ], static fn (?string $note): bool => null !== $note)),
             'excluded'   => $scope->excluded(),
             'provenance' => $scope->provenance(['interval' => $scope->interval]),
         ];
@@ -176,6 +197,10 @@ final class Flows
             $codes   = array_values(array_unique([...array_keys($opening), ...array_keys($closing), ...array_keys($flows[$period['label']] ?? [])]));
             sort($codes);
             foreach ($codes as $code) {
+                if (null !== $scope->currencyCode && $code !== $scope->currencyCode) {
+                    continue; // the currency filter applies to balances as much as to journals
+                }
+                $scope->noteCurrency($code);
                 $cell         = $flows[$period['label']][$code] ?? ['in' => '0', 'out' => '0', 'transfers_in' => '0', 'transfers_out' => '0', 'adjustments' => '0', 'count' => 0];
                 $open         = $opening[$code] ?? null;
                 $close        = $closing[$code] ?? null;
@@ -213,7 +238,7 @@ final class Flows
                 'reconciles says whether opening + in − out + transfers_net + adjustments = closing; false points at foreign-currency or converted balances, and is reported, never forced',
             ],
             'excluded'   => [],
-            'provenance' => $scope->provenance(['interval' => $scope->interval, 'balances' => 'virtual balance excluded']),
+            'provenance' => $scope->provenance(['interval' => $scope->interval, 'balances' => Ledger::BALANCE_NOTE]),
         ];
     }
 
@@ -233,48 +258,46 @@ final class Flows
         $repository = $this->ledger->repo(AccountRepositoryInterface::class);
         $skipped    = [];
         $included   = $accounts->filter(static function (Account $account) use ($repository, &$skipped): bool {
+            // net worth is assets + liabilities: an expense, revenue or other account named in
+            // account_ids[] is left out and named — never quietly booked as a "liability"
+            $type = (string) $account->accountType?->type;
+            if (!in_array($type, [...Ledger::ASSET_TYPES, ...Ledger::LIABILITY_TYPES], true)) {
+                $skipped[] = ['account_id' => (int) $account->id, 'name' => (string) $account->name, 'reason' => sprintf('not an asset or liability account (%s)', $type)];
+
+                return false;
+            }
             $flag = $repository->getMetaValue($account, 'include_net_worth');
             if (null !== $flag && '1' !== $flag && 'true' !== $flag) {
-                $skipped[] = ['account_id' => (int) $account->id, 'name' => (string) $account->name];
+                $skipped[] = ['account_id' => (int) $account->id, 'name' => (string) $account->name, 'reason' => 'include_net_worth is off'];
 
                 return false;
             }
 
             return true;
         })->values();
-        $assets      = $included->filter(static fn (Account $a): bool => AccountTypeEnum::ASSET->value === $a->accountType?->type)->values();
-        $liabilities = $included->filter(static fn (Account $a): bool => in_array($a->accountType?->type, Ledger::LIABILITY_TYPES, true))->values();
         $scope       = $scope->withAccounts($included, $scope->accountsExplicit);
         $periods     = Periods::split($scope->start, $scope->end, $scope->interval);
-        $rows        = [];
-        foreach ($periods as $period) {
-            $at    = Carbon::parse($period['end']);
-            $a     = $this->ledger->balances($assets, $at);
-            $l     = $this->ledger->balances($liabilities, $at);
-            $codes = array_values(array_unique([...array_keys($a), ...array_keys($l)]));
-            sort($codes);
-            foreach ($codes as $code) {
-                $scope->noteCurrency($code);
-                $assetSum = $a[$code] ?? '0';
-                $liabSum  = $l[$code] ?? '0';
-                $rows[]   = [
-                    'period'        => $period['label'],
-                    'date'          => $period['end'],
-                    'currency_code' => $code,
-                    'assets'        => $this->ledger->fmt($assetSum, $code),
-                    'liabilities'   => $this->ledger->fmt($liabSum, $code),
-                    'net'           => $this->ledger->fmt(Money::add($assetSum, $liabSum), $code),
-                ];
-            }
-        }
+        $detail      = $included->count() * count($periods) <= self::MAX_ACCOUNT_CELLS;
+        $wanted      = fn (string $code): bool => null === $scope->currencyCode || $code === $scope->currencyCode;
+        $isAsset     = static fn (Account $a): bool => AccountTypeEnum::ASSET->value === $a->accountType?->type;
 
-        $perAccount = [];
-        $detail     = $included->count() * count($periods) <= self::MAX_ACCOUNT_CELLS;
+        // per period and currency: assets, liabilities, net. With per-account detail on, the
+        // per-account balances are fetched once and added up here (the NetWorth helper sums the
+        // same per-account figures); without it, two aggregate calls per period.
+        $sums        = []; // [period label][currency] => [assets, liabilities]
+        $perAccount  = [];
         if ($detail) {
             foreach ($included as $account) {
+                /** @var Account $account */
+                $kind     = $isAsset($account) ? 'assets' : 'liabilities';
                 $balances = [];
                 foreach ($periods as $period) {
                     foreach ($this->ledger->balances(new Collection([$account]), Carbon::parse($period['end'])) as $code => $balance) {
+                        if (!$wanted($code)) {
+                            continue;
+                        }
+                        $sums[$period['label']][$code] ??= ['assets' => '0', 'liabilities' => '0'];
+                        $sums[$period['label']][$code][$kind] = Money::add($sums[$period['label']][$code][$kind], $balance);
                         $balances[] = ['period' => $period['label'], 'currency_code' => $code, 'balance' => $this->ledger->fmt($balance, $code)];
                     }
                 }
@@ -282,11 +305,44 @@ final class Flows
                     'account_id' => (int) $account->id,
                     'name'       => (string) $account->name,
                     'type'       => (string) $account->accountType?->type,
-                    'kind'       => AccountTypeEnum::ASSET->value === $account->accountType?->type ? 'asset' : 'liability',
+                    'kind'       => $isAsset($account) ? 'asset' : 'liability',
                     'balances'   => $balances,
                 ];
             }
         }
+        if (!$detail) {
+            $assets      = $included->filter($isAsset)->values();
+            $liabilities = $included->filter(static fn (Account $a): bool => in_array($a->accountType?->type, Ledger::LIABILITY_TYPES, true))->values();
+            foreach ($periods as $period) {
+                $at = Carbon::parse($period['end']);
+                foreach (['assets' => $assets, 'liabilities' => $liabilities] as $kind => $set) {
+                    foreach ($this->ledger->balances($set, $at) as $code => $balance) {
+                        if (!$wanted($code)) {
+                            continue;
+                        }
+                        $sums[$period['label']][$code] ??= ['assets' => '0', 'liabilities' => '0'];
+                        $sums[$period['label']][$code][$kind] = Money::add($sums[$period['label']][$code][$kind], $balance);
+                    }
+                }
+            }
+        }
+        $rows        = [];
+        foreach ($periods as $period) {
+            $byCode = $sums[$period['label']] ?? [];
+            ksort($byCode);
+            foreach ($byCode as $code => $sum) {
+                $scope->noteCurrency($code);
+                $rows[] = [
+                    'period'        => $period['label'],
+                    'date'          => $period['end'],
+                    'currency_code' => $code,
+                    'assets'        => $this->ledger->fmt($sum['assets'], $code),
+                    'liabilities'   => $this->ledger->fmt($sum['liabilities'], $code),
+                    'net'           => $this->ledger->fmt(Money::add($sum['assets'], $sum['liabilities']), $code),
+                ];
+            }
+        }
+        $scope->countRows(count($rows));
 
         return [
             'interval'   => $scope->interval,
@@ -297,11 +353,11 @@ final class Flows
             'notes'      => array_values(array_filter([
                 'net = assets + liabilities; liabilities are signed as Firefly stores them (money owed is negative)',
                 'balances are at the end of each period\'s last day (Firefly NetWorth helper, virtual balance excluded)',
-                [] === $skipped ? null : 'accounts with include_net_worth off are left out (see skipped)',
+                [] === $skipped ? null : 'some accounts are left out — not an asset or liability, or include_net_worth off (see skipped, each with its reason)',
                 $detail ? null : sprintf('per-account detail omitted: more than %d account × period cells — narrow the range or pass account_ids', self::MAX_ACCOUNT_CELLS),
             ])),
             'excluded'   => [],
-            'provenance' => $scope->provenance(['interval' => $scope->interval, 'balances' => 'virtual balance excluded']),
+            'provenance' => $scope->provenance(['interval' => $scope->interval, 'balances' => Ledger::BALANCE_NOTE]),
         ];
     }
 }

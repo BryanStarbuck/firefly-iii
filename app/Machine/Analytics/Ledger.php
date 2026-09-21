@@ -33,6 +33,7 @@ use FireflyIII\Machine\Money;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\TransactionCurrency;
 use FireflyIII\Models\UserGroup;
+use FireflyIII\Support\Singleton\PreferencesSingleton;
 use FireflyIII\User;
 use Illuminate\Support\Collection;
 
@@ -50,6 +51,12 @@ use Illuminate\Support\Collection;
 final class Ledger
 {
     public const array ASSET_TYPES     = [AccountTypeEnum::ASSET->value];
+
+    /** What every balance-derived figure is (echoed in provenance.balances). */
+    public const string BALANCE_NOTE   = 'per account currency (never converted to the primary currency), virtual balance excluded';
+
+    /** The PreferencesSingleton key Amount::convertToPrimary() memoises under when called without a user. */
+    private const string CONVERT_PREF_KEY = 'convert_to_primary_no_user';
     public const array LIABILITY_TYPES = [AccountTypeEnum::LOAN->value, AccountTypeEnum::DEBT->value, AccountTypeEnum::MORTGAGE->value];
 
     /** @var array<string, int> currency code → decimal places */
@@ -109,7 +116,7 @@ final class Ledger
         $query = Account::query()
             ->where('accounts.user_group_id', $this->group->id)
             ->accountTypeIn($types)
-            ->with(['accountType'])
+            ->with(['accountType', 'accountMeta']) // accountMeta: include_net_worth and currency reads without an N+1
             ->orderBy('accounts.id')
         ;
         if ($activeOnly) {
@@ -130,6 +137,11 @@ final class Ledger
      */
     public function journals(Scope $scope, array $types, bool $withTags = false, bool $withBills = false, bool $applyFilters = true): array
     {
+        if ($scope->accounts->isEmpty()) {
+            // no account in scope means nothing to count — never "every journal in the ledger"
+            // (the collector without setAccounts() would answer with all of them)
+            return [];
+        }
         $collector = $this->collector()
             ->setRange($scope->start->copy()->startOfDay(), $scope->end->copy()->endOfDay())
             ->setTypes($types)
@@ -226,6 +238,34 @@ final class Ledger
         return Money::abs(Money::strip((string) $journal['amount']));
     }
 
+    /**
+     * The journal's amount in the administration's PRIMARY currency, as Firefly itself
+     * converted it (§10.3): the amount when the journal is in the primary currency already, the
+     * foreign amount when that is in the primary currency, else Firefly's pc_amount. Null when
+     * Firefly has no conversion for this row — the caller then reports no converted total.
+     */
+    public function converted(array $journal): ?string
+    {
+        $primary = (string) $this->primary->code;
+        if ((string) $journal['currency_code'] === $primary) {
+            return self::amount($journal);
+        }
+        $foreign = $journal['foreign_amount'] ?? null;
+        if (null !== $foreign && '' !== (string) $foreign && (string) ($journal['foreign_currency_code'] ?? '') === $primary) {
+            return Money::abs(Money::strip((string) $foreign));
+        }
+        $pc      = $journal['pc_amount'] ?? null;
+        if (null === $pc || '' === (string) $pc) {
+            return null;
+        }
+        $pc      = Money::abs(Money::strip((string) $pc));
+        if (Money::isZero($pc) && !Money::isZero(self::amount($journal))) {
+            return null; // a zero conversion of a non-zero amount is no conversion
+        }
+
+        return $pc;
+    }
+
     /** The journal's date in the administration's timezone, YYYY-MM-DD. */
     public static function date(array $journal): string
     {
@@ -252,8 +292,25 @@ final class Ledger
             $this->netWorth = app(NetWorthInterface::class);
             $this->netWorth->setUserGroup($this->group);
         }
+        // The NetWorth helper honours the operator's "convert to primary currency" preference:
+        // with it on, a USD account's balance comes back silently folded into the EUR figure
+        // (via Firefly's exchange rate, "0" when none is stored). The plane answers PER
+        // CURRENCY and never mixes (§10.3, §14.1), so the preference is held off for this call.
+        $singleton = PreferencesSingleton::getInstance();
+        $previous  = $singleton->getPreference(self::CONVERT_PREF_KEY);
+        $singleton->setPreference(self::CONVERT_PREF_KEY, false);
+
+        try {
+            $rows = $this->netWorth->byAccounts($accounts, $at->copy()->endOfDay());
+        } finally {
+            if (null === $previous) {
+                $singleton->resetPreferences();
+            } else {
+                $singleton->setPreference(self::CONVERT_PREF_KEY, $previous);
+            }
+        }
         $out = [];
-        foreach ($this->netWorth->byAccounts($accounts, $at->copy()->endOfDay()) as $row) {
+        foreach ($rows as $row) {
             if (!is_array($row) || !array_key_exists('currency_code', $row)) {
                 continue;
             }

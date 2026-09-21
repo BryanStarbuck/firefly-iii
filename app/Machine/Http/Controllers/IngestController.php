@@ -28,6 +28,7 @@ use Carbon\CarbonImmutable;
 use Closure;
 use FireflyIII\Machine\Confirm\ConfirmTokens;
 use FireflyIII\Machine\DryRun;
+use FireflyIII\Machine\Envelope;
 use FireflyIII\Machine\Ingest\AccountProvisioner;
 use FireflyIII\Machine\Ingest\Collector;
 use FireflyIII\Machine\Ingest\Csv;
@@ -37,6 +38,7 @@ use FireflyIII\Machine\Ingest\Manifest;
 use FireflyIII\Machine\Ingest\MapFile;
 use FireflyIII\Machine\Ingest\ParsedStatement;
 use FireflyIII\Machine\Ingest\Preferences;
+use FireflyIII\Machine\Ingest\Progress;
 use FireflyIII\Machine\Ingest\RowBuilder;
 use FireflyIII\Machine\Ingest\RunLog;
 use FireflyIII\Machine\Ingest\StatementDedupe;
@@ -49,6 +51,8 @@ use FireflyIII\Machine\WriteResult;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 use Throwable;
 
 /**
@@ -65,6 +69,10 @@ use Throwable;
  *
  * The only read-tier routes that write are /ingest/extract and /ingest/prefer, and only into the
  * staging directory. Nothing is ever written under {ROOT} outside {ROOT}/.firefly-staging/.
+ *
+ * The long routes (plan, apply, file/apply, extract) lift PHP's time limit for themselves and,
+ * when the caller sends `Accept: application/x-ndjson`, stream progress lines ahead of the
+ * envelope (apis.mdx §15; the CLI's spinner reads them).
  */
 final class IngestController extends MachineController
 {
@@ -420,9 +428,17 @@ final class IngestController extends MachineController
     // ------------------------------------------------------------- raw mode R* ---
 
     /** POST /ingest/extract (R*) — raw mode only; writes to the staging directory only. */
-    public function extract(Request $request): JsonResponse
+    public function extract(Request $request): Response
     {
-        $args     = $this->input($request, ['root' => ['sometimes', 'nullable', 'string', 'max:4096'], 'force' => ['sometimes', 'nullable', 'boolean']]);
+        $args = $this->input($request, ['root' => ['sometimes', 'nullable', 'string', 'max:4096'], 'force' => ['sometimes', 'nullable', 'boolean']]);
+
+        return $this->streamed($request, fn (): JsonResponse => $this->extractNow($args));
+    }
+
+    /** @param array<string, mixed> $args */
+    private function extractNow(array $args): JsonResponse
+    {
+        self::longRunning();
         $root     = StatementsRoot::resolve($args['root'] ?? null);
         $manifest = Manifest::load($root, null, (string) $this->primaryCurrency()->code);
         if ('raw' !== $manifest['mode']) {
@@ -625,7 +641,7 @@ final class IngestController extends MachineController
     // ------------------------------------------------------------ plan / apply ---
 
     /** POST /ingest/plan (read) — Firefly's store path, rolled back: new, already present, previously deleted. */
-    public function plan(Request $request): JsonResponse
+    public function plan(Request $request): Response
     {
         $args  = $this->input($request, [
             'root'        => ['sometimes', 'nullable', 'string', 'max:4096'],
@@ -645,16 +661,16 @@ final class IngestController extends MachineController
             'apply_rules' => (bool) ($args['apply_rules'] ?? true),
         ];
 
-        return $this->planWith($request, 'POST /ingest/apply', 'plan', $clean, $this->importClosure($clean));
+        return $this->streamed($request, fn (): JsonResponse => $this->planWith($request, 'POST /ingest/apply', 'plan', $clean, $this->importClosure($clean)));
     }
 
     /** POST /ingest/apply (write) */
-    public function apply(Request $request): JsonResponse
+    public function apply(Request $request): Response
     {
         $this->input($request, []);
         $args = $this->argsFor($request, 'POST /ingest/apply', 'POST /machine/v1/ingest/plan');
 
-        return $this->applyWith($request, 'POST /ingest/apply', 'apply', $args, $this->importClosure($args), self::importRender($args));
+        return $this->streamed($request, fn (): JsonResponse => $this->applyWith($request, 'POST /ingest/apply', 'apply', $args, $this->importClosure($args), self::importRender($args)));
     }
 
     /** POST /ingest/file/plan (read) — one file into one account. */
@@ -690,12 +706,12 @@ final class IngestController extends MachineController
     }
 
     /** POST /ingest/file/apply (write) */
-    public function fileApply(Request $request): JsonResponse
+    public function fileApply(Request $request): Response
     {
         $this->input($request, []);
         $args = $this->argsFor($request, 'POST /ingest/file/apply', 'POST /machine/v1/ingest/file/plan');
 
-        return $this->applyWith($request, 'POST /ingest/file/apply', 'file_apply', $args, $this->fileClosure($args), self::importRender($args));
+        return $this->streamed($request, fn (): JsonResponse => $this->applyWith($request, 'POST /ingest/file/apply', 'file_apply', $args, $this->fileClosure($args), self::importRender($args)));
     }
 
     // ---------------------------------------------------------------------- runs ---
@@ -757,6 +773,7 @@ final class IngestController extends MachineController
                 $entry    = $map[$a['key']] ?? null;
                 $target   = null === $entry ? null : $ledger->find((int) $entry['account_id']);
                 $rows     = array_values(array_filter($c['rows'], static fn (array $r): bool => (null === $args['start'] || $r['date'] >= $args['start']) && (null === $args['end'] || $r['date'] <= $args['end'])));
+                $rows     = self::guardCurrency($rows, $c['statements'], $target, true === ($a['currency_defaulted'] ?? true) ? null : (string) $a['currency']);
                 $summary  = self::accountSummary($c, $rows, $target);
                 if (null === $target) {
                     $summary['blocked']        = true;
@@ -765,14 +782,14 @@ final class IngestController extends MachineController
                 }
                 $plans[]  = ['summary' => $summary, 'account_id' => $target['id'] ?? null, 'rows' => $rows];
             }
-            $result    = Importer::run($ledger, $plans, (bool) $args['apply_rules']);
+            $result    = Importer::run($ledger, $plans, (bool) $args['apply_rules'], 1000, $dryRun ? 'planning' : 'storing');
             $dates     = [];
             foreach ($plans as $p) {
                 foreach ($p['rows'] as $r) {
                     $dates[] = $r['date'];
                 }
             }
-            $blockedRows = array_sum(array_map(static fn (array $p): int => (int) $p['summary']['blocked_rows'], $plans));
+            $blockedRows = array_sum(array_map(static fn (array $p): int => (int) $p['summary']['blocked_rows'] + (int) $p['summary']['currency_mismatch'], $plans));
             if ($blockedRows > 0) {
                 $result->count('blocked', $blockedRows);
             }
@@ -815,10 +832,14 @@ final class IngestController extends MachineController
             $account['last4'] ??= $statement->last4;
             $layerOne  = StatementDedupe::run([$statement], $account, []);
             $built     = RowBuilder::build($account, [$statement], $layerOne['blocked_months']);
-            $c         = ['account' => $account, 'statements' => [$statement], 'conflicts' => [], 'rows' => $built['rows'], 'dupes' => $built['dupes'], 'bad' => $built['bad']];
-            $summary   = self::accountSummary($c, $built['rows'], $target);
-            $result    = Importer::run($ledger, [['summary' => $summary, 'account_id' => (int) $target['id'], 'rows' => $built['rows']]], (bool) $args['apply_rules']);
-            $dates     = array_column($built['rows'], 'date');
+            $rows      = self::guardCurrency($built['rows'], [$statement], $target, null);
+            $c         = ['account' => $account, 'statements' => [$statement], 'conflicts' => [], 'rows' => $rows, 'dupes' => $built['dupes'], 'bad' => $built['bad']];
+            $summary   = self::accountSummary($c, $rows, $target);
+            $result    = Importer::run($ledger, [['summary' => $summary, 'account_id' => (int) $target['id'], 'rows' => $rows]], (bool) $args['apply_rules'], 1000, $dryRun ? 'planning' : 'storing');
+            if ($summary['currency_mismatch'] > 0) {
+                $result->count('blocked', (int) $summary['currency_mismatch']);
+            }
+            $dates     = array_column($rows, 'date');
 
             return $result->with([
                 'root'       => $root,
@@ -863,8 +884,20 @@ final class IngestController extends MachineController
      */
     private function planWith(Request $request, string $applyKey, string $kind, array $args, Closure $apply): JsonResponse
     {
+        self::longRunning();
         $staging = new Staging((string) $args['root']);
-        $staging->ensure(); // the plan and its run log live in staging; a foreign directory is refused first
+        $logRun  = true;
+
+        try {
+            $staging->ensure(); // the plan and its run log live in staging; a foreign directory is refused first
+        } catch (MachineException $e) {
+            if ('internal' !== $e->errorCode) {
+                throw $e; // conflict: somebody else's directory — never stage over it
+            }
+            // a read-only archive: the plan still answers, it just cannot be logged beside the statements
+            $logRun = false;
+            $this->addMeta(['warnings' => [sprintf('the plan could not be logged: %s is not writable (%s)', Staging::DIR, $e->getMessage())]]);
+        }
         $started = CarbonImmutable::now('UTC')->format('Y-m-d\TH:i:s\Z');
         $held    = $this->locked(static fn () => DryRun::run(static fn () => $apply(true)));
         $result  = $held->value;
@@ -886,7 +919,11 @@ final class IngestController extends MachineController
         if ($result->changeCount() > (int) config('machine.limits.max_changes_default', 200)) {
             $data['hint'] = sprintf('%d rows would be stored — apply with max_changes: %d or more', $result->changeCount(), $result->changeCount());
         }
-        RunLog::record($staging, $id, $kind, $started, self::runLine($args, $result, 'planned'), ['args' => self::publicArgs($args), 'accounts' => $result->data['accounts'] ?? $result->data['plan'] ?? [], 'rows' => $result->data['rows'] ?? [], 'changes' => $result->changes]);
+        if ($logRun) {
+            RunLog::record($staging, $id, $kind, $started, self::runLine($args, $result, 'planned'), ['args' => self::publicArgs($args), 'accounts' => $result->data['accounts'] ?? $result->data['plan'] ?? [], 'rows' => $result->data['rows'] ?? [], 'changes' => $result->changes]);
+        } else {
+            $data['run_id'] = null;
+        }
         $this->addMeta(['untrusted' => ['rows[].description']]);
 
         return $this->ok($data, ['dryRun' => true]);
@@ -901,6 +938,7 @@ final class IngestController extends MachineController
      */
     private function applyWith(Request $request, string $applyKey, string $kind, array $args, Closure $apply, Closure $render): JsonResponse
     {
+        self::longRunning();
         $staging = new Staging((string) $args['root']);
         $started = CarbonImmutable::now('UTC')->format('Y-m-d\TH:i:s\Z');
         $last    = null;
@@ -932,13 +970,79 @@ final class IngestController extends MachineController
             return $response;
         }
         if ($last instanceof WriteResult) {
+            // The ledger is written and committed: a run log that cannot be written (the staging
+            // directory vanished or was replaced meanwhile) must not turn the answer into an error.
             $id = RunLog::newId();
-            RunLog::record($staging, $id, $kind, $started, self::runLine($args, $last, 'applied') + ['operation_id' => $data['operation_id'] ?? null], ['args' => self::publicArgs($args), 'accounts' => $last->data['accounts'] ?? $last->data['plan'] ?? [], 'rows' => $last->data['rows'] ?? [], 'changes' => $last->changes, 'operation_id' => $data['operation_id'] ?? null]);
-            $body['data']['run_id'] = $id;
+
+            try {
+                RunLog::record($staging, $id, $kind, $started, self::runLine($args, $last, 'applied') + ['operation_id' => $data['operation_id'] ?? null], ['args' => self::publicArgs($args), 'accounts' => $last->data['accounts'] ?? $last->data['plan'] ?? [], 'rows' => $last->data['rows'] ?? [], 'changes' => $last->changes, 'operation_id' => $data['operation_id'] ?? null]);
+                $body['data']['run_id'] = $id;
+            } catch (Throwable $e) {
+                $body['data']['run_id']      = null;
+                $body['meta']['warnings']    = array_merge((array) ($body['meta']['warnings'] ?? []), [sprintf('applied, but the run could not be logged in %s: %s', Staging::DIR, $e instanceof MachineException ? $e->getMessage() : 'the staging directory is not writable')]);
+            }
             $response->setData($body);
         }
 
         return $response;
+    }
+
+    /**
+     * apis.mdx §15 — a long route streams NDJSON progress when the caller asked for it with
+     * `Accept: application/x-ndjson`: one `{"progress": {"phase", "done", "total"}}` line per
+     * report, then the normal envelope as the last line (an error envelope when the call failed;
+     * the status is already 200 by then, so the envelope's `ok` and `code` are the verdict).
+     *
+     * The plane's outer middleware rewrites Accept to application/json before the handler runs,
+     * so the caller's own header is read from the raw server variable.
+     *
+     * @param Closure(): JsonResponse $produce
+     */
+    private function streamed(Request $request, Closure $produce): Response
+    {
+        if (!self::wantsNdjson($request)) {
+            return $produce();
+        }
+        $response = new StreamedResponse(null, 200, ['Content-Type' => 'application/x-ndjson; charset=utf-8', 'X-Accel-Buffering' => 'no']);
+        $response->setCallback(static function () use ($produce): void {
+            $emit     = static function (string $line): void {
+                echo $line, "\n";
+                if (ob_get_level() > 0) {
+                    @ob_flush();
+                }
+                flush();
+            };
+            $previous = Progress::sink(static fn (string $phase, ?int $done, ?int $total) => $emit(Envelope::encode(['progress' => ['phase' => $phase, 'done' => $done, 'total' => $total]])));
+
+            try {
+                $json = $produce();
+            } catch (Throwable $e) {
+                if (!$e instanceof MachineException) {
+                    report($e);
+                }
+                $json = Envelope::error(Envelope::fromThrowable($e));
+            } finally {
+                Progress::sink($previous);
+            }
+            $emit((string) $json->getContent());
+        });
+
+        return $response;
+    }
+
+    private static function wantsNdjson(Request $request): bool
+    {
+        $accept = (string) ($request->server->get('HTTP_ACCEPT') ?? '');
+
+        return str_contains(strtolower($accept), 'application/x-ndjson');
+    }
+
+    /** Lift PHP's execution time limit for this request only (apis.mdx §15). */
+    private static function longRunning(): void
+    {
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(0);
+        }
     }
 
     /**
@@ -1112,6 +1216,16 @@ final class IngestController extends MachineController
             }
         }
         $dates    = array_column($rows, 'date');
+        $mismatch = array_values(array_filter($rows, static fn (array $r): bool => 'currency_mismatch' === $r['status']));
+        $reasons  = [];
+        if (count($c['conflicts']) > 0) {
+            $reasons[] = 'statement conflicts block their account-months — GET /ingest/dupes, then POST /ingest/prefer';
+        }
+        if ([] !== $mismatch) {
+            $found     = array_values(array_unique(array_column($mismatch, 'currency_code')));
+            sort($found, SORT_STRING);
+            $reasons[] = sprintf('%d row%s are in %s but the account is in %s — never stored as if the numbers were the same; map the statements to an account in that currency (PUT /ingest/map) or fix the manifest currency', count($mismatch), 1 === count($mismatch) ? '' : 's', implode('/', $found), (string) ($target['currency_code'] ?? '?'));
+        }
 
         return [
             'key'                    => $a['key'],
@@ -1130,11 +1244,103 @@ final class IngestController extends MachineController
             'rows_after_dedupe'      => count($c['rows']),
             'rows_in_range'          => count($rows),
             'blocked_rows'           => count(array_filter($rows, static fn (array $r): bool => 'blocked' === $r['status'])),
+            'currency_mismatch'      => count($mismatch),
             'bad_rows'               => count($c['bad']),
-            'blocked'                => count($c['conflicts']) > 0,
-            'blocked_reason'         => count($c['conflicts']) > 0 ? 'statement conflicts block their account-months — GET /ingest/dupes, then POST /ingest/prefer' : null,
+            'blocked'                => [] !== $reasons,
+            'blocked_reason'         => [] === $reasons ? null : implode('; ', $reasons),
             'date_range'             => [] === $dates ? null : ['start' => min($dates), 'end' => max($dates)],
+            'warnings'               => self::statementWarnings($c['statements']),
         ];
+    }
+
+    /**
+     * Money is a decimal string IN A NAMED CURRENCY (apis.mdx §14.1), and the plane never invents
+     * an amount (§11.8): a row whose statement (OFX CURDEF, camt Ccy) — or, when the statement is
+     * silent, whose manifest row — names a currency other than the target account's is BLOCKED and
+     * named, never stored as if a EUR figure were a USD one. A silent statement under a defaulted
+     * manifest currency is taken to be in the account's currency, and the summary says which.
+     *
+     * @param list<array<string, mixed>>  $rows
+     * @param list<ParsedStatement>       $statements
+     * @param null|array<string, mixed>   $target
+     * @param null|string                 $declared the manifest's explicit currency, when it gave one
+     *
+     * @return list<array<string, mixed>>
+     */
+    private static function guardCurrency(array $rows, array $statements, ?array $target, ?string $declared): array
+    {
+        if (null === $target) {
+            return $rows;
+        }
+        $want   = strtoupper(trim((string) ($target['currency_code'] ?? '')));
+        $byFile = [];
+        foreach ($statements as $s) {
+            if (null !== $s->currency && '' !== trim($s->currency)) {
+                $byFile[$s->relative] = strtoupper(trim($s->currency));
+            }
+        }
+        $declared = null === $declared || '' === trim($declared) ? null : strtoupper(trim($declared));
+        foreach ($rows as $i => $r) {
+            if ('ok' !== $r['status']) {
+                continue;
+            }
+            $has = $byFile[(string) ($r['statement'] ?? '')] ?? $declared;
+            if (null !== $has && $has !== $want) {
+                $rows[$i]['status']        = 'currency_mismatch';
+                $rows[$i]['currency_code'] = $has;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * What the operator should know about an account's source set: a lesser file read for a
+     * month only it has, and — the one way a prepared tree can still double a month — two primary
+     * statements without bank ids whose rows overlap in time (their shared rows get two ordinals,
+     * because the plane never guesses which of two same-day rows is the same transaction).
+     *
+     * @param list<ParsedStatement> $statements
+     *
+     * @return list<string>
+     */
+    private static function statementWarnings(array $statements): array
+    {
+        $out       = [];
+        $primaries = array_values(array_filter($statements, static fn (ParsedStatement $s): bool => ParsedStatement::PRIMARY === $s->status));
+        foreach ($primaries as $s) {
+            foreach ($s->warnings as $w) {
+                if (str_starts_with($w, 'read although')) {
+                    $out[] = sprintf('%s: %s', $s->relative, $w);
+                }
+            }
+        }
+        $ranges    = [];
+        foreach ($primaries as $s) {
+            // the statement's own period when it states one (a card posts a late row past its
+            // cycle, and that is not an overlap), else the span of its rows
+            $r = null !== $s->periodStart && null !== $s->periodEnd ? [$s->periodStart, $s->periodEnd] : $s->rowRange();
+            if (null === $r) {
+                continue;
+            }
+            $bankIds = [] !== $s->rows && count(array_filter($s->rows, static fn ($row): bool => null !== $row->fitid)) === count($s->rows);
+            if (!$bankIds) {
+                $ranges[] = [$r[0], $r[1], $s->relative];
+            }
+        }
+        usort($ranges, static fn (array $a, array $b): int => $a <=> $b);
+        for ($i = 0; $i < count($ranges); ++$i) {
+            for ($j = $i + 1; $j < count($ranges); ++$j) {
+                if ($ranges[$j][0] <= $ranges[$i][1]) {
+                    $out[] = sprintf('%s and %s overlap (%s..%s) and carry no bank ids: a row present in both is counted as two transactions — check that month is not doubled', $ranges[$i][2], $ranges[$j][2], $ranges[$j][0], min($ranges[$i][1], $ranges[$j][1]));
+                }
+                if (count($out) >= 20) {
+                    break 2;
+                }
+            }
+        }
+
+        return array_values(array_unique($out));
     }
 
     /**

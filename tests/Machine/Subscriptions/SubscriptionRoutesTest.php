@@ -226,9 +226,16 @@ final class SubscriptionRoutesTest extends MachineTestCase
         $this->assertSame('Streaming Plus', DB::table('rule_actions')->where('action_type', 'link_to_bill')->value('action_value'), 'Firefly renamed the rule action with the subscription');
 
         $op     = DB::table('machine_operations')->where('id', $done['data']['operation_id'])->first();
-        $classes = array_column(json_decode((string) $op->touched, true), 'class');
+        $touched = json_decode((string) $op->touched, true);
+        $classes = array_column($touched, 'class');
         $this->assertContains(Bill::class, $classes);
         $this->assertContains(\FireflyIII\Models\RuleAction::class, $classes, 'undo can restore the renamed rule action too');
+        foreach ($touched as $row) {
+            if (\FireflyIII\Models\RuleAction::class === $row['class']) {
+                $this->assertSame('updated', $row['op'], 'the renamed action is recorded as updated (it still exists), with the old name to restore');
+                $this->assertSame('Streaming', $row['before']['action_value']);
+            }
+        }
 
         $this->assertPlaneError($this->machine('PUT', '/subscriptions/'.$bill->id, []), 400, 'invalid_input');
         $this->assertPlaneError($this->machine('PUT', '/subscriptions/99999', ['name' => 'x']), 404, 'not_found');

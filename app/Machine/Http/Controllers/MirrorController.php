@@ -31,6 +31,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Route;
 use Illuminate\Routing\Router;
+use Illuminate\Support\Facades\Facade;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 use Throwable;
@@ -87,6 +88,11 @@ final class MirrorController extends MachineController
         $content  = (string) $response->getContent();
         $type     = (string) $response->headers->get('Content-Type');
 
+        if ($status >= 300 && $status < 400) {
+            // upstream's IsAdmin middleware answers a non-owner with a redirect to the home page,
+            // never an error: a redirect is a refusal here, not an empty success
+            throw MachineException::forbidden('Upstream redirected instead of answering — it wants a role the operator does not have.', 'The operator needs the owner (full) role in Firefly III, or set FIREFLY_MACHINE_OPERATOR to the owner (GET /machine/v1/admin/users lists roles)', ['path' => 'api/v1/'.$path, 'upstream_status' => $status]);
+        }
         if (204 === $status || '' === trim($content)) {
             return $this->ok(['path' => 'api/v1/'.$path, 'route' => 'GET /api/v1/'.$template, 'status' => $status, 'result' => null, 'pagination' => null]);
         }
@@ -154,12 +160,16 @@ final class MirrorController extends MachineController
         $outerRoute  = $container->bound(Route::class) ? $container->make(Route::class) : null;
         $outerRouter = self::routerState($router);
 
+        // the Request facade caches its resolved instance: clear it on both swaps, as the HTTP
+        // kernel does, so nothing upstream reads the caller's request while the sub-request runs
         $container->instance('request', $sub);
+        Facade::clearResolvedInstance('request');
 
         try {
             return $router->dispatch($sub);
         } finally {
             $container->instance('request', $parent);
+            Facade::clearResolvedInstance('request');
             if (null !== $outerRoute) {
                 $container->instance(Route::class, $outerRoute);
             }
@@ -308,11 +318,11 @@ final class MirrorController extends MachineController
     }
 
     /**
-     * Cut a list until it fits the 8 MiB response cap (§15).
+     * Cut a list until it fits the 8 MiB response cap (§15) — shared with GET /search (§13).
      *
      * @return array{0: mixed, 1: int} the (possibly cut) value and how many rows were dropped
      */
-    private static function capBytes(mixed $result): array
+    public static function capBytes(mixed $result): array
     {
         $max = (int) config('machine.limits.max_response_bytes', 8388608) - 65536;
         if (strlen(Envelope::encode($result)) <= $max) {
@@ -346,7 +356,11 @@ final class MirrorController extends MachineController
 
         return match (true) {
             404 === $status               => MachineException::notFound('Upstream found nothing there: '.$message, 'Check the id in the path — a typed route may resolve names for you', $details),
-            401 === $status, 403 === $status => MachineException::forbidden('Upstream refused the operator: '.$message, 'This read needs a role the operator does not have in this administration', $details),
+            // The operator is bound on the api guard before upstream runs, so a 401 can never mean
+            // "not authenticated" here: it is a route binder (Webhook, WebhookMessage, …) that
+            // answers 401 where the others answer 404 — a record that is not the operator's.
+            401 === $status               => MachineException::notFound('Upstream has no such record for the operator.', 'Check the id in the path — it may belong to another user, or be deleted', $details),
+            403 === $status               => MachineException::forbidden('Upstream refused the operator: '.$message, 'This read needs a role the operator does not have in this administration', $details),
             422 === $status, 400 === $status, 415 === $status => MachineException::invalid('Upstream rejected the arguments: '.$message, 'Fix the query-string arguments named in details.fields', $details),
             default                       => MachineException::upstream('Upstream failed: '.$message, 'Retry, or use a typed route for the same question', $details),
         };

@@ -25,6 +25,7 @@ declare(strict_types=1);
 namespace Tests\Machine\Subscriptions;
 
 use Carbon\Carbon;
+use FireflyIII\Machine\Transactions\Pivots\CategoryJournalRow;
 use FireflyIII\Models\Account;
 use FireflyIII\Models\Bill;
 use FireflyIII\Models\PiggyBank;
@@ -36,8 +37,8 @@ use Tests\Machine\MachineTestCase;
 
 /**
  * pm/apis.mdx §7.5 for this family: what the subscription, piggy-bank and recurrence writes put
- * in the operation log is enough for POST /undo to reverse them — or, where it is not (the piggy
- * bank pivot has no model yet), undo REFUSES instead of half-reversing.
+ * in the operation log is enough for POST /undo to reverse them — the saved amounts of a piggy
+ * bank (the account_piggy_bank pivot) and the links a triggered transaction creates included.
  *
  * @internal
  *
@@ -103,24 +104,77 @@ final class SubscriptionUndoTest extends MachineTestCase
         $this->assertNotNull(Recurrence::query()->find($id), 'the recurrence itself stays (that was an earlier operation)');
     }
 
-    public function testUndoOfAPiggyBankMoveRefusesRatherThanHalfReversing(): void
+    public function testUndoRestoresAPiggyBankMove(): void
     {
         $piggy = $this->piggy($this->user, $this->checking, 'Vacation', '1000.00', '100.00');
         $this->apply('POST', '/piggy-banks/'.$piggy->id.'/add', ['amount' => '200.00']);
+        $this->assertSame(0, bccomp('300', (string) DB::table('account_piggy_bank')->where('piggy_bank_id', $piggy->id)->value('current_amount'), 12));
+        $this->assertSame(1, PiggyBank::query()->find($piggy->id)?->piggyBankEvents()->count());
 
         $last  = $this->envelope($this->machine('GET', '/undo/last'));
         $this->assertTrue($last['ok'], (string) json_encode($last));
-        if (true === $last['data']['reversible']) {
-            // the core has shipped a model for the account_piggy_bank pivot: undo must then restore the amount
-            $this->undo();
-            $this->assertSame(0, bccomp('100', (string) DB::table('account_piggy_bank')->where('piggy_bank_id', $piggy->id)->value('current_amount'), 12));
-            $this->assertSame(0, PiggyBank::query()->find($piggy->id)?->piggyBankEvents()->count());
+        $this->assertTrue($last['data']['reversible'], 'the saved-amount pivot row has a record class, so undo can write it back: '.json_encode($last['data']));
+        $this->assertSame([], $last['data']['blocked_by']);
+        $this->assertContains('account_piggy_bank_row', array_column($last['data']['effects'], 'entity'));
 
-            return;
-        }
-        $this->assertNotEmpty($last['data']['blocked_by']);
-        $this->assertNull($last['data']['confirm_token']);
-        $this->assertSame(0, bccomp('300', (string) DB::table('account_piggy_bank')->where('piggy_bank_id', $piggy->id)->value('current_amount'), 12), 'nothing was half-undone');
+        $this->undo();
+        $this->assertSame(0, bccomp('100', (string) DB::table('account_piggy_bank')->where('piggy_bank_id', $piggy->id)->value('current_amount'), 12), 'the amount is back');
+        $this->assertSame(0, PiggyBank::query()->find($piggy->id)?->piggyBankEvents()->count(), 'the event is gone');
+        $this->assertSame('100.00', $this->envelope($this->machine('GET', '/piggy-banks/'.$piggy->id))['data']['piggy_bank']['current_amount']);
+    }
+
+    public function testUndoRemovesACreatedPiggyBankAndItsLinks(): void
+    {
+        $done = $this->apply('POST', '/piggy-banks', ['name' => 'Laptop', 'accounts' => [(string) $this->checking->id], 'target_amount' => '900.00']);
+        $id   = (int) $done['data']['piggy_bank']['id'];
+        $this->assertSame(1, DB::table('account_piggy_bank')->where('piggy_bank_id', $id)->count());
+        $this->undo();
+        $this->assertNull(PiggyBank::withTrashed()->find($id));
+        $this->assertSame(0, DB::table('account_piggy_bank')->where('piggy_bank_id', $id)->count(), 'the link row is gone too');
+    }
+
+    public function testUndoOfATriggerRemovesTheCategoryLinkAsWell(): void
+    {
+        $first  = Carbon::now(config('app.timezone'))->startOfMonth()->addMonth();
+        $made   = $this->apply('POST', '/recurrences', ['recurrence' => [
+            'type'              => 'withdrawal',
+            'title'             => 'Gym',
+            'first_date'        => $first->format('Y-m-d'),
+            'nr_of_repetitions' => 12,
+            'repetitions'       => [['type' => 'monthly', 'moment' => '3']],
+            'transactions'      => [['description' => 'Gym', 'amount' => '40.00', 'currency_code' => 'USD', 'source_id' => (string) $this->checking->id, 'destination_name' => 'Fitco', 'category_name' => 'Health', 'tags' => ['fitness']]],
+        ]]);
+        $id     = $made['data']['recurrence']['id'];
+        $links  = DB::table('category_transaction_journal')->count();
+        $tagged = DB::table('tag_transaction_journal')->count();
+
+        $fired  = $this->envelope($this->machine('POST', '/recurrences/'.$id.'/trigger'));
+        $this->assertTrue($fired['ok'], (string) json_encode($fired));
+        $this->assertSame('Health', $fired['data']['transactions'][0]['transactions'][0]['category_name']);
+        $this->assertSame($links + 1, DB::table('category_transaction_journal')->count());
+        $this->assertSame($tagged + 1, DB::table('tag_transaction_journal')->count());
+        $op     = DB::table('machine_operations')->where('id', $fired['data']['operation_id'])->first();
+        $this->assertContains(CategoryJournalRow::class, array_column(json_decode((string) $op->touched, true), 'class'), 'the category link is in the log');
+
+        $this->undo();
+        $this->assertSame($links, DB::table('category_transaction_journal')->count(), 'the category link went with the journal');
+        $this->assertSame($tagged, DB::table('tag_transaction_journal')->count(), 'so did the tag link');
+    }
+
+    public function testDeletingSomethingAlreadyGoneLeavesNoOperationToUndo(): void
+    {
+        $this->enableAdmin();
+        $bill = $this->bill($this->user, 'Streaming', '15.99', '2026-01-05');
+        $this->apply('DELETE', '/subscriptions/'.$bill->id, []);
+        $ops  = DB::table('machine_operations')->count();
+        $done = $this->envelope($this->machine('DELETE', '/subscriptions/'.$bill->id, ['dry_run' => false])); // §5.6: answered directly, no plan, no token
+        $this->assertTrue($done['ok'], (string) json_encode($done));
+        $this->assertSame(0, $done['data']['deleted']);
+        $this->assertArrayNotHasKey('operation_id', $done['data']);
+        $this->assertSame($ops, DB::table('machine_operations')->count(), 'a no-op is not an operation');
+        $last = $this->envelope($this->machine('GET', '/undo/last'));
+        $this->assertSame('DELETE /subscriptions/{id}', $last['data']['route']);
+        $this->assertContains('bill', array_column($last['data']['effects'], 'entity'), 'the real delete is still the last operation');
     }
 
     /** @return array<string, mixed> the applied envelope */

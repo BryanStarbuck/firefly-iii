@@ -276,7 +276,7 @@ final class RuleRoutesTest extends MachineTestCase
         $this->enableWrites();
         $plan = $this->envelope($this->machine('POST', '/rules/run', ['rule_ids' => [(string) $this->coffee->id], 'start' => '2026-08-01', 'end' => '2026-08-31']));
         $this->assertTrue($plan['ok'], (string) json_encode($plan));
-        $this->assertSame(['updated' => 2, 'deleted' => 0, 'matched' => 2], $plan['data']['changes']);
+        $this->assertSame(['updated' => 2, 'deleted' => 0, 'unlisted' => 0, 'matched' => 2], $plan['data']['changes']);
         $this->assertSame(2, $plan['data']['change_count']);
         $this->assertCount(2, $plan['data']['matches']);
         $this->assertSame(0, Category::query()->where('name', 'Dining')->count(), 'the preview changed nothing');
@@ -392,6 +392,85 @@ final class RuleRoutesTest extends MachineTestCase
         $this->assertTrue($apply['ok'], (string) json_encode($apply));
         $this->assertNull(RuleGroup::query()->find($this->group->id));
         $this->assertSame($other->id, Rule::query()->find($this->coffee->id)->rule_group_id);
+    }
+
+    // ----------------------------------------------------------- regressions ---
+
+    /** A rule run edits journals through the engine, which undo cannot trace: /undo must refuse, not "succeed" doing nothing. */
+    public function testARuleRunIsRecordedAsIrreversibleSoUndoRefuses(): void
+    {
+        $this->enableWrites();
+        $plan  = $this->envelope($this->machine('POST', '/rules/run', ['rule_ids' => [(string) $this->coffee->id]]));
+        $apply = $this->envelope($this->machine('POST', '/rules/run', ['rule_ids' => [(string) $this->coffee->id], 'dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
+        $this->assertTrue($apply['ok'], (string) json_encode($apply));
+        $this->assertFalse($apply['data']['reversible']);
+        $this->assertSame(3, $apply['data']['engine_changed_count'], 'Firefly\'s own count of changed journals is reported (R7)');
+
+        $last  = $this->envelope($this->machine('GET', '/undo/last'));
+        $this->assertSame($apply['data']['operation_id'], $last['data']['operation_id']);
+        $this->assertFalse($last['data']['reversible'], 'a rule run must not be offered as undoable');
+        $this->assertNotEmpty($last['data']['blocked_by']);
+        $this->assertNull($last['data']['confirm_token']);
+    }
+
+    /** /rules/validate is a read: Firefly's validators must not leave a configuration row behind (R8). */
+    public function testValidateIsAReadAndStoresNoConfiguration(): void
+    {
+        $before = DB::table('configuration')->count();
+        $env    = $this->envelope($this->machine('POST', '/rules/validate', ['rule' => $this->ruleBody('Bakery is dining')]));
+        $this->assertTrue($env['data']['valid']);
+        $this->assertIsBool($env['data']['expression_engine']);
+        $this->assertSame($before, DB::table('configuration')->count(), 'validating a rule stored a configuration row');
+    }
+
+    /** rule_group_title on an edit used to be accepted and silently ignored. */
+    public function testUpdateMovesARuleToAGroupNamedByTitle(): void
+    {
+        $this->enableWrites();
+        $other = $this->ruleGroup($this->user, 'Business rules');
+        $body  = ['rule' => ['rule_group_title' => 'business rules']];
+        $plan  = $this->envelope($this->machine('PUT', '/rules/'.$this->coffee->id, $body));
+        $this->assertTrue($plan['ok'], (string) json_encode($plan));
+        $this->assertSame('Business rules', $plan['data']['rule']['rule_group_title']);
+        $this->assertSame($this->group->id, Rule::query()->find($this->coffee->id)->rule_group_id, 'the dry run moved nothing');
+        $apply = $this->envelope($this->machine('PUT', '/rules/'.$this->coffee->id, $body + ['dry_run' => false, 'confirm_token' => $plan['data']['confirm_token']]));
+        $this->assertTrue($apply['ok'], (string) json_encode($apply));
+        $this->assertSame($other->id, Rule::query()->find($this->coffee->id)->rule_group_id);
+
+        $this->assertPlaneError($this->machine('PUT', '/rules/'.$this->coffee->id, ['rule' => ['rule_group_title' => 'No such group']]), 400, 'invalid_input');
+    }
+
+    public function testMoveToTheGroupItIsAlreadyInIsRefused(): void
+    {
+        $this->enableWrites();
+        $env = $this->assertPlaneError($this->machine('POST', '/rules/'.$this->coffee->id.'/move', ['rule_group_id' => (string) $this->group->id]), 400, 'invalid_input');
+        $this->assertStringContainsString('already', $env['error']['message']);
+    }
+
+    /** A search for "%" or "_" is a search for those characters, not a wildcard. */
+    public function testRuleSearchTreatsLikeWildcardsAsText(): void
+    {
+        $this->rule($this->user, $this->group, '100% cash_back');
+        $this->assertSame(['100% cash_back'], array_column($this->envelope($this->machine('GET', '/rules', ['search' => '_']))['data']['rules'], 'title'), '"_" is not a one-character wildcard');
+        $this->assertSame(['100% cash_back'], array_column($this->envelope($this->machine('GET', '/rules', ['search' => '%']))['data']['rules'], 'title'), '"%" is not a wildcard');
+        $this->assertSame([], array_column($this->envelope($this->machine('GET', '/rules', ['search' => 'c_ffee']))['data']['rules'], 'title'));
+        $this->assertSame(['100% cash_back'], array_column($this->envelope($this->machine('GET', '/rules', ['search' => 'cash_back']))['data']['rules'], 'title'));
+    }
+
+    /** A preview scopes to THIS operator's journals only — never another user's ledger. */
+    public function testPreviewNeverSeesAnotherUsersJournals(): void
+    {
+        config(['machine.operator' => $this->user->email]);
+        $group = \FireflyIII\Models\UserGroup::create(['title' => 'other@example.test']);
+        $role  = \FireflyIII\Models\UserRole::query()->where('title', 'owner')->firstOrFail();
+        $other = User::create(['email' => 'other@example.test', 'password' => 'password', 'user_group_id' => $group->id]);
+        \FireflyIII\Models\GroupMembership::create(['user_id' => $other->id, 'user_group_id' => $group->id, 'user_role_id' => $role->id]);
+        $this->withdrawal($other, $this->asset($other, 'Other checking'), 'Coffee elsewhere', '3.00', '2026-08-10');
+
+        $env   = $this->envelope($this->machine('POST', '/rules/preview', ['rule_id' => (string) $this->coffee->id]));
+        $this->assertTrue($env['ok'], (string) json_encode($env));
+        $this->assertSame(3, $env['data']['match_count']);
+        $this->assertNotContains('Coffee elsewhere', array_column($env['data']['matches'], 'description'));
     }
 
     public function testEveryRuleRouteIsLive(): void

@@ -71,6 +71,15 @@ final class BudgetController extends MachineController
     private const array AUTO_TYPES   = ['none', 'reset', 'rollover', 'adjusted'];
     private const array AUTO_PERIODS = ['daily', 'weekly', 'monthly', 'quarterly', 'half_year', 'yearly'];
 
+    /**
+     * Upstream 6.7 derives the available budget: AvailableBudgetCalculator (run by Firefly's own
+     * listener on every limit create/update/delete, and by BudgetDestroyService) overwrites the
+     * amount of every available budget the limit's period touches with the sum of that currency's
+     * limits, and deletes the row when that sum is zero. Upstream's /api/v1 no longer stores or
+     * updates available budgets at all. The plane keeps the spec's PUT (§8.5) but says so.
+     */
+    public const string AVAILABLE_DERIVED = 'Firefly III recalculates the available budget from the period\'s budget limits: the next limit created, changed or removed in this currency overwrites this amount with the budgeted total (and removes it when nothing is budgeted). Set limits first, then this; treat it as an override that lasts until the next limit change.';
+
     private const array PERIOD_RULES = [
         'start' => ['sometimes', 'nullable', 'date_format:Y-m-d'],
         'end'   => ['sometimes', 'nullable', 'date_format:Y-m-d'],
@@ -176,6 +185,7 @@ final class BudgetController extends MachineController
             'notes'                 => [
                 'limit: null means NO limit was set for the period (unbudgeted) — that is not a limit of "0.00"',
                 'spent is negative (money out); left = limit + spent; left_to_spend = available + spent_total; left_to_budget = available - budgeted_total',
+                'available is Firefly\'s own row for exactly this period, and Firefly recalculates it from the limits whenever a limit changes — after a limit write it equals budgeted_total until PUT /available-budgets overrides it again',
             ],
         ]);
     }
@@ -254,7 +264,7 @@ final class BudgetController extends MachineController
             'start'                 => $start->format('Y-m-d'),
             'end'                   => $end->format('Y-m-d'),
             'period_source'         => $source,
-            'min_spent'             => $minSpent,
+            'min_spent'             => null === $minSpent ? null : Money::strip($minSpent),
             'budgets_without_limit' => $gaps,
             'without_budget'        => $withoutBudget,
             'notes'                 => [
@@ -281,7 +291,12 @@ final class BudgetController extends MachineController
             $rows[] = $this->availableRow($available);
         }
 
-        return $this->ok(['available_budgets' => $rows, 'start' => $start?->format('Y-m-d'), 'end' => $end?->format('Y-m-d')]);
+        return $this->ok([
+            'available_budgets' => $rows,
+            'start'             => $start?->format('Y-m-d'),
+            'end'               => $end?->format('Y-m-d'),
+            'notes'             => [self::AVAILABLE_DERIVED],
+        ]);
     }
 
     // ================================================================ writes ===
@@ -362,7 +377,7 @@ final class BudgetController extends MachineController
                 $this->refuseDuplicateName($data['name'], $budgetId);
             }
             $renamed = array_key_exists('name', $data) && $data['name'] !== $budget->name;
-            $before  = [$budget->name, (bool) $budget->active, $this->noteText($budget)];
+            $before  = [$budget->name, (bool) $budget->active, $this->noteText($budget), $this->autoState($budgetId)];
             $result->updating($budget);
             if ($renamed) {
                 $this->recordRuleCascade($result, (string) $budget->name, 'set_budget', 'budget_is');
@@ -384,7 +399,8 @@ final class BudgetController extends MachineController
                 }
             }
             $budget->refresh();
-            $changed = $before !== [$budget->name, (bool) $budget->active, $this->noteText($budget)] || null !== $autoType;
+            // "updated" only when a stored fact moved — the same values again are "unchanged"
+            $changed = $before !== [$budget->name, (bool) $budget->active, $this->noteText($budget), $this->autoState($budgetId)];
             $result->count($changed ? 'updated' : 'unchanged');
 
             return $result->with(['budget' => $this->renderBudgets(new Collection([$budget]))[0]]);
@@ -414,8 +430,8 @@ final class BudgetController extends MachineController
         return $this->write($request, $args, function (bool $dryRun) use ($budgetId, $currency, $start, $end, $amount, $notes): WriteResult {
             $budget = Budget::query()->findOrFail($budgetId);
             $result = new WriteResult();
-            $row    = $this->trackingAvailable($result, $dryRun, fn (): array => $this->applyLimit($result, $budget, $currency, $start, $end, $amount, $notes));
-            $result->basis = [$row];
+            $row    = $this->trackingAvailable($result, $dryRun, fn (): array => $this->applyLimit($result, $budget, $currency, $start, $end, $amount, $notes, $dryRun));
+            $result->basis = self::stableRows([$row]);
 
             return $result->with(['budget_id' => (string) $budget->id, 'name' => (string) $budget->name, 'limits' => [$row], 'action' => $row['action']]);
         });
@@ -440,6 +456,18 @@ final class BudgetController extends MachineController
             $result = new WriteResult();
             $limit  = BudgetLimit::query()->where('budget_id', $budgetId)->where('id', $limitId)->first();
             if (null === $limit) {
+                $elsewhere = BudgetLimit::query()->leftJoin('budgets', 'budgets.id', '=', 'budget_limits.budget_id')
+                    ->where('budget_limits.id', $limitId)->where('budgets.user_group_id', $this->administration()->id)->whereNull('budgets.deleted_at')
+                    ->first(['budget_limits.id', 'budgets.id as owner_id', 'budgets.name as owner_name'])
+                ;
+                if (null !== $elsewhere) {
+                    throw MachineException::invalid(
+                        sprintf('Limit #%d belongs to budget "%s" (#%d), not to "%s" (#%d).', $limitId, $elsewhere->owner_name, $elsewhere->owner_id, $budget->name, $budgetId),
+                        sprintf('DELETE /machine/v1/budgets/%d/limits/%d — or GET /machine/v1/budgets/%d/limits for this budget\'s own limit ids', $elsewhere->owner_id, $limitId, $budgetId),
+                        ['limit_id' => (string) $limitId, 'budget_id' => (string) $budgetId, 'belongs_to_budget_id' => (string) $elsewhere->owner_id],
+                    );
+                }
+
                 return $result->with([
                     'budget_id' => (string) $budgetId,
                     'name'      => (string) $budget->name,
@@ -457,7 +485,10 @@ final class BudgetController extends MachineController
                 ->map(static fn (BudgetLimit $l): array => ['id' => (string) $l->id, 'start' => $l->start_date->format('Y-m-d'), 'end' => $l->end_date->format('Y-m-d')])
                 ->values()->all();
             $unbudgeted = [] === $covering;
-            $result->basis = [$row];
+            // the fingerprint covers the change set — this limit's stored facts and the other limits
+            // that decide "unbudgeted" — never the live spent/left figures: a transaction booked
+            // between plan and apply does not change what deleting a limit does (§7.3)
+            $result->basis = [self::stableRows([['budget_id' => $row['budget_id'], 'limit_id' => $row['id'], 'start' => $row['start'], 'end' => $row['end'], 'currency_code' => $row['currency_code'], 'previous' => $row['amount'], 'amount' => null, 'action' => 'deleted']]), $covering];
 
             return $result->with([
                 'budget_id'        => (string) $budgetId,
@@ -514,7 +545,11 @@ final class BudgetController extends MachineController
             $row      = $this->availableRow($available->refresh()) + ['previous' => $previous];
             $result->basis = [$row['amount'], $previous];
 
-            return $result->with(['available_budget' => $row]);
+            return $result->with([
+                'available_budget'     => $row,
+                'firefly_recalculates' => true,
+                'warning'              => self::AVAILABLE_DERIVED,
+            ]);
         });
     }
 
@@ -543,10 +578,10 @@ final class BudgetController extends MachineController
                 foreach ($previous as $old) {
                     $currency = $this->currency((int) $old->transaction_currency_id) ?? $this->primaryCurrency();
                     $amount   = Money::forCurrency((string) $old->amount, $currency);
-                    $rows[]   = $this->trackingAvailable($result, $dryRun, fn (): array => $this->applyLimit($result, $budget, $currency, $start, $end, $amount, null)) + ['copied_from' => (string) $old->id];
+                    $rows[]   = $this->trackingAvailable($result, $dryRun, fn (): array => $this->applyLimit($result, $budget, $currency, $start, $end, $amount, null, $dryRun)) + ['copied_from' => (string) $old->id];
                 }
             }
-            $result->basis = $rows;
+            $result->basis = self::stableRows($rows);
 
             return $result->with([
                 'start'            => $start->format('Y-m-d'),
@@ -607,14 +642,14 @@ final class BudgetController extends MachineController
                     foreach ($windows as $index => [$ws, $we]) {
                         $history[] = ['start' => $ws->format('Y-m-d'), 'end' => $we->format('Y-m-d'), 'spent' => Money::forCurrency($spentByPeriod[$index] ?? '0', $currency)];
                     }
-                    $rows[]   = $this->trackingAvailable($result, $dryRun, fn (): array => $this->applyLimit($result, $budget, $currency, $start, $end, $average, null)) + ['average_of' => $n, 'spent_total' => Money::forCurrency(Money::negate($total), $currency), 'history' => $history];
+                    $rows[]   = $this->trackingAvailable($result, $dryRun, fn (): array => $this->applyLimit($result, $budget, $currency, $start, $end, $average, null, $dryRun)) + ['average_of' => $n, 'spent_total' => Money::forCurrency(Money::negate($total), $currency), 'history' => $history];
                     $any      = true;
                 }
                 if (!$any) {
                     $skipped[] = ['budget_id' => (string) $budget->id, 'name' => (string) $budget->name, 'reason' => sprintf('spent nothing in the previous %d period(s) — left as it was, not set to "0.00"', $n)];
                 }
             }
-            $result->basis = $rows;
+            $result->basis = self::stableRows($rows);
 
             return $result->with([
                 'start'           => $start->format('Y-m-d'),
@@ -687,8 +722,13 @@ final class BudgetController extends MachineController
                 $result->deleting($note);
             }
             if ($journals > 0) {
-                // the journal links are removed by Firefly's destroy service and are not in the undo log
-                $result->touched[] = ['class' => 'FireflyIII\Machine\Pivot\BudgetTransactionJournal', 'id' => (int) $budget->id, 'op' => 'deleted', 'before' => ['budget_id' => (int) $budget->id, 'journals' => $journals]];
+                // the journal links are removed by Firefly's destroy service and are not in the undo
+                // log row by row: one 'irreversible' marker makes undo refuse, naming why (§7.5)
+                $result->touched[] = ['class' => 'FireflyIII\Machine\Pivot\BudgetTransactionJournal', 'id' => (int) $budget->id, 'op' => 'irreversible', 'before' => [
+                    'what'   => 'budget links of transaction journals',
+                    'did'    => sprintf('removed the budget from %d journal(s)', $journals),
+                    'reason' => sprintf('%d journal(s) lost budget "%s" (#%d); undo cannot restore those links', $journals, $budget->name, $budget->id),
+                ]];
             }
             // Firefly's BudgetDestroyService deletes the budget's attachment FILES from the upload
             // disk — outside the DB transaction, so a rollback cannot bring them back.
@@ -863,6 +903,7 @@ final class BudgetController extends MachineController
         $endOfDay     = $end->copy()->endOfDay();
         $ops          = $this->opsRepo();
         $limitRepo    = $this->limitRepo();
+        $budgetRepo   = $this->budgetRepo();
         $primary      = $this->primaryCurrency();
         $expenses     = $budgets->count() > 0 ? $ops->collectExpenses($start, $endOfDay, null, $budgets) : [];
         $autos        = AutoBudget::query()->whereIn('budget_id', $budgets->pluck('id')->all())->get()->keyBy('budget_id');
@@ -872,6 +913,11 @@ final class BudgetController extends MachineController
         $withoutLimit = 0;
         foreach ($budgets as $budget) {
             $limits      = $limitRepo->getBudgetLimits($budget, $start, $end);
+            // Firefly's per-budget figure: a limit inside the period counts in full, one crossing
+            // its edge is pro-rated by the days that overlap. (BudgetLimitRepository::budgeted()
+            // is the available-budget-period figure and multiplies the WHOLE period by a partial
+            // limit's daily rate: a 150.00 limit for Oct 1-15 would read "310.00" for October.)
+            $budgeted    = $budgetRepo->budgetedInPeriodForBudget($budget, $start, $end);
             $spent       = [];
             foreach ($ops->sumCollectedExpensesByBudget($expenses, $budget) as $currencyId => $entry) {
                 $spent[(int) $currencyId] = (string) $entry['sum'];
@@ -889,7 +935,7 @@ final class BudgetController extends MachineController
                 $inCur    = $limits->filter(static fn (BudgetLimit $l): bool => (int) $l->transaction_currency_id === $currencyId)->values();
                 $limitRaw = null;
                 if ($inCur->count() > 0) {
-                    $limitRaw = (string) $limitRepo->budgeted($start, $end, $currency, new Collection([$budget]));
+                    $limitRaw = (string) ($budgeted[$currencyId]['sum'] ?? '0');
                     $hasLimit = true;
                 }
                 $spentRaw = $spent[$currencyId] ?? '0';
@@ -953,7 +999,7 @@ final class BudgetController extends MachineController
      *
      * @return array<string, mixed>
      */
-    private function applyLimit(WriteResult $result, Budget $budget, TransactionCurrency $currency, Carbon $start, Carbon $end, string $amount, ?string $notes): array
+    private function applyLimit(WriteResult $result, Budget $budget, TransactionCurrency $currency, Carbon $start, Carbon $end, string $amount, ?string $notes, bool $dryRun = false): array
     {
         $existing = $this->exactLimit($budget, (int) $currency->id, $start->format('Y-m-d'), $end->format('Y-m-d'));
         $previous = null === $existing ? null : Money::forCurrency((string) $existing->amount, $currency);
@@ -980,17 +1026,55 @@ final class BudgetController extends MachineController
             $result->created($limit)->count('created');
         }
 
+        // Firefly's budgeted-in-period figure SUMS every limit in the currency that overlaps the
+        // period (a yearly limit is pro-rated into a month), so a caller who "set" 650 must learn
+        // that /budget-period will show more when another limit overlaps.
+        $others   = $this->limitRepo()->getBudgetLimits($budget, $start, $end)
+            ->filter(static fn (BudgetLimit $l): bool => (int) $l->transaction_currency_id === (int) $currency->id && (int) $l->id !== (int) $limit->id)
+            ->map(fn (BudgetLimit $l): array => ['id' => (string) $l->id, 'start' => $l->start_date->format('Y-m-d'), 'end' => $l->end_date->format('Y-m-d'), 'amount' => Money::forCurrency((string) $l->amount, $currency)])
+            ->values()->all();
+
         return [
-            'name'          => (string) $budget->name,
-            'budget_id'     => (string) $budget->id,
-            'limit_id'      => (string) $limit->id,
-            'start'         => $start->format('Y-m-d'),
-            'end'           => $end->format('Y-m-d'),
-            'currency_code' => (string) $currency->code,
-            'previous'      => $previous,
-            'amount'        => $amount,
-            'action'        => $action,
+            'name'                     => (string) $budget->name,
+            'budget_id'                => (string) $budget->id,
+            // a row a dry run "created" was rolled back: it has no id until the real apply
+            'limit_id'                 => $dryRun && 'created' === $action ? null : (string) $limit->id,
+            'start'                    => $start->format('Y-m-d'),
+            'end'                      => $end->format('Y-m-d'),
+            'currency_code'            => (string) $currency->code,
+            'previous'                 => $previous,
+            'amount'                   => $amount,
+            'action'                   => $action,
+            'other_limits_in_period'   => $others,
         ];
+    }
+
+    /**
+     * The facts of limit rows that a confirm-token fingerprint may depend on (§7.3): never a
+     * created row's id (a rolled-back insert does not get the same id again on MySQL/Postgres,
+     * so a plan that carried one could never be applied), never the per-row extras.
+     *
+     * @param list<array<string, mixed>> $rows
+     *
+     * @return list<array<string, mixed>>
+     */
+    private static function stableRows(array $rows): array
+    {
+        $out = [];
+        foreach ($rows as $row) {
+            $out[] = [
+                'budget_id'     => $row['budget_id'] ?? null,
+                'limit_id'      => 'created' === ($row['action'] ?? null) ? null : ($row['limit_id'] ?? null),
+                'start'         => $row['start'] ?? null,
+                'end'           => $row['end'] ?? null,
+                'currency_code' => $row['currency_code'] ?? null,
+                'previous'      => $row['previous'] ?? null,
+                'amount'        => $row['amount'] ?? null,
+                'action'        => $row['action'] ?? null,
+            ];
+        }
+
+        return $out;
     }
 
     private function exactLimit(Budget $budget, int $currencyId, string $start, string $end): ?BudgetLimit
@@ -1066,10 +1150,11 @@ final class BudgetController extends MachineController
         return Budget::query()->whereIn('id', $ids)->orderBy('order')->orderBy('name')->orderBy('id')->get();
     }
 
+    /** Laravel hands route parameters already URL-decoded; decoding again would turn "A+B" into "A B". */
     private function findBudget(string $idOrName): Budget
     {
         /** @var Budget */
-        return $this->resolve(Budget::class, urldecode($idOrName));
+        return $this->resolve(Budget::class, $idOrName);
     }
 
     private function findBudgetOrNull(string $idOrName): ?Budget
@@ -1167,6 +1252,15 @@ final class BudgetController extends MachineController
             $type = self::autoTypeName((int) $existing->auto_budget_type);
         }
         if ('none' === $type) {
+            $extra = array_values(array_filter(['auto_budget_amount', 'auto_budget_period', 'auto_budget_currency_code'], static fn (string $f): bool => null !== ($args[$f] ?? null)));
+            if ([] !== $extra) {
+                throw MachineException::invalid(
+                    sprintf('auto_budget_type "none" cannot take %s.', implode(', ', $extra)),
+                    'Pass auto_budget_type reset, rollover or adjusted with those fields — or "none" alone to have no auto-budget',
+                    ['fields' => $extra],
+                );
+            }
+
             return null === $budget ? [] : ['auto_budget_type' => 0];
         }
         $currency = null !== ($args['auto_budget_currency_code'] ?? null)
@@ -1262,6 +1356,17 @@ final class BudgetController extends MachineController
                 $result->created($created);
             }
         };
+    }
+
+    /** The auto-budget as stored (type, amount, period, currency), or null — the fact an update compares. @return null|array<string, mixed> */
+    private function autoState(int $budgetId): ?array
+    {
+        $auto = AutoBudget::query()->where('budget_id', $budgetId)->first();
+        if (null === $auto) {
+            return null;
+        }
+
+        return ['type' => (int) $auto->auto_budget_type, 'amount' => Money::strip((string) $auto->amount), 'period' => (string) $auto->period, 'currency_id' => (int) $auto->transaction_currency_id];
     }
 
     private function noteText(Budget $budget): ?string

@@ -40,6 +40,8 @@ use FireflyIII\Models\RuleTrigger;
 use FireflyIII\Repositories\Rule\RuleRepositoryInterface;
 use FireflyIII\Repositories\RuleGroup\RuleGroupRepositoryInterface;
 use FireflyIII\Rules\IsValidActionExpression;
+use FireflyIII\Support\Facades\AppConfiguration;
+use FireflyIII\Support\Facades\Preferences;
 use FireflyIII\TransactionRules\Engine\RuleEngineInterface;
 use FireflyIII\Transformers\RuleGroupTransformer;
 use FireflyIII\Transformers\RuleTransformer;
@@ -49,6 +51,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Validator;
 
 /**
@@ -104,6 +107,7 @@ final class RuleController extends MachineController
             ])->values()->all();
             $out[]            = $row;
         }
+        $this->addMeta(['untrusted' => ['title', 'description', 'rules.title']]);
 
         return $this->ok(['rule_groups' => $out]);
     }
@@ -126,7 +130,7 @@ final class RuleController extends MachineController
         }
         $search = trim((string) ($args['search'] ?? ''));
         if ('' !== $search) {
-            $query->whereRaw('LOWER(rules.title) LIKE ?', ['%'.mb_strtolower($search).'%']);
+            $query->whereRaw("LOWER(rules.title) LIKE ? ESCAPE '\\'", ['%'.self::likeEscape(mb_strtolower($search)).'%']);
         }
         $moment = $args['trigger'] ?? null;
         $moment = 'manual' === $moment ? 'manual-activation' : $moment;
@@ -168,14 +172,17 @@ final class RuleController extends MachineController
     {
         $args   = $this->input($request, ['rule' => ['required', 'array'], 'rule_id' => ['sometimes', 'nullable', 'string', 'max:64']]);
         $target = isset($args['rule_id']) && '' !== (string) $args['rule_id'] ? $this->findRule((string) $args['rule_id']) : null;
-        $errors = $this->ruleErrors($args['rule'], null === $target ? 'create' : 'update', $target);
+        // Firefly's validators read AppConfiguration::get('enable_expression_engine', false), which
+        // STORES the default when the row is absent; this is a read (R8), so validate inside the
+        // rolled-back harness and nothing is left behind.
+        $errors = self::shieldingCache(true, fn (): array => DryRun::run(fn (): array => $this->ruleErrors($args['rule'], null === $target ? 'create' : 'update', $target))->value);
 
         return $this->ok([
             'valid'   => [] === $errors,
             'errors'  => [] === $errors ? new \stdClass() : $errors,
             'mode'    => null === $target ? 'create' : 'update',
-            'rule_id' => $target?->id,
-            'expression_engine' => (bool) \FireflyIII\Support\Facades\AppConfiguration::get('enable_expression_engine', false)->data,
+            'rule_id' => null === $target ? null : (string) $target->id,
+            'expression_engine' => self::expressionEngineEnabled(),
         ]);
     }
 
@@ -201,11 +208,11 @@ final class RuleController extends MachineController
         $saved = $hasId ? $this->findRule((string) $args['rule_id']) : null;
         $data  = $hasRule ? $this->validRuleData($args['rule'], 'preview', null) : null;
 
-        $held  = DryRun::run(function () use ($saved, $data, $scope): array {
+        $held  = self::shieldingCache(true, fn (): \FireflyIII\Machine\DryRunResult => DryRun::run(function () use ($saved, $data, $scope): array {
             $rule = $saved ?? $this->storeRule($data ?? [], true);
 
             return $this->runEngine(new Collection([$rule]), null, $scope);
-        });
+        }));
 
         return $this->ok($this->renderPreview($held->value, $limit, [
             'rule_id'   => null === $saved ? null : (string) $saved->id,
@@ -221,7 +228,7 @@ final class RuleController extends MachineController
         $group = $this->findGroup($id);
         $scope = $this->scope($args);
         $limit = $this->sampleLimit($args['limit'] ?? null);
-        $held  = DryRun::run(fn (): array => $this->runEngine($this->activeRules($group), $group, $scope));
+        $held  = self::shieldingCache(true, fn (): \FireflyIII\Machine\DryRunResult => DryRun::run(fn (): array => $this->runEngine($this->activeRules($group), $group, $scope)));
 
         return $this->ok($this->renderPreview($held->value, $limit, ['rule_group_id' => (string) $group->id, 'rule_group_title' => $group->title, 'active' => (bool) $group->active], $held->webhooks));
     }
@@ -259,7 +266,13 @@ final class RuleController extends MachineController
             $specs  = $this->ruleSpecs();
             $before = self::snapshotRows($specs);
             $fresh  = Rule::query()->findOrFail($rule->id);
-            $this->ruleRepository()->update($fresh, $data);
+            $oldGroupId = (int) $fresh->rule_group_id;
+            $repo   = $this->ruleRepository();
+            $repo->update($fresh, $data);
+            if (isset($data['rule_group_id']) && (int) $data['rule_group_id'] !== $oldGroupId) {
+                // Firefly renumbers the group the rule moved INTO; close the gap it left behind too
+                $repo->resetRuleOrder(RuleGroup::query()->findOrFail($oldGroupId));
+            }
             self::recordRowChanges($result, $specs, $before);
             $result->count('updated');
             $this->countReordered($result, $rule->id);
@@ -281,11 +294,18 @@ final class RuleController extends MachineController
         if (null === $group && !isset($args['order'])) {
             throw MachineException::invalid('Nothing to move: pass order, a rule group, or both.', 'Send {"order": 1} to reorder within the group, or {"rule_group_id": "3"} to move it to another group');
         }
+        if (null !== $group && $group->id === $rule->rule_group_id && !isset($args['order'])) {
+            throw MachineException::invalid(
+                sprintf('Rule #%d is already in rule group "%s".', $rule->id, $group->title),
+                'Name a different rule group, or pass order to reorder it within this one',
+                ['rule_id' => (string) $rule->id, 'rule_group_id' => (string) $group->id],
+            );
+        }
         $group ??= $rule->ruleGroup;
 
         return $this->write($request, $args, function (bool $dryRun) use ($rule, $group, $args): WriteResult {
             $result = new WriteResult();
-            $specs  = [[Rule::class, fn (): EloquentBuilder => Rule::query()->where('user_group_id', $this->administration()->id)]];
+            $specs  = $this->ruleSpecs(); // resetRuleOrder also renumbers trigger and action rows
             $before = self::snapshotRows($specs);
             $fresh  = Rule::query()->findOrFail($rule->id);
             $target = RuleGroup::query()->findOrFail($group->id);
@@ -302,13 +322,20 @@ final class RuleController extends MachineController
             }
             self::recordRowChanges($result, $specs, $before);
             $moved  = 0;
+            $others = 0;
             foreach ($result->touched as $t) {
-                if (Rule::class === $t['class'] && (int) $t['id'] === $rule->id) {
-                    $moved = 1;
+                if (Rule::class !== $t['class']) {
+                    continue;
                 }
+                if ((int) $t['id'] === $rule->id) {
+                    $moved = 1;
+
+                    continue;
+                }
+                ++$others;
             }
             $result->count('moved', $moved);
-            $result->count('reordered', max(0, count($result->touched) - $moved));
+            $result->count('reordered', $others);
 
             return $result->with(['rule' => $this->renderRule($fresh->refresh())]);
         });
@@ -346,8 +373,14 @@ final class RuleController extends MachineController
             $result  = new WriteResult();
             $result->count('updated', $outcome['changed']);
             $result->count('deleted', $outcome['deleted']);
+            // Firefly's engine counts every journal an action reported changing (R7). A rule fired
+            // later in the run can match a journal an earlier rule just changed, and that journal
+            // is not in the matched set listed here — the difference is counted, and it counts
+            // against the ceiling, rather than being silently dropped.
+            $unlisted = max(0, $outcome['acted'] - $outcome['changed'] - $outcome['deleted']);
+            $result->count('unlisted', $unlisted);
             $result->count('matched', $outcome['match_count']);
-            $basis   = [];
+            $basis   = [['acted', $outcome['acted']]];
             foreach ($outcome['rows'] as $row) {
                 if ([] !== $row['changes']) {
                     $basis[] = [$row['journal_id'], $row['changes']];
@@ -359,8 +392,24 @@ final class RuleController extends MachineController
                 'rule_group_id' => null === $group ? null : (string) $group->id,
             ], null);
             unset($data['preview']);
+            $data['engine_changed_count'] = $outcome['acted'];
+            $data['unlisted_changed_count'] = $unlisted;
+            if ($unlisted > 0) {
+                $data['unlisted_note'] = sprintf('Firefly reports %d changed journal(s) that are not in the matches list: a later rule matched a journal an earlier rule had just changed, or an action changed something outside the compared fields (a piggy bank, for instance).', $unlisted);
+            }
             $data['reversible'] = false;
             $data['undo_note']  = 'A rule run edits journals, tags and categories through Firefly\'s rule engine; POST /undo cannot reverse it. The matches list is the record of what changed.';
+            if ($result->changeCount() > 0) {
+                // the operation log refuses an undo of this row instead of "undoing" nothing
+                $result->touched[] = ['class' => self::class, 'id' => 0, 'op' => 'irreversible', 'before' => [
+                    'what'   => 'rule_run',
+                    'did'    => sprintf('changed %d journal(s) through the rule engine', $result->changeCount()),
+                    'reason' => 'a rule run edits journals, categories, budgets, tags and notes through Firefly\'s engine, which the operation log does not trace row by row — re-categorise them by hand or with another rule',
+                ]];
+            }
+            if (!$dryRun) {
+                Preferences::mark();
+            }
 
             return $result->with($data);
         });
@@ -562,6 +611,54 @@ final class RuleController extends MachineController
     private static function key(int|string $id): int|string
     {
         return is_int($id) || 1 === preg_match('/^\d{1,18}$/', $id) ? (int) $id : $id;
+    }
+
+    /**
+     * Run $fn with the application cache swapped for a throwaway store during a DRY RUN (or a
+     * read that runs the write path rolled back). Firefly's exchange-rate listener calls
+     * Cache::clear(): let loose inside a preview it would wipe every outstanding confirm token,
+     * the idempotency keys and the write lock — side effects that must not escape a rollback
+     * (§7.2). A real apply lets it run, as upstream's /api/v1 does, so Firefly's own cached
+     * figures are refreshed.
+     *
+     * @template T
+     *
+     * @param Closure(): T $fn
+     *
+     * @return T
+     */
+    public static function shieldingCache(bool $dryRun, Closure $fn): mixed
+    {
+        if (!$dryRun) {
+            return $fn();
+        }
+        $default = (string) config('cache.default');
+        $name    = 'machine_dry_run_'.bin2hex(random_bytes(4));
+        config([sprintf('cache.stores.%s', $name) => ['driver' => 'array', 'serialize' => false], 'cache.default' => $name]);
+
+        try {
+            return $fn();
+        } finally {
+            config(['cache.default' => $default]);
+            Cache::forgetDriver($name);
+        }
+    }
+
+    /** A search term as LIKE text: "%" and "_" mean themselves (use with `LIKE ? ESCAPE '\'`). */
+    public static function likeEscape(string $value): string
+    {
+        return addcslashes($value, '\\%_');
+    }
+
+    /**
+     * Firefly's expression-engine switch, read WITHOUT storing the default: AppConfiguration::get()
+     * with a default writes a configuration row when none exists, which a read route must not (R8).
+     */
+    public static function expressionEngineEnabled(): bool
+    {
+        $row = AppConfiguration::get('enable_expression_engine');
+
+        return null !== $row && true === filter_var($row->data, FILTER_VALIDATE_BOOLEAN);
     }
 
     /** @param array<string, mixed> $a @param array<string, mixed> $b */
@@ -921,8 +1018,8 @@ final class RuleController extends MachineController
             'title'                      => $titleRules,
             'description'                => ['sometimes', 'nullable', 'string', 'max:32768'],
             'rule_group_id'              => ['sometimes', 'nullable', 'bail', 'integer', 'min:1', 'belongsToUser:rule_groups'],
-            'rule_group_title'           => ['sometimes', 'nullable', 'bail', 'string', 'min:1', 'max:255', 'belongsToUser:rule_groups,title'],
-            'rule_group_name'            => ['sometimes', 'nullable', 'bail', 'string', 'min:1', 'max:255', 'belongsToUser:rule_groups,title'],
+            'rule_group_title'           => ['sometimes', 'nullable', 'bail', 'string', 'min:1', 'max:255'],
+            'rule_group_name'            => ['sometimes', 'nullable', 'bail', 'string', 'min:1', 'max:255'],
             'order'                      => ['sometimes', 'nullable', 'integer', 'min:1', 'max:100000'],
             'trigger'                    => [$create ? 'required' : 'sometimes', 'string', 'in:store-journal,update-journal,manual-activation,manual'],
             'strict'                     => ['sometimes', 'boolean'],
@@ -941,9 +1038,21 @@ final class RuleController extends MachineController
             'actions.*.stop_processing'  => ['sometimes', 'boolean'],
         ];
         $validator = Validator::make($rule, $rules);
-        $validator->after(static function ($v) use ($rule, $create): void {
+        $validator->after(function ($v) use ($rule, $create): void {
             if ($create && empty($rule['rule_group_id']) && empty($rule['rule_group_title']) && empty($rule['rule_group_name'])) {
                 $v->errors()->add('rule_group_id', 'A rule belongs to a rule group: pass rule_group_id or rule_group_title (GET /machine/v1/rule-groups lists them).');
+            }
+            foreach (['rule_group_title', 'rule_group_name'] as $field) {
+                $title = $rule[$field] ?? null;
+                if (!is_string($title) || '' === $title) {
+                    continue;
+                }
+
+                try {
+                    $this->findGroup($title); // exact title, then case-insensitive; ambiguity is an error
+                } catch (MachineException $e) {
+                    $v->errors()->add($field, trim(sprintf('%s %s', $e->getMessage(), (string) $e->hint)));
+                }
             }
             foreach (['triggers' => 'trigger', 'actions' => 'action'] as $list => $noun) {
                 if (!isset($rule[$list]) || !is_array($rule[$list]) || [] === $rule[$list]) {
@@ -1006,7 +1115,9 @@ final class RuleController extends MachineController
         }
         $groupTitle = $rule['rule_group_title'] ?? $rule['rule_group_name'] ?? null;
         if (!isset($data['rule_group_id']) && null !== $groupTitle && '' !== (string) $groupTitle) {
-            $data['rule_group_title'] = (string) $groupTitle;
+            // resolved here, to an id: RuleRepository::update() ignores rule_group_title, and
+            // store() would take it — one path for both (exact title first, then case-insensitive)
+            $data['rule_group_id'] = (int) $this->findGroup((string) $groupTitle)->id;
         }
         if (isset($rule['order'])) {
             $data['order'] = (int) $rule['order'];
@@ -1094,10 +1205,13 @@ final class RuleController extends MachineController
 
     // ---------------------------------------------------------------- lookups ---
 
+    // Route segments arrive already URL-decoded (Laravel matches the decoded path), so they are
+    // never decoded again here: a second urldecode() turns "Coffee + tea" into "Coffee   tea".
+
     private function findRule(string $idOrTitle): Rule
     {
         /** @var Rule */
-        return $this->resolve(Rule::class, urldecode($idOrTitle), 'title');
+        return $this->resolve(Rule::class, $idOrTitle, 'title');
     }
 
     private function findRuleOrGone(string $idOrTitle): ?Rule
@@ -1116,7 +1230,7 @@ final class RuleController extends MachineController
     private function findGroup(string $idOrTitle): RuleGroup
     {
         /** @var RuleGroup */
-        return $this->resolve(RuleGroup::class, urldecode($idOrTitle), 'title');
+        return $this->resolve(RuleGroup::class, $idOrTitle, 'title');
     }
 
     private function findGroupOrGone(string $idOrTitle): ?RuleGroup

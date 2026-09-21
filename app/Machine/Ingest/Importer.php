@@ -31,8 +31,11 @@ use FireflyIII\Exceptions\DuplicateTransactionException;
 use FireflyIII\Exceptions\FireflyException;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Money;
+use FireflyIII\Machine\Transactions\Snapshot;
 use FireflyIII\Machine\WriteResult;
+use FireflyIII\Models\Account;
 use FireflyIII\Models\TransactionGroup;
+use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Repositories\TransactionGroup\TransactionGroupRepositoryInterface;
 use Illuminate\Support\Facades\DB;
 
@@ -52,6 +55,13 @@ use Illuminate\Support\Facades\DB;
  * `plan` and `apply` are this same code with one boolean different: the plan runs it inside the
  * dry-run harness (rolled back), rows stored in order in one transaction, so a within-batch
  * duplicate is caught exactly as on apply. Notes are never written; nothing is ever deleted.
+ *
+ * What the run created is recorded for the operation log the way the transactions family does
+ * it (Snapshot): the groups, journals, transactions, meta rows, the category / budget / tag links
+ * the rules added, and the expense / revenue accounts Firefly created on the side — so /undo
+ * removes all of it, never leaving an orphan transaction row behind a deleted journal. Rows a
+ * factory stamped with the operator's CURRENT administration are moved into the bound one first
+ * (apis.mdx §4.9), as the accounts family does.
  */
 final class Importer
 {
@@ -59,7 +69,7 @@ final class Importer
      * @param list<array{summary: array<string, mixed>, account_id: null|int, rows: list<array<string, mixed>>}> $accounts
      *                                                                                                                  rows: RowBuilder rows (status ok are stored)
      */
-    public static function run(LedgerAccounts $ledger, array $accounts, bool $applyRules, int $detailLimit = 1000): WriteResult
+    public static function run(LedgerAccounts $ledger, array $accounts, bool $applyRules, int $detailLimit = 1000, string $phase = 'storing'): WriteResult
     {
         $repository = app(TransactionGroupRepositoryInterface::class);
         $repository->setUser($ledger->user());
@@ -67,11 +77,21 @@ final class Importer
 
         $result     = new WriteResult();
         $created    = [];          // group id => [account index, row index]
+        $dupOf      = [];          // existing group id => list of [account index, detail index]
+        $watermark  = Snapshot::watermark();
         $detail     = [];
         $summaries  = [];
         $newIds     = [];
         $dupIds     = [];
         $detailed   = 0;
+        $total      = 0;
+        $done       = 0;
+        foreach ($accounts as $plan) {
+            if (null !== $plan['account_id']) {
+                $total += count(array_filter($plan['rows'], static fn (array $r): bool => 'ok' === $r['status']));
+            }
+        }
+        Progress::tick($phase, 0, $total);
         foreach ($accounts as $ai => $plan) {
             $summary              = $plan['summary'] + ['already_present' => 0, 'previously_deleted' => 0, 'new' => 0, 'errors' => 0, 'rules_would_categorise' => 0];
             $accountId            = $plan['account_id'];
@@ -85,6 +105,8 @@ final class Importer
                 if ('ok' !== $row['status']) {
                     continue;
                 }
+                ++$done;
+                Progress::tick($phase, $done, $total);
                 $verdict = ['account' => $row['account'], 'date' => $row['date'], 'type' => $row['type'], 'amount' => Money::abs((string) $row['amount']), 'description' => $row['description'], 'external_id' => $row['external_id']];
 
                 try {
@@ -112,28 +134,24 @@ final class Importer
                         'transactions'            => [CanonicalRow::forFactory($canonical)],
                     ]);
                     $created[(int) $group->id] = [$ai, count($detail)];
-                    $result->created($group);
-                    foreach ($group->transactionJournals as $journal) {
-                        $result->created($journal);
-                    }
                     $result->count('created');
                     ++$summary['new'];
                     $newIds[]             = $row['external_id'];
                     $verdict += ['verdict' => 'new', 'group_id' => (int) $group->id];
                 } catch (DuplicateTransactionException $e) {
                     $of      = 1 === preg_match('/#(\d+)/', $e->getMessage(), $m) ? (int) $m[1] : null;
-                    $deleted = null !== $of && true === TransactionGroup::withTrashed()->find($of)?->trashed();
-                    if ($deleted) {
-                        ++$summary['previously_deleted'];
-                        $result->count('previously_deleted');
-                    } else {
-                        ++$summary['already_present'];
-                        $result->count('duplicates');
+                    $inBatch = null !== $of && isset($created[$of]);
+                    ++$summary['already_present'];
+                    $result->count('duplicates');
+                    $dupIds[$row['external_id']] = $inBatch ? 'batch:'.$created[$of][1] : $of;
+                    if (!$inBatch && null !== $of) {
+                        // whether #of was deleted by the operator is decided once for the whole run, below
+                        $dupOf[$of][] = [$ai, $detailed];
                     }
-                    $dupIds[$row['external_id']] = $of;
-                    $verdict += ['verdict' => $deleted ? 'previously_deleted' : 'duplicate', 'duplicate_of' => $of, 'reason' => $deleted
-                        ? sprintf('you deleted #%d in Firefly — its duplicate hash still stands, so it stays deleted', (int) $of)
-                        : sprintf('Firefly\'s duplicate hash matches #%d', (int) $of)];
+                    $verdict += match (true) {
+                        $inBatch => ['verdict' => 'duplicate', 'duplicate_of' => $of, 'in_batch' => true, 'reason' => 'the same canonical row appears earlier in this run (same hash) — stored once'],
+                        default  => ['verdict' => 'duplicate', 'duplicate_of' => $of, 'reason' => sprintf('Firefly\'s duplicate hash matches #%d', (int) $of)],
+                    };
                 } catch (FireflyException $e) {
                     ++$summary['errors'];
                     $result->count('errors');
@@ -146,6 +164,7 @@ final class Importer
 
         // ONE pass of the deferred listeners over everything this run stored (the batch finish)
         if ([] !== $created) {
+            Progress::tick('finishing', 0, 1);
             $groups  = TransactionGroup::query()->whereIn('id', array_keys($created))->with('transactionJournals')->get();
             $objects = new TransactionGroupEventObjects();
             foreach ($groups as $g) {
@@ -158,7 +177,11 @@ final class Importer
             $flags->recalculateCredit = true;
             event(new CreatedSingleTransactionGroup($flags, $objects));
             self::rulesReport($created, $detail, $summaries, $accounts);
+            self::claimSideAccounts($ledger, (int) $watermark['accounts']);
+            Snapshot::record($result, Snapshot::capture([]), Snapshot::capture(array_keys($created)), $watermark, $ledger->group());
+            Progress::tick('finishing', 1, 1);
         }
+        self::markPreviouslyDeleted($dupOf, $detail, $summaries, $result);
 
         $out        = [];
         foreach ($accounts as $ai => $plan) {
@@ -174,6 +197,83 @@ final class Importer
             'rows'           => $detail,
             'rows_truncated' => $detailed > count($detail),
         ]);
+    }
+
+    /**
+     * Which of the groups Firefly's duplicate check named were deleted by the operator? The
+     * check ran withTrashed(), so a match may be a soft-deleted group, or a group whose every
+     * journal is soft-deleted (§11.6): either counts. Decided in two queries for the whole run,
+     * never one per duplicate row, and the verdicts and counts are re-labelled from `duplicate`
+     * to `previously_deleted`.
+     *
+     * @param array<int, list<array{0: int, 1: int}>> $dupOf     group id => [account index, detail index]
+     * @param list<array<string, mixed>>               $detail
+     * @param array<int, array<string, mixed>>         $summaries
+     */
+    private static function markPreviouslyDeleted(array $dupOf, array &$detail, array &$summaries, WriteResult $result): void
+    {
+        if ([] === $dupOf) {
+            return;
+        }
+        $ids     = array_keys($dupOf);
+        $deleted = [];
+        foreach (array_chunk($ids, 500) as $chunk) {
+            foreach (TransactionGroup::withTrashed()->whereIn('id', $chunk)->get(['id', 'deleted_at']) as $group) {
+                if (null !== $group->deleted_at) {
+                    $deleted[(int) $group->id] = true;
+                }
+            }
+            $alive = TransactionJournal::withTrashed()->whereIn('transaction_group_id', $chunk)->get(['id', 'transaction_group_id', 'deleted_at']);
+            $seen  = [];
+            foreach ($alive as $journal) {
+                $gid          = (int) $journal->transaction_group_id;
+                $seen[$gid] ??= ['any' => false, 'live' => false];
+                $seen[$gid]['any'] = true;
+                if (null === $journal->deleted_at) {
+                    $seen[$gid]['live'] = true;
+                }
+            }
+            foreach ($seen as $gid => $s) {
+                if ($s['any'] && !$s['live']) {
+                    $deleted[$gid] = true;
+                }
+            }
+        }
+        foreach ($dupOf as $of => $hits) {
+            if (!isset($deleted[$of])) {
+                continue;
+            }
+            foreach ($hits as [$ai, $di]) {
+                --$summaries[$ai]['already_present'];
+                ++$summaries[$ai]['previously_deleted'];
+                $result->count('duplicates', -1);
+                $result->count('previously_deleted');
+                if (isset($detail[$di]) && ($detail[$di]['duplicate_of'] ?? null) === $of) {
+                    $detail[$di]['verdict'] = 'previously_deleted';
+                    $detail[$di]['reason']  = sprintf('you deleted #%d in Firefly — its duplicate hash still stands, so it stays deleted', $of);
+                }
+            }
+        }
+        if (0 === ($result->changes['duplicates'] ?? null)) {
+            unset($result->changes['duplicates']);
+        }
+    }
+
+    /**
+     * Firefly's account factory stamps an expense / revenue account it creates on the way with
+     * the operator's CURRENT administration (user.user_group_id); the plane may be bound to
+     * another one (apis.mdx §4.9). What this run created belongs to the bound books — move it
+     * there before the operation log reads it back. Only the operator's own new rows, never a
+     * row the browser inserted meanwhile in another administration.
+     */
+    private static function claimSideAccounts(LedgerAccounts $ledger, int $watermark): void
+    {
+        DB::table((new Account())->getTable())
+            ->where('id', '>', $watermark)
+            ->where('user_id', $ledger->user()->id)
+            ->where('user_group_id', '!=', $ledger->group()->id)
+            ->update(['user_group_id' => $ledger->group()->id])
+        ;
     }
 
     /**

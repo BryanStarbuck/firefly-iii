@@ -77,15 +77,31 @@ final class Scope
         return $this->end->format('Y-m-d');
     }
 
+    /** @var null|array<int, true> the account ids, memoised: hasAccount() runs once per journal */
+    private ?array $idSet = null;
+
     /** @return list<int> */
     public function accountIds(): array
     {
-        return array_values(array_map('intval', $this->accounts->pluck('id')->all()));
+        return array_keys($this->idSet());
     }
 
     public function hasAccount(int $id): bool
     {
-        return in_array($id, $this->accountIds(), true);
+        return isset($this->idSet()[$id]);
+    }
+
+    /** @return array<int, true> */
+    private function idSet(): array
+    {
+        if (null === $this->idSet) {
+            $this->idSet = [];
+            foreach ($this->accounts as $account) {
+                $this->idSet[(int) $account->id] = true;
+            }
+        }
+
+        return $this->idSet;
     }
 
     /** A copy of this scope with another range (trailing windows, runway basis…). */

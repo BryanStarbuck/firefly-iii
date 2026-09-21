@@ -47,6 +47,9 @@ use Illuminate\Support\Collection;
  */
 final class Reports
 {
+    /** The audit report's journals section is a list: this many rows at most per answer (§5.5). */
+    public const int AUDIT_MAX_ROWS = 5000;
+
     public function __construct(private readonly Ledger $ledger) {}
 
     /** @return array<string, mixed> */
@@ -58,6 +61,9 @@ final class Reports
         $accounts = [];
         foreach ($report['accounts'] as $entry) {
             $code       = (string) $entry['currency_code'];
+            if (null !== $scope->currencyCode && $code !== $scope->currencyCode) {
+                continue;
+            }
             $start      = Money::strip((string) $entry['start_balance']);
             $end        = Money::strip((string) $entry['end_balance']);
             $accounts[] = [
@@ -111,13 +117,13 @@ final class Reports
             /** @var Account $account */
             $audit  = $generator->getAuditReport($account, $dayBefore);
             $code   = (string) $audit['currency']->code;
+            if (null !== $scope->currencyCode && $scope->currencyCode !== $code) {
+                continue; // the account is in another currency: neither its journals nor its summary
+            }
             $this->ledger->rememberCurrency($audit['currency']);
             $scope->noteCurrency($code);
             $count  = 0;
             foreach ($audit['journals'] as $journal) {
-                if (null !== $scope->currencyCode && $scope->currencyCode !== $code) {
-                    continue;
-                }
                 $before = Money::strip((string) $journal['balance_before']);
                 $after  = Money::strip((string) $journal['balance_after']);
                 $rows[] = [
@@ -170,6 +176,7 @@ final class Reports
 
         return [
             'budgets'                  => $performance['rows'],
+            'per_budget'               => $performance['per_budget'],
             'totals'                   => $performance['totals'],
             'budgets_without_activity' => $performance['budgets_without_activity'],
             'notes'                    => $performance['notes'],
@@ -242,7 +249,7 @@ final class Reports
             'counterparties' => $list,
             'notes'          => ['in = deposits from the account, out = withdrawals to it, net = in − out'],
             'excluded'       => ['transfers', 'opening balances', 'reconciliations'],
-            'provenance'     => $scope->provenance(['report' => 'double', 'counterparties' => [] === $wanted ? 'all expense and revenue accounts' : $wanted]),
+            'provenance'     => $scope->provenance(['report' => 'double', 'counterparties' => [] === $wanted ? 'all expense and revenue accounts' : $wanted, 'transfers' => 'not counted (withdrawals and deposits only)']),
         ];
     }
 

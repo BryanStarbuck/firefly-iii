@@ -27,9 +27,15 @@ namespace FireflyIII\Machine\Ingest;
 use Carbon\Carbon;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Money;
+use FireflyIII\Machine\Transactions\Snapshot;
 use FireflyIII\Machine\WriteResult;
+use FireflyIII\Models\Account;
+use FireflyIII\Models\AccountMeta;
 use FireflyIII\Models\TransactionCurrency;
+use FireflyIII\Models\TransactionGroup;
+use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Repositories\Account\AccountRepositoryInterface;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Account provisioning from a manifest — apis.mdx §12.
@@ -94,7 +100,15 @@ final class AccountProvisioner
                 continue;
             }
             $proposed = self::proposed($m, $naming, $liabilityKinds, $ledger->primary());
-            $byName   = array_values(array_filter($ledger->byName($proposed['name']), static fn (array $r): bool => !isset($claimed[$r['id']])));
+            $named    = $ledger->byName($proposed['name']);
+            $byName   = array_values(array_filter($named, static fn (array $r): bool => !isset($claimed[$r['id']])));
+            if ([] === $byName && [] !== $named) {
+                // the name is taken by an account another manifest row is already mapped to:
+                // Firefly's factory would hand back that account, not create a twin — never silently
+                $plan[] = $row + ['action' => 'ambiguous', 'candidates' => array_map(LedgerAccounts::brief(...), $named), 'proposed' => $proposed, 'reason' => sprintf('the name "%s" belongs to #%d, which is already mapped to another manifest row — pass a naming template with {label}, or map this row by hand (PUT /ingest/map)', $proposed['name'], $named[0]['id'])];
+
+                continue;
+            }
             if (1 === count($byName)) {
                 $plan[] = $row + ['action' => 'link', 'existing' => LedgerAccounts::brief($byName[0]), 'proposed' => $proposed, 'reason' => sprintf('matched on name "%s"', $byName[0]['name'])];
 
@@ -168,8 +182,18 @@ final class AccountProvisioner
         foreach ($plan as $p) {
             $m = $byKey[$p['key']] ?? null;
             if ('create' === $p['action'] && null !== $m) {
+                $watermark       = Snapshot::watermark();
                 $account         = $repository->store(self::storeData($p['proposed'], $m));
-                $result->created($account);
+                if (!$account->wasRecentlyCreated || null !== $ledger->find((int) $account->id)) {
+                    // AccountFactory::create() returns an existing same-name account of the type
+                    // instead of a twin: that is a link nobody planned, so it is refused, not kept
+                    throw MachineException::conflict(
+                        sprintf('Firefly returned the existing account #%d "%s" for %s instead of creating one — nothing was written.', (int) $account->id, (string) $account->name, (string) $p['key']),
+                        'Re-plan: the account list changed since this plan; the row now links or is ambiguous',
+                        ['key' => $p['key'], 'existing' => ['id' => (int) $account->id, 'name' => (string) $account->name]],
+                    );
+                }
+                self::recordCreated($result, $account, $ledger, $repository, $watermark);
                 $result->count('created');
                 $map[$p['key']]  = self::mapEntry($m, (int) $account->id, (string) $account->name, 'accounts/apply:create');
                 $created[]       = ['id' => (int) $account->id, 'name' => (string) $account->name, 'manifest' => $p['manifest']];
@@ -195,6 +219,43 @@ final class AccountProvisioner
         $result->basis       = ['plan' => $basis];
 
         return $result->with(['plan' => $rows, 'created' => $created, 'map_path' => Staging::DIR.'/'.MapFile::FILE]);
+    }
+
+    /**
+     * Record what one AccountRepository::store() created, so /undo removes all of it: the account
+     * and its meta rows, the opening-balance group with its journal, transactions and meta (§12.4),
+     * and the "initial balance" account Firefly creates on the side for it. Firefly's factories
+     * stamp new rows with the operator's CURRENT administration; the plane may be bound to another
+     * one (apis.mdx §4.9), so what this write created is moved into the bound books first — the
+     * operator's own new rows only, never a row the browser inserted meanwhile.
+     *
+     * @param array<string, int> $watermark Snapshot::watermark() taken before the store
+     */
+    private static function recordCreated(WriteResult $result, Account $account, LedgerAccounts $ledger, AccountRepositoryInterface $repository, array $watermark): void
+    {
+        $admin = (int) $ledger->group()->id;
+        $user  = (int) $ledger->user()->id;
+        DB::table((new Account())->getTable())->where('id', '>', $watermark['accounts'])->where('user_id', $user)->where('user_group_id', '!=', $admin)->update(['user_group_id' => $admin]);
+        $account->user_group_id = $admin;
+        $opening = $repository->getOpeningBalanceGroup($account);
+        $groupIds = [];
+        if (null !== $opening) {
+            $groupIds = [(int) $opening->id];
+            DB::table((new TransactionGroup())->getTable())->whereIn('id', $groupIds)->where('user_id', $user)->where('user_group_id', '!=', $admin)->update(['user_group_id' => $admin]);
+            DB::table((new TransactionJournal())->getTable())->whereIn('transaction_group_id', $groupIds)->where('user_id', $user)->where('user_group_id', '!=', $admin)->update(['user_group_id' => $admin]);
+        }
+        // the accounts first (the new one and Firefly's initial-balance account beside it): undo
+        // walks the log backwards, so their meta rows and the opening-balance rows go first
+        Snapshot::record($result, Snapshot::capture([]), Snapshot::capture($groupIds), $watermark, $ledger->group());
+        $newAccounts = [];
+        foreach ($result->touched as $t) {
+            if (Account::class === $t['class'] && 'created' === $t['op']) {
+                $newAccounts[] = (int) $t['id'];
+            }
+        }
+        foreach (AccountMeta::query()->whereIn('account_id', $newAccounts)->orderBy('id')->get() as $meta) {
+            $result->created($meta);
+        }
     }
 
     /**

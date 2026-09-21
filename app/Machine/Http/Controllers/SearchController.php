@@ -42,9 +42,11 @@ use FireflyIII\Support\Search\QueryParser\StringNode;
 use FireflyIII\Support\Search\SearchInterface;
 use FireflyIII\Transformers\AccountTransformer;
 use FireflyIII\Transformers\TransactionGroupTransformer;
+use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\DB;
 use Symfony\Component\HttpFoundation\ParameterBag;
 use Throwable;
 
@@ -77,10 +79,24 @@ final class SearchController extends MachineController
 
     private const int MAX_QUERY = 1000;
 
+    /** §13 / §15: a search over this many seconds is `upstream_error` with a narrowing hint. */
+    public const int TIMEOUT_SECONDS = 10;
+
     public function search(Request $request): JsonResponse
     {
-        $args   = $this->input($request, ['query' => ['required', 'string', 'max:'.self::MAX_QUERY], 'limit' => ['sometimes', 'nullable'], 'offset' => ['sometimes', 'nullable']], true);
-        $params = $this->listParams($request, ['date'], 'date');
+        $args   = $this->input($request, ['query' => ['required', 'string', 'max:'.self::MAX_QUERY]] + self::LIST_RULES, true);
+        // Firefly's collector has ONE order (date desc, then order, then id — §5.5) and the search
+        // cannot be told another. `order` is accepted so a list client (ffx --order) can say the
+        // one order there is; anything else is refused by name rather than silently ignored.
+        $order  = trim((string) ($args['order'] ?? ''));
+        if ('' !== $order && '-date' !== $order) {
+            throw MachineException::invalid(
+                sprintf('Cannot order a search by "%s".', $order),
+                'A search has a fixed order: date desc (Firefly\'s journal order). Pass order=-date or omit it',
+                ['field' => 'order', 'accepted' => ['-date']],
+            );
+        }
+        $params = $this->listParams($request, ['date'], '-date');
         $limit  = $params->limit;
         $offset = $params->offset;
 
@@ -114,17 +130,25 @@ final class SearchController extends MachineController
             $transactions[] = self::withoutLinks($transformer->transform($group));
         }
 
+        // §13 byte cap: 8 MiB; over it the page is cut, meta.truncated says so and next_offset
+        // points at the first row that was dropped, so a caller can continue rather than guess.
+        [$transactions, $dropped] = MirrorController::capBytes($transactions);
+        $returned  = count($transactions);
+        $truncated = $truncated || $dropped > 0;
+
         return $this->ok(
             array_merge(['transactions' => $transactions, 'total' => $total], $this->report($searcher, (string) $args['query'])),
             [
                 'truncated'     => $truncated,
                 'limit_applied' => $limit,
                 'offset'        => $offset,
-                'count'         => count($transactions),
-                'next_offset'   => $truncated ? $offset + $limit : null,
+                'count'         => $returned,
+                'next_offset'   => $truncated ? $offset + $returned : null,
                 'order'         => 'date desc (Firefly\'s journal order: date, order, id)',
                 'untrusted'     => self::UNTRUSTED_TRANSACTION_FIELDS,
-            ] + ($params->clamped ? ['limit_requested' => $params->requestedLimit] : []),
+            ]
+            + ($params->clamped ? ['limit_requested' => $params->requestedLimit] : [])
+            + ($dropped > 0 ? ['dropped_rows' => $dropped, 'hint' => sprintf('The page was over 8 MiB: %d row(s) were dropped — continue with offset=%d, or narrow the query (date_after, date_before) or lower limit', $dropped, $offset + $returned)] : []),
         );
     }
 
@@ -182,8 +206,22 @@ final class SearchController extends MachineController
             'type'  => ['sometimes', 'nullable', 'string', 'max:64'],
         ] + self::LIST_RULES, true);
         $params = $this->listParams($request, ['name', 'id'], 'name');
-        $type   = (string) ($args['type'] ?? 'all');
-        $types  = $this->mapAccountTypes('' === $type ? 'all' : $type);
+        $type   = trim((string) ($args['type'] ?? 'all'));
+        $type   = '' === $type ? 'all' : $type;
+        // Firefly's mapAccountTypes() turns a type it does not know into "normal" — silently a
+        // different search than the one asked for (§5.7); refuse it by name instead.
+        $unknownTypes = array_values(array_filter(array_map('trim', explode(',', $type)), fn (string $t): bool => !array_key_exists($t, $this->types)));
+        if ([] !== $unknownTypes) {
+            $known = array_keys($this->types);
+            sort($known);
+
+            throw MachineException::invalid(
+                sprintf('Unknown account type%s: %s.', 1 === count($unknownTypes) ? '' : 's', implode(', ', $unknownTypes)),
+                sprintf('type accepts: %s (comma-separated)', implode(', ', $known)),
+                ['field' => 'type', 'unknown' => $unknownTypes, 'accepted' => $known],
+            );
+        }
+        $types  = $this->mapAccountTypes($type);
 
         /** @var AccountSearch $search */
         $search = app(AccountSearch::class);
@@ -228,6 +266,10 @@ final class SearchController extends MachineController
         $searcher->setUser($this->operator());
         $searcher->setDate(Carbon::now());
 
+        // Values Firefly would silently coerce are refused before it sees them: amount_more:abc
+        // becomes amount_more:0 (every transaction), id:abc becomes id:0 (none).
+        $this->refuseBadValues($query);
+
         try {
             $searcher->parseQuery($query);
         } catch (FireflyException $e) {
@@ -235,22 +277,150 @@ final class SearchController extends MachineController
         }
         $invalid = $searcher->getInvalidOperators();
         if ([] !== $invalid) {
+            // Firefly files two different failures here: an operator it does not have, and a
+            // known operator whose VALUE it could not read (a date it cannot parse). Tell them apart.
             $known   = array_keys((array) config('search.operators'));
-            $details = [];
+            $unknown = [];
+            $badValue = [];
             foreach ($invalid as $op) {
-                $type      = strtolower((string) ($op['type'] ?? ''));
-                $details[] = ['operator' => $type, 'did_you_mean' => self::closest($type, $known)];
+                $type  = strtolower((string) ($op['type'] ?? ''));
+                $value = (string) ($op['value'] ?? '');
+                if (in_array($type, $known, true)) {
+                    $badValue[] = ['operator' => $type, 'value' => $value, 'expected' => self::argumentType(self::rootOf($type), (bool) (config('search.operators.'.$type.'.needs_context') ?? true))];
+
+                    continue;
+                }
+                $unknown[] = ['operator' => $type, 'did_you_mean' => self::closest($type, $known)];
             }
-            $names = implode(', ', array_map(static fn (array $d): string => $d['operator'], $details));
+            if ([] !== $badValue) {
+                $first = $badValue[0];
+
+                throw MachineException::invalid(
+                    sprintf('Firefly could not read the value of %s: "%s" is not a %s.', $first['operator'], $first['value'], $first['expected']),
+                    self::valueHint($first['operator'], $first['expected']),
+                    ['invalid_values' => $badValue],
+                );
+            }
+            $names = implode(', ', array_map(static fn (array $d): string => $d['operator'], $unknown));
 
             throw MachineException::invalid(
-                sprintf('Unknown search operator%s: %s. Firefly would silently ignore %s and search wider than you meant.', 1 === count($details) ? '' : 's', $names, 1 === count($details) ? 'it' : 'them'),
-                null !== $details[0]['did_you_mean'] ? sprintf('Did you mean %s:? GET /machine/v1/search/operators lists every operator', $details[0]['did_you_mean']) : 'GET /machine/v1/search/operators lists every operator',
-                ['invalid_operators' => $details],
+                sprintf('Unknown search operator%s: %s. Firefly would silently ignore %s and search wider than you meant.', 1 === count($unknown) ? '' : 's', $names, 1 === count($unknown) ? 'it' : 'them'),
+                null !== $unknown[0]['did_you_mean'] ? sprintf('Did you mean %s:? GET /machine/v1/search/operators lists every operator', $unknown[0]['did_you_mean']) : 'GET /machine/v1/search/operators lists every operator',
+                ['invalid_operators' => $unknown],
             );
         }
 
         return $searcher;
+    }
+
+    /**
+     * Refuse a typed operator value Firefly would coerce instead of refusing: an amount that is
+     * not a decimal (Steam::positive() makes it "0"), an id that is not an integer ((int) makes
+     * it 0), a boolean operator whose value is neither true nor false (anything but "false" is
+     * read as true).
+     */
+    private function refuseBadValues(string $query): void
+    {
+        // Firefly's parser reads a minus AFTER the colon as a prohibition of a new token, so
+        // amount_more:-50 is NOT amount_more:50 — the complement of what a caller who thinks of
+        // withdrawals as negative meant. Refuse it by name; the parsed tree has already lost the sign.
+        if (preg_match_all('/(?<![\w"])([a-z_]+):-(\d[\d.,]*)(?![\w.,])/i', $query, $m, PREG_SET_ORDER) > 0) {
+            foreach ($m as $hit) {
+                $operator = strtolower($hit[1]);
+                if (!is_array(config('search.operators.'.$operator))) {
+                    continue;
+                }
+                $expected = self::argumentType(self::rootOf($operator), (bool) (config('search.operators.'.$operator.'.needs_context') ?? true));
+                if (!in_array($expected, ['amount', 'id'], true)) {
+                    continue;
+                }
+
+                $balance = str_contains($operator, 'balance');
+
+                throw MachineException::invalid(
+                    sprintf('%s:-%s — Firefly reads a minus after the colon as "NOT %s:%s", not as a negative %s.', $operator, $hit[2], $operator, $hit[2], $balance ? 'balance' : $expected),
+                    $balance
+                        ? sprintf('Firefly\'s search cannot express a negative balance; a positive one works (%s:%s), and -%s:%s excludes instead — for an overdrawn account use GET /machine/v1/accounts with its balance fields', $operator, $hit[2], $operator, $hit[2])
+                        : sprintf('Amounts are positive in a search: write %s:%s — or -%s:%s to exclude those transactions', $operator, $hit[2], $operator, $hit[2]),
+                    ['invalid_values' => [['operator' => $operator, 'value' => '-'.$hit[2], 'expected' => $expected, 'read_as' => sprintf('NOT %s:%s', $operator, $hit[2])]]],
+                );
+            }
+        }
+
+        try {
+            /** @var QueryParserInterface $parser */
+            $parser = app(QueryParserInterface::class);
+            $tree   = $parser->parse($query);
+        } catch (Throwable) {
+            return; // the searcher's own parse reports the syntax error
+        }
+        $problems = self::checkValues($tree);
+        if ([] === $problems) {
+            return;
+        }
+        $first = $problems[0];
+
+        throw MachineException::invalid(
+            sprintf('%s:%s — "%s" is not a %s, and Firefly would read it as %s.', $first['operator'], $first['value'], $first['value'], $first['expected'], $first['read_as']),
+            self::valueHint($first['operator'], $first['expected']),
+            ['invalid_values' => $problems],
+        );
+    }
+
+    /** @return list<array<string, mixed>> the operator values Firefly would coerce, in query order */
+    private static function checkValues(Node $node): array
+    {
+        if ($node instanceof NodeGroup) {
+            $problems = [];
+            foreach ($node->getNodes() as $child) {
+                $problems = array_merge($problems, self::checkValues($child));
+            }
+
+            return $problems;
+        }
+        if (!$node instanceof FieldNode) {
+            return [];
+        }
+        $operator = strtolower($node->getOperator());
+        $config   = config('search.operators.'.$operator);
+        if (!is_array($config)) {
+            return []; // unknown operators are reported by the searcher
+        }
+        $root     = self::rootOf($operator);
+        $expected = self::argumentType($root, (bool) ($config['needs_context'] ?? true));
+        $value    = trim((string) $node->getValue());
+        $readAs   = match ($expected) {
+            'amount' => 1 === preg_match('/^-?\d+(?:[.,]\d+)?$/', $value) ? null : 'an amount of 0',
+            'id'     => 1 === preg_match('/^\d{1,19}$/', $value) ? null : 'id 0 (no transaction)',
+            'true'   => in_array(strtolower($value), ['true', 'false'], true) ? null : 'true',
+            default  => null,
+        };
+        if (null === $readAs) {
+            return [];
+        }
+
+        return [['operator' => $operator, 'value' => $value, 'expected' => $expected, 'read_as' => $readAs]];
+    }
+
+    private static function rootOf(string $operator): string
+    {
+        try {
+            return ltrim(OperatorQuerySearch::getRootOperator($operator), '-');
+        } catch (Throwable) {
+            return $operator;
+        }
+    }
+
+    private static function valueHint(string $operator, string $expected): string
+    {
+        return match ($expected) {
+            'amount'   => sprintf('Write the amount as a decimal string: %s:50.00 (GET /machine/v1/search/operators)', $operator),
+            'id'       => sprintf('Pass a numeric id: %s:42', $operator),
+            'date'     => sprintf('Write the date as YYYY-MM-DD: %s:2026-01-31 (Firefly also reads "today", "-1w", "2026-01")', $operator),
+            'true'     => sprintf('This operator takes true or false: %s:true', $operator),
+            'currency' => sprintf('Pass the currency code: %s:USD', $operator),
+            default    => 'GET /machine/v1/search/operators lists every operator with an example',
+        };
     }
 
     /**
@@ -328,6 +498,15 @@ final class SearchController extends MachineController
     }
 
     /**
+     * Run the search under the §13 timeout (10 s, `upstream_error` over it) and map Firefly's own
+     * failures to the envelope.
+     *
+     * The timeout is enforced where the driver can: PostgreSQL's statement_timeout and MySQL's
+     * max_execution_time cancel the query itself. SQLite (the plane's default runtime, §3.3) has
+     * no statement timeout through PDO, so there the wall clock is the judge: a search that
+     * finished past the limit is refused with the same code and hint, because a query that slow
+     * is a query too wide, and the caller must narrow it — not learn to wait.
+     *
      * @template T
      *
      * @param \Closure(): T $fn
@@ -336,15 +515,119 @@ final class SearchController extends MachineController
      */
     private function run(\Closure $fn): mixed
     {
+        $timeout = self::timeoutMicros();
+        $started = hrtime(true);
+        $reset   = self::armDriverTimeout($timeout);
+
         try {
-            return $fn();
+            $out = $fn();
         } catch (MachineException $e) {
+            throw $e;
+        } catch (QueryException $e) {
+            if (self::isDriverTimeout($e)) {
+                throw self::timedOut($timeout, intdiv(hrtime(true) - $started, 1000));
+            }
+
             throw $e;
         } catch (FireflyException $e) {
             throw MachineException::upstream('Firefly\'s search failed.', 'Narrow the query, or check it against GET /machine/v1/search/operators', ['reason' => Envelope::scrub($e->getMessage())]);
-        } catch (Throwable $e) {
-            throw $e;
+        } finally {
+            $reset();
         }
+        $elapsed = intdiv(hrtime(true) - $started, 1000);
+        if ($elapsed > $timeout) {
+            throw self::timedOut($timeout, $elapsed);
+        }
+
+        return $out;
+    }
+
+    /**
+     * The §13 search timeout in MICROSECONDS (config machine.limits.search_timeout, in seconds,
+     * default 10). Time is kept as integers here — no float ever touches a plane value, amount
+     * or otherwise (MoneyTest guards the whole of app/Machine).
+     */
+    private static function timeoutMicros(): int
+    {
+        $value = config('machine.limits.search_timeout', self::TIMEOUT_SECONDS);
+        if (!is_numeric($value)) {
+            return self::TIMEOUT_SECONDS * 1_000_000;
+        }
+        $micros = (int) bcmul(sprintf('%.6F', $value), '1000000', 0);
+
+        return $micros > 0 ? $micros : self::TIMEOUT_SECONDS * 1_000_000;
+    }
+
+    /** 10000000 → "10", 1 → "0.000001": microseconds as a decimal string of seconds. */
+    private static function seconds(int $micros): string
+    {
+        $s = sprintf('%d.%06d', intdiv($micros, 1_000_000), $micros % 1_000_000);
+
+        return rtrim(rtrim($s, '0'), '.');
+    }
+
+    private static function timedOut(int $timeoutMicros, int $elapsedMicros): MachineException
+    {
+        return MachineException::upstream(
+            sprintf('The search took longer than the %s s limit (%s s).', self::seconds($timeoutMicros), self::seconds($elapsedMicros)),
+            'Narrow the query — add date_after/date_before, an account_id or a category — or lower limit; GET /machine/v1/search/count says how many rows match before you page',
+            ['timeout_seconds' => self::seconds($timeoutMicros), 'elapsed_seconds' => self::seconds($elapsedMicros)],
+        );
+    }
+
+    /**
+     * Ask the database to cancel a statement past the timeout, where the driver can; returns the
+     * closure that puts the session back. SQLite has no such setting through PDO (see run()).
+     *
+     * @return \Closure(): void
+     */
+    private static function armDriverTimeout(int $timeoutMicros): \Closure
+    {
+        $ms = max(1, intdiv($timeoutMicros + 999, 1000));
+
+        try {
+            $connection = DB::connection();
+            $driver     = $connection->getDriverName();
+            if ('pgsql' === $driver) {
+                $connection->statement(sprintf('SET statement_timeout = %d', $ms));
+
+                return static function () use ($connection): void {
+                    try {
+                        $connection->statement('SET statement_timeout = DEFAULT');
+                    } catch (Throwable) {
+                        // the connection is per request; a stuck setting dies with it
+                    }
+                };
+            }
+            if ('mysql' === $driver || 'mariadb' === $driver) {
+                $connection->statement(sprintf('SET SESSION max_execution_time = %d', $ms));
+
+                return static function () use ($connection): void {
+                    try {
+                        $connection->statement('SET SESSION max_execution_time = DEFAULT');
+                    } catch (Throwable) {
+                        // as above
+                    }
+                };
+            }
+        } catch (Throwable) {
+            // a driver that refuses the setting is a driver without the guard, not a failed search
+        }
+
+        return static function (): void {};
+    }
+
+    /** PostgreSQL 57014 (statement cancelled by statement_timeout) and MySQL 3024 (max_execution_time exceeded). */
+    private static function isDriverTimeout(QueryException $e): bool
+    {
+        $state = (string) ($e->errorInfo[0] ?? $e->getCode());
+        $code  = (int) ($e->errorInfo[1] ?? 0);
+        $text  = strtolower($e->getMessage());
+
+        return '57014' === $state
+            || 3024 === $code
+            || str_contains($text, 'statement timeout')
+            || str_contains($text, 'maximum statement execution time exceeded');
     }
 
     /**
@@ -359,20 +642,44 @@ final class SearchController extends MachineController
         return $row;
     }
 
-    /** @param list<string> $known */
+    /**
+     * The known operator nearest to a misspelt one: least edit distance, and on a tie the longest
+     * shared prefix (amount_moar → amount_more, not amount_max).
+     *
+     * @param list<string> $known
+     */
     private static function closest(string $word, array $known): ?string
     {
-        $best  = null;
-        $score = PHP_INT_MAX;
+        $best   = null;
+        $score  = PHP_INT_MAX;
+        $shared = -1;
         foreach ($known as $candidate) {
-            $d = levenshtein($word, (string) $candidate);
-            if ($d < $score) {
-                $score = $d;
-                $best  = (string) $candidate;
+            $candidate = (string) $candidate;
+            $d         = levenshtein($word, $candidate);
+            if ($d > $score) {
+                continue;
+            }
+            $prefix = self::sharedPrefix($word, $candidate);
+            if ($d < $score || $prefix > $shared) {
+                $score  = $d;
+                $shared = $prefix;
+                $best   = $candidate;
             }
         }
 
         return null !== $best && $score <= max(2, intdiv(strlen($word), 3)) ? $best : null;
+    }
+
+    private static function sharedPrefix(string $a, string $b): int
+    {
+        $n = min(strlen($a), strlen($b));
+        for ($i = 0; $i < $n; ++$i) {
+            if ($a[$i] !== $b[$i]) {
+                return $i;
+            }
+        }
+
+        return $n;
     }
 
     /** The argument type of a (root) operator, from its name — the same naming Firefly's parser relies on. */

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ phpunit.machine.xml — the machine plane's test configuration (pm/apis.mdx §18).
+  ~
+  ~ A copy of upstream's phpunit.xml with: only the tests/Machine suite, no coverage
+  ~ block (this machine has no coverage driver, and with the block PHPUnit runs
+  ~ nothing), a 2G memory limit (the plane suite is ~500 tests in one process), and
+  ~ stopOnFailure/stopOnError off so one red test does not hide the others.
+  ~ Run: vendor/bin/phpunit -c phpunit.machine.xml
+  -->
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/10.2/phpunit.xsd"
+         backupGlobals="false"
+         backupStaticProperties="false"
+         beStrictAboutOutputDuringTests="true"
+         bootstrap="vendor/autoload.php"
+         cacheDirectory=".phpunit.cache"
+         colors="true"
+         executionOrder="depends,defects"
+         failOnRisky="true"
+         failOnWarning="true"
+         processIsolation="false"
+         stopOnError="false"
+         stopOnFailure="false">
+    <php>
+        <env name="APP_ENV" value="testing"/>
+        <env name="DB_CONNECTION" value="sqlite"/>
+        <env name="APP_LOG_ENV" value="notice"/>
+        <env name="DB_DATABASE" value=""/>
+        <env name="APP_LOG_LEVEL" value="notice"/>
+        <env name="AUDIT_LOG_LEVEL" value="emergency" />
+        <ini name="memory_limit" value="2G"/>
+
+
+        <env name="QUERY_PARSER_IMPLEMENTATION" value="new"/>
+    </php>
+    <testsuites>
+        <testsuite name="machine">
+            <directory suffix="Test.php">./tests/Machine</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory suffix=".php">app</directory>
+        </include>
+    </source>
+</phpunit>

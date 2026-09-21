@@ -26,10 +26,12 @@ namespace Tests\Machine\Undo;
 
 use Carbon\Carbon;
 use FireflyIII\Models\Category;
+use FireflyIII\Models\Transaction;
 use FireflyIII\User;
 use Illuminate\Support\Facades\DB;
 use Tests\Machine\Core\Fixtures\ProbeRoutes;
 use Tests\Machine\MachineTestCase;
+use Tests\Machine\Search\SearchLedger;
 
 /**
  * pm/apis.mdx §7.5 — GET /undo/last (the plan, with the token) and POST /undo (token required,
@@ -41,6 +43,7 @@ use Tests\Machine\MachineTestCase;
  */
 final class UndoTest extends MachineTestCase
 {
+    use SearchLedger;
 
     protected array $machineFamilies = [ProbeRoutes::class];
 
@@ -139,6 +142,77 @@ final class UndoTest extends MachineTestCase
         $this->assertFalse($again['data']['reversible']);
         $this->assertNull($again['data']['confirm_token']);
         $this->assertStringContainsString('CANNOT be undone', $again['data']['description']);
+    }
+
+    /**
+     * Regression: the account list for the balance recalculation was read with one query per
+     * touched transaction. An operation may touch thousands (a categorise, an ingest) — it must
+     * stay a handful of queries whatever the count.
+     */
+    public function testUndoRecalculatesBalancesWithABoundedNumberOfQueries(): void
+    {
+        $account = $this->seedSpending($this->user);
+        $ids     = DB::table('transactions')->pluck('id')->all();
+        $touched = [];
+        foreach ($ids as $id) {
+            $row       = (array) DB::table('transactions')->where('id', $id)->first();
+            $touched[] = ['class' => Transaction::class, 'id' => $id, 'op' => 'updated', 'before' => $row];
+        }
+        // pad the operation with many more (already gone) transaction rows, as a big write would
+        for ($i = 0; $i < 300; ++$i) {
+            $touched[] = ['class' => Transaction::class, 'id' => 900000 + $i, 'op' => 'created', 'before' => null];
+        }
+        DB::table('machine_operations')->insert([
+            'created_at' => Carbon::now()->addSecond(), 'updated_at' => Carbon::now()->addSecond(),
+            'user_id' => $this->user->id, 'user_group_id' => $this->user->user_group_id,
+            'route' => 'POST /_probe/many', 'caller' => 'test', 'key_fingerprint' => null,
+            'changes' => json_encode(['updated' => count($ids), 'created' => 300]), 'touched' => json_encode($touched), 'reversed_at' => null,
+        ]);
+        $plan = $this->envelope($this->machine('GET', '/undo/last'));
+        $this->assertTrue($plan['data']['reversible'], json_encode($plan['data']['blocked_by']));
+
+        DB::enableQueryLog();
+        $env  = $this->envelope($this->machine('POST', '/undo', ['confirm_token' => $plan['data']['confirm_token']]));
+        $log  = DB::getQueryLog();
+        DB::disableQueryLog();
+        $this->assertTrue($env['ok'], json_encode($env));
+        $this->assertSame(300, $env['data']['undone']['already_gone']);
+        $this->assertGreaterThan(0, $env['data']['accounts_rebalanced']);
+        $lookups = array_filter($log, static fn (array $q): bool => str_contains($q['query'], '"account_id" from "transactions"') || str_contains($q['query'], 'select "account_id" from "transactions"'));
+        $this->assertLessThan(10, count($lookups), 'account lookups are batched, never one per touched row: '.count($lookups));
+        $this->assertSame($account->id, DB::table('transactions')->where('account_id', $account->id)->value('account_id'));
+    }
+
+    /**
+     * §7.6: undoing an ADMIN write deletes what an admin made, so it needs the admin tier — the
+     * write tier (and the MCP, which never has admin) cannot use undo as a back door to it.
+     */
+    public function testUndoingAnAdminWriteNeedsTheAdminTier(): void
+    {
+        $this->enableAdmin();
+        $this->apply('/_probe/admin-thing', ['names' => ['Made by an admin']]);
+        $plan = $this->envelope($this->machine('GET', '/undo/last'));
+        $this->assertSame('admin', $plan['data']['tier']);
+        $this->assertTrue($plan['data']['reversible']);
+
+        $mcp = $this->assertPlaneError($this->machine('POST', '/undo', ['confirm_token' => $plan['data']['confirm_token']], ['X-Firefly-Client' => 'mcp']), 403, 'forbidden');
+        $this->assertStringContainsString('never available to the MCP', $mcp['error']['message']);
+        config(['machine.allow_admin' => false]);
+        $off = $this->assertPlaneError($this->machine('POST', '/undo', ['confirm_token' => $plan['data']['confirm_token']]), 403, 'forbidden');
+        $this->assertStringContainsString('FIREFLY_MACHINE_ALLOW_ADMIN', $off['error']['hint']);
+        $this->assertSame(1, Category::query()->count(), 'nothing was undone');
+
+        $this->enableAdmin();
+        $done = $this->envelope($this->machine('POST', '/undo', ['confirm_token' => $plan['data']['confirm_token']]));
+        $this->assertTrue($done['ok'], (string) json_encode($done));
+        $this->assertSame(0, Category::query()->count(), 'the refusals did not consume the token');
+
+        // a write-tier operation needs no more than the write tier
+        config(['machine.allow_admin' => false]);
+        $this->apply('/_probe/categories', ['names' => ['Plain']]);
+        $plain = $this->envelope($this->machine('GET', '/undo/last'));
+        $this->assertSame('write', $plain['data']['tier']);
+        $this->assertTrue($this->envelope($this->machine('POST', '/undo', ['confirm_token' => $plain['data']['confirm_token']], ['X-Firefly-Client' => 'mcp']))['ok']);
     }
 
     public function testUndoIsAWriteTierRoute(): void

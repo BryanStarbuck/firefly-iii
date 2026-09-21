@@ -119,7 +119,7 @@ final class Runway
                 'liquid = asset accounts (not liabilities) today, virtual balance excluded',
             ],
             'excluded'   => $scope->excluded(),
-            'provenance' => $window->provenance(['basis_months' => $basis, 'balance_date' => $today->format('Y-m-d')]),
+            'provenance' => $window->provenance(['basis_months' => $basis, 'balance_date' => $today->format('Y-m-d'), 'balances' => Ledger::BALANCE_NOTE]),
         ];
     }
 }

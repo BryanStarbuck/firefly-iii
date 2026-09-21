@@ -48,6 +48,7 @@ use FireflyIII\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Symfony\Component\HttpFoundation\ParameterBag;
@@ -60,7 +61,8 @@ use Symfony\Component\HttpFoundation\ParameterBag;
  *
  *   POST /admin/key/rotate        CredentialsFile::rotate() — the answer is the fingerprint only
  *   POST /admin/cron              CronRunner (recurring, auto-budgets, bill warnings, exchange
- *                                 rates when enabled, webhooks) for the operator — no dry run
+ *                                 rates when enabled, webhooks) for the operator; dry run by
+ *                                 default, counting the rows each job would create
  *   POST /admin/correct-database  every corrector firefly-iii:correct-database runs, one by one,
  *                                 so the answer says what EACH changed; dry run by default
  *   POST /admin/data/destroy      upstream's DELETE /api/v1/data/destroy, in-process; dry run
@@ -176,22 +178,42 @@ final class AdminController extends MachineController
 
     // ---------------------------------------------------------------- cron ---
 
+    /** The tables Firefly's cron jobs add rows to, counted for the plan (§7.2: the preview is the write). */
+    private const array CRON_TABLES = ['transaction_groups', 'transaction_journals', 'transactions', 'budget_limits', 'webhook_messages', 'currency_exchange_rates', 'notifications'];
+
+    /**
+     * Cron obeys the write protocol like every other route that creates ledger rows (§7.1, LOCKED):
+     * the dry run runs Firefly's cron jobs for real inside the rolled-back harness and reports what
+     * each would create; the apply needs the confirm token. The exchange-rate download is the one
+     * job with an outside effect (an HTTP call), so the plan skips it and says so.
+     */
     public function cron(Request $request): JsonResponse
     {
         $args = $this->input($request, ['force' => ['sometimes', 'boolean'], 'date' => ['sometimes', 'nullable', 'date_format:Y-m-d']]);
 
         return $this->write($request, $args, function (bool $dryRun) use ($args): WriteResult {
-            $user  = $this->operator();
-            $force = (bool) ($args['force'] ?? false);
-            $date  = isset($args['date']) ? Carbon::createFromFormat('Y-m-d', (string) $args['date'])->startOfDay() : Carbon::now();
-            $jobs  = [
-                'recurring_transactions' => $this->runRecurring($user, $force, $date),
-                'auto_budgets'           => $this->runAutoBudget($user, $force, $date),
-                'bill_notifications'     => $this->billWarningCronJob($user, $force, $date),
-                'webhooks'               => $this->webhookCronJob($user, $force, $date),
-            ];
-            if (true === AppConfiguration::get('enable_external_rates', config('cer.download_enabled'))->data) {
-                $jobs['exchange_rates'] = $this->exchangeRatesCronJob($user, $force, $date);
+            $user   = $this->operator();
+            $force  = (bool) ($args['force'] ?? false);
+            $date   = array_key_exists('date', $args) && null !== $args['date'] ? Carbon::createFromFormat('Y-m-d', (string) $args['date'])->startOfDay() : Carbon::now();
+            $before = self::rowCounts(self::CRON_TABLES);
+            $rates  = true === AppConfiguration::get('enable_external_rates', config('cer.download_enabled'))->data;
+
+            try {
+                $jobs = [
+                    'recurring_transactions' => $this->runRecurring($user, $force, $date),
+                    'auto_budgets'           => $this->runAutoBudget($user, $force, $date),
+                    'bill_notifications'     => $this->billWarningCronJob($user, $force, $date),
+                    'webhooks'               => $this->webhookCronJob($user, $force, $date),
+                ];
+                if ($rates) {
+                    $jobs['exchange_rates'] = $dryRun
+                        ? ['job_fired' => false, 'job_succeeded' => false, 'job_errored' => false, 'message' => 'Skipped in the dry run: this job downloads exchange rates from the internet, which a preview must not do. The apply runs it.']
+                        : $this->exchangeRatesCronJob($user, $force, $date);
+                }
+            } finally {
+                // a job's "last run" stamp is read back through Firefly's forever-cache; a dry run's
+                // stamp is rolled back in the database, so it must not survive in the cache either
+                self::forgetCronStamps();
             }
             $result = new WriteResult();
             $report = [];
@@ -205,9 +227,18 @@ final class AdminController extends MachineController
                 ];
                 $result->count($fired ? 'jobs_fired' : 'skipped');
             }
+            $created = [];
+            foreach (self::rowCounts(self::CRON_TABLES) as $table => $n) {
+                $d = $n - ($before[$table] ?? 0);
+                if ($d > 0) {
+                    $created[$table] = $d;
+                    $result->count($table, $d);
+                }
+            }
+            $result->changeCount = array_sum($created);
             self::irreversible($result, 'cron', 'ran Firefly\'s cron', 'cron creates recurring transactions, budget limits and notifications that undo cannot trace — fix any of them by hand');
 
-            return $result->with(['jobs' => $report, 'date' => $date->toDateString(), 'forced' => $force, 'undoable' => false]);
+            return $result->with(['jobs' => $report, 'created' => (object) $created, 'date' => $date->toDateString(), 'forced' => $force, 'undoable' => false]);
         });
     }
 
@@ -222,29 +253,119 @@ final class AdminController extends MachineController
             $result    = new WriteResult();
             $report    = [];
             $corrected = 0;
+            $changedTables = [];
+            $snapshot  = self::tableSnapshot();
             foreach (self::CORRECTORS as $command) {
                 if (!in_array($command, $known, true)) {
-                    $report[] = ['command' => $command, 'ran' => false, 'changed' => 0, 'lines' => [], 'note' => 'this Firefly version has no such corrector'];
+                    $report[] = ['command' => $command, 'ran' => false, 'changed' => 0, 'changed_tables' => [], 'lines' => [], 'note' => 'this Firefly version has no such corrector'];
 
                     continue;
                 }
-                $code    = Artisan::call($command);
-                $lines   = self::outputLines(Artisan::output());
-                $changes = array_values(array_filter($lines, static fn (string $l): bool => !str_starts_with($l, '[✓]') && !str_starts_with($l, 'Now executing')));
-                $corrected += count($changes);
-                $report[] = ['command' => $command, 'ran' => true, 'exit_code' => $code, 'changed' => count($changes), 'lines' => $lines];
+                // What a corrector CHANGED is measured on the tables, not read off its chatter:
+                // the commands print "[i]" for "Done recalculating…" and for "Corrected 3 limits"
+                // alike, so lines are the explanation and the table snapshot is the verdict.
+                $code     = Artisan::call($command);
+                $lines    = self::outputLines(Artisan::output());
+                $now      = self::tableSnapshot();
+                $changed  = self::changedTables($snapshot, $now);
+                $snapshot = $now;
+                $corrected += count($changed);
+                foreach ($changed as $table) {
+                    $changedTables[$table] = ($changedTables[$table] ?? 0) + 1;
+                }
+                $report[] = ['command' => $command, 'ran' => true, 'exit_code' => $code, 'changed' => count($changed), 'changed_tables' => $changed, 'lines' => $lines];
             }
             $result->count('corrected', $corrected);
             foreach (self::SKIPPED_CORRECTORS as $command => $why) {
-                $report[] = ['command' => $command, 'ran' => false, 'changed' => 0, 'lines' => [], 'note' => $why];
+                $report[] = ['command' => $command, 'ran' => false, 'changed' => 0, 'changed_tables' => [], 'lines' => [], 'note' => $why];
             }
-            $result->basis = array_map(static fn (array $r): array => [$r['command'], $r['lines']], $report);
+            $result->basis = array_map(static fn (array $r): array => [$r['command'], $r['changed_tables']], $report);
             if ($corrected > 0) {
-                self::irreversible($result, 'database', sprintf('corrected %d thing(s)', $corrected), 'integrity repairs are not recorded row by row — they are safe to leave in place');
+                self::irreversible($result, 'database', sprintf('corrected %d table(s)', count($changedTables)), 'integrity repairs are not recorded row by row — they are safe to leave in place');
             }
 
-            return $result->with(['correctors' => $report, 'corrected' => $corrected, 'undoable' => false]);
+            return $result->with(['correctors' => $report, 'corrected' => $corrected, 'changed_tables' => array_keys($changedTables), 'undoable' => false]);
         }, null);
+    }
+
+    /**
+     * The tables the correctors touch, as (rows, highest id, latest updated_at) — cheap
+     * aggregates, taken before and after each corrector so "changed" means the table moved.
+     */
+    private const array CORRECTED_TABLES = [
+        'accounts', 'account_meta', 'transaction_groups', 'transaction_journals', 'transactions', 'journal_meta', 'journal_links', 'link_types',
+        'budgets', 'budget_limits', 'available_budgets', 'bills', 'piggy_banks', 'piggy_bank_events', 'account_piggy_bank', 'recurrences', 'recurrences_transactions',
+        'currencies', 'transaction_currencies', 'transaction_currency_user_group', 'preferences', 'users', 'user_groups', 'group_memberships', 'categories', 'tags', 'notes',
+    ];
+
+    /** @return array<string, string> table => a stable digest of its aggregates */
+    private static function tableSnapshot(): array
+    {
+        $out = [];
+        foreach (self::CORRECTED_TABLES as $table) {
+            if (!Schema::hasTable($table)) {
+                continue;
+            }
+            $query = DB::table($table);
+            $parts = [(string) $query->count()];
+            if (Schema::hasColumn($table, 'id')) {
+                $parts[] = (string) $query->max('id');
+            }
+            if (Schema::hasColumn($table, 'updated_at')) {
+                $parts[] = (string) $query->max('updated_at');
+            }
+            if (Schema::hasColumn($table, 'deleted_at')) {
+                $parts[] = (string) DB::table($table)->whereNotNull('deleted_at')->count();
+            }
+            $out[$table] = implode('|', $parts);
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param array<string, string> $before
+     * @param array<string, string> $after
+     *
+     * @return list<string>
+     */
+    private static function changedTables(array $before, array $after): array
+    {
+        $changed = [];
+        foreach ($after as $table => $digest) {
+            if (($before[$table] ?? null) !== $digest) {
+                $changed[] = $table;
+            }
+        }
+
+        return $changed;
+    }
+
+    /** @param list<string> $tables @return array<string, int> */
+    private static function rowCounts(array $tables): array
+    {
+        $out = [];
+        foreach ($tables as $table) {
+            if (Schema::hasTable($table)) {
+                $out[$table] = (int) DB::table($table)->count();
+            }
+        }
+
+        return $out;
+    }
+
+    /** Firefly caches each cron job's "last run" stamp forever; forget them so a rolled-back stamp cannot linger. */
+    private static function forgetCronStamps(): void
+    {
+        try {
+            foreach (DB::table('users')->pluck('id') as $id) {
+                foreach (['last_rt_job', 'last_ab_job', 'last_bw_job', 'last_cer_job', 'last_webhook_job'] as $job) {
+                    Cache::forget(sprintf('ff3-config-%s_%d', $job, (int) $id));
+                }
+            }
+        } catch (\Throwable) {
+            // best effort
+        }
     }
 
     // ------------------------------------------------------ destroy / purge ---
@@ -339,8 +460,12 @@ final class AdminController extends MachineController
         $this->input($request, [], true);
         $response = MirrorController::dispatchInternal($request, 'GET', '/api/v1/configuration', [], null, ['Accept' => 'application/json']);
         $decoded  = json_decode((string) $response->getContent(), true);
-        if ($response->getStatusCode() >= 400 || !is_array($decoded)) {
-            throw MachineException::upstream('Firefly could not read its configuration.', 'Check storage/logs/laravel.log', ['upstream_status' => $response->getStatusCode()]);
+        $status   = $response->getStatusCode();
+        if (in_array($status, [401, 403], true)) {
+            throw MachineException::forbidden('Firefly refused the operator the configuration.', 'The operator needs the owner (full) role in Firefly III — or set FIREFLY_MACHINE_OPERATOR to the owner (GET /machine/v1/admin/users lists roles)', ['upstream_status' => $status]);
+        }
+        if ($status >= 400 || !is_array($decoded)) {
+            throw MachineException::upstream('Firefly could not read its configuration.', 'Check storage/logs/laravel.log', ['upstream_status' => $status]);
         }
         $rows     = array_is_list($decoded) ? $decoded : (array) ($decoded['data'] ?? []);
         $values   = [];
@@ -390,19 +515,25 @@ final class AdminController extends MachineController
         $webhook = $this->webhook($id);
         $args    = $this->input($request, []);
 
+        // A submit is an outbound call carrying financial data (§8.10), so it previews like every
+        // write: the dry run's Bus recorder holds the SendWebhookMessage jobs and the plan reports
+        // how many messages would leave; the apply needs the token and lets them go.
         return $this->write($request, $args, function (bool $dryRun) use ($webhook): WriteResult {
             $messages = $this->webhooks()->getReadyMessages($webhook);
             $result   = new WriteResult();
+            $ids      = [];
             foreach ($messages as $message) {
                 /** @var WebhookMessage $message */
                 SendWebhookMessage::dispatch($message)->afterResponse();
                 $result->count('queued');
+                $ids[] = (int) $message->id;
             }
+            $result->basis = $ids;
             if ($messages->count() > 0) {
                 self::irreversible($result, 'webhook_message', 'sent webhook messages', 'a message that left this machine cannot be recalled');
             }
 
-            return $result->with(['webhook_id' => (int) $webhook->id, 'queued' => $messages->count(), 'note' => 'Firefly sends at most three ready messages per submit; GET /machine/v1/webhooks/{id}/messages shows what is left.']);
+            return $result->with(['webhook_id' => (int) $webhook->id, 'queued' => $messages->count(), 'message_ids' => $ids, 'url' => (string) $webhook->url, 'note' => 'Firefly sends at most three ready messages per submit; GET /machine/v1/webhooks/{id}/messages shows what is left.']);
         });
     }
 
@@ -448,8 +579,12 @@ final class AdminController extends MachineController
     {
         $response = MirrorController::dispatchInternal($request, $method, $uri, $query, null, ['Accept' => 'application/json', 'Content-Type' => 'application/json']);
         $status   = $response->getStatusCode();
-        if ($status < 400) {
+        if ($status < 300) {
             return;
+        }
+        if ($status < 400) {
+            // upstream's IsAdmin middleware redirects a non-owner to the home page instead of refusing
+            throw MachineException::forbidden('Firefly redirected instead of answering — the operator lacks a role it needs.', 'The operator needs the owner (full) role in this administration', ['upstream_status' => $status]);
         }
         $decoded = json_decode((string) $response->getContent(), true);
         $message = Envelope::scrub(is_array($decoded) && is_string($decoded['message'] ?? null) ? $decoded['message'] : 'Firefly refused the request.');
@@ -586,7 +721,10 @@ final class AdminController extends MachineController
             'responses.*'  => sprintf('required|in:%s', $responses),
             'deliveries'   => [$required, 'array', 'min:1', 'max:1'],
             'deliveries.*' => sprintf('required|in:%s', $deliveries),
-            'url'          => array_values(array_filter([$required, 'string', sprintf('url:%s', $protocols), null === $webhook ? null : sprintf('uniqueExistingWebhook:%d', $webhook->id), new IsValidWebhookUrl()])),
+            // `bail`: Firefly's IsValidWebhookUrl resolves the host, and a URL without one
+            // ("javascript:alert(1)", "http://") makes it throw a TypeError — which would reach the
+            // caller as `internal` instead of invalid_input. The url: rule refuses those first.
+            'url'          => array_values(array_filter(['bail', $required, 'string', sprintf('url:%s', $protocols), null === $webhook ? null : sprintf('uniqueExistingWebhook:%d', $webhook->id), new IsValidWebhookUrl()])),
         ];
     }
 

@@ -58,6 +58,7 @@ use FireflyIII\Repositories\TransactionGroup\TransactionGroupRepositoryInterface
 use FireflyIII\Services\Internal\Update\GroupCloneService;
 use FireflyIII\Services\Internal\Update\JournalUpdateService;
 use FireflyIII\Support\Facades\Preferences;
+use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -103,8 +104,40 @@ final class TransactionController extends MachineController
         }
         $page      = $this->applyList(array_values($rows), $params);
         $groups    = GroupRenderer::groups(array_map(static fn (array $r): int => $r['id'], $page), $this->operator(), $this->administration());
+        $groups    = $this->underByteCap($groups, $params->offset);
 
         return $this->ok(['transactions' => $groups, 'total' => count($rows), 'filters' => $applied]);
+    }
+
+    /**
+     * The response byte cap (apis.mdx §15): a page of 5,000 split groups can pass 8 MiB, so the
+     * page is cut at the last whole group that fits, and meta says so with the narrowing hint.
+     *
+     * @param list<array<string, mixed>> $groups
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function underByteCap(array $groups, int $offset): array
+    {
+        $cap   = (int) config('machine.limits.max_body_bytes', 8388608);
+        $bytes = strlen(Envelope::encode($groups));
+        if ($bytes <= $cap || [] === $groups) {
+            return $groups;
+        }
+        $keep  = count($groups);
+        while ($keep > 1 && $bytes > $cap) {
+            $keep  = max(1, min($keep - 1, intdiv($keep * $cap * 95, $bytes * 100))); // counts, never amounts
+            $bytes = strlen(Envelope::encode(array_slice($groups, 0, $keep)));
+        }
+        $this->addMeta([
+            'truncated'     => true,
+            'limit_applied' => $keep,
+            'count'         => $keep,
+            'next_offset'   => $offset + $keep,
+            'hint'          => sprintf('The response was cut at %d transaction groups to stay under %d bytes — narrow it with start/end, an account or a lower limit, and page with offset=%d', $keep, $cap, $offset + $keep),
+        ]);
+
+        return array_slice($groups, 0, $keep);
     }
 
     /** GET /transactions/export — the same filters, as Firefly's own CSV. */
@@ -200,7 +233,7 @@ final class TransactionController extends MachineController
             'apply_rules'             => ['sometimes', 'boolean'],
             'error_if_duplicate_hash' => ['sometimes', 'boolean'],
         ]);
-        if (false === ($args['error_if_duplicate_hash'] ?? true)) {
+        if (array_key_exists('error_if_duplicate_hash', $args) && false === filter_var($args['error_if_duplicate_hash'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE)) {
             throw MachineException::invalid(
                 'error_if_duplicate_hash cannot be turned off on this plane.',
                 'Omit it — Firefly\'s duplicate check is always on here (apis.mdx §11.7); a real duplicate is refused as a conflict naming the original',
@@ -210,7 +243,7 @@ final class TransactionController extends MachineController
         $user       = $this->operator();
         $admin      = $this->administration();
         $splits     = SplitInput::prepare((array) $args['transactions'], SplitInput::STORE_FIELDS, $user, $admin, $this->finder());
-        $applyRules = (bool) ($args['apply_rules'] ?? true);
+        $applyRules = !array_key_exists('apply_rules', $args) || false !== filter_var($args['apply_rules'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
         $payload    = array_filter([
             'transactions'            => $splits,
             'group_title'             => $args['group_title'] ?? null,
@@ -291,17 +324,25 @@ final class TransactionController extends MachineController
         foreach ($group->transactionJournals()->with(['transactionType', 'transactionCurrency'])->get() as $journal) {
             $existing[(int) $journal->id] = $journal;
         }
-        $payload  = ['apply_rules' => (bool) ($args['apply_rules'] ?? false), 'fire_webhooks' => true];
+        $payload  = ['apply_rules' => true === filter_var($args['apply_rules'] ?? false, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE), 'fire_webhooks' => true];
+        $kept     = [];
         if (array_key_exists('transactions', $args)) {
-            $payload['transactions'] = SplitInput::prepare((array) $args['transactions'], SplitInput::UPDATE_FIELDS, $user, $admin, $this->finder(), $existing);
+            $splits                  = SplitInput::prepare((array) $args['transactions'], SplitInput::UPDATE_FIELDS, $user, $admin, $this->finder(), $existing);
+            [$splits, $kept]         = SplitInput::keepUnnamed($splits, $existing);
+            $payload['transactions'] = $splits;
         }
         if (array_key_exists('group_title', $args)) {
             $payload['group_title'] = $args['group_title'];
         }
+        // Firefly demands a group title whenever the payload has several splits; the kept ones
+        // make it so, and the group's own title (unchanged) is the answer
+        if (!array_key_exists('group_title', $payload) && count($payload['transactions'] ?? []) > 1 && '' !== (string) $group->title) {
+            $payload['group_title'] = (string) $group->title;
+        }
         FireflyForm::validated(UpdateRequest::class, $payload, ['transactionGroup' => $group]);
         $groupId  = (int) $group->id;
 
-        return $this->write($request, $args, function (bool $dryRun) use ($payload, $groupId, $user, $admin): WriteResult {
+        return $this->write($request, $args, function (bool $dryRun) use ($payload, $groupId, $user, $admin, $kept): WriteResult {
             $group        = $this->findGroup((string) $groupId);
             $data         = FireflyForm::validated(UpdateRequest::class, $payload, ['transactionGroup' => $group])->getAll();
             $watermark    = Snapshot::watermark();
@@ -350,6 +391,10 @@ final class TransactionController extends MachineController
                 'transactions'      => null === $rendered ? [] : [$rendered],
                 'rules_applied'     => $flags->applyRules,
                 'created_alongside' => $side,
+                'splits_kept'       => array_map('strval', $kept),
+                'note'              => [] === $kept
+                    ? null
+                    : sprintf('Split%s %s not named in transactions[] and kept as %s — a write-tier edit never removes a split; DELETE /machine/v1/transaction-journals/{journal_id} (admin) does.', 1 === count($kept) ? '' : 's', implode(', ', $kept), 1 === count($kept) ? 'it is' : 'they are'),
             ]);
         });
     }
@@ -457,7 +502,7 @@ final class TransactionController extends MachineController
     public function bulk(Request $request): JsonResponse
     {
         $args = $this->input($request, [
-            'journal_ids'   => ['sometimes', 'array', 'min:1', 'max:100000'],
+            'journal_ids'   => ['sometimes', 'array', 'min:1', 'max:5000'],
             'journal_ids.*' => ['regex:/^\d{1,19}$/'],
             'filter'        => ['sometimes', 'array'],
             'set'           => ['required', 'array'],
@@ -500,14 +545,14 @@ final class TransactionController extends MachineController
     public function categorize(Request $request): JsonResponse
     {
         $args = $this->input($request, [
-            'journal_ids'   => ['sometimes', 'array', 'min:1', 'max:100000'],
+            'journal_ids'   => ['sometimes', 'array', 'min:1', 'max:5000'],
             'journal_ids.*' => ['regex:/^\d{1,19}$/'],
             'filter'        => ['sometimes', 'array'],
             'category_id'   => ['sometimes', 'nullable', 'regex:/^\d{1,19}$/'],
             'category_name' => ['sometimes', 'nullable', 'string', 'max:255'],
         ]);
         if (!array_key_exists('category_id', $args) && !array_key_exists('category_name', $args)) {
-            throw MachineException::invalid('Which category?', 'Pass category_id or category_name (category_id: null removes the category)', ['field' => 'category_id']);
+            throw MachineException::invalid('Which category?', 'Pass category_id or category_name (category_id: null removes the category; so does an empty category_name)', ['field' => 'category_id']);
         }
 
         return $this->bulkWrite($request, $args, ['category' => $this->categoryTarget($args, '')]);
@@ -517,14 +562,14 @@ final class TransactionController extends MachineController
     public function setBudget(Request $request): JsonResponse
     {
         $args = $this->input($request, [
-            'journal_ids'   => ['sometimes', 'array', 'min:1', 'max:100000'],
+            'journal_ids'   => ['sometimes', 'array', 'min:1', 'max:5000'],
             'journal_ids.*' => ['regex:/^\d{1,19}$/'],
             'filter'        => ['sometimes', 'array'],
             'budget_id'     => ['sometimes', 'nullable', 'regex:/^\d{1,19}$/'],
             'budget_name'   => ['sometimes', 'nullable', 'string', 'max:255'],
         ]);
         if (!array_key_exists('budget_id', $args) && !array_key_exists('budget_name', $args)) {
-            throw MachineException::invalid('Which budget?', 'Pass budget_id or budget_name — or budget_id: null to remove the budget', ['field' => 'budget_id']);
+            throw MachineException::invalid('Which budget?', 'Pass budget_id or budget_name — or budget_id: null (or an empty budget_name) to remove the budget', ['field' => 'budget_id']);
         }
 
         return $this->bulkWrite($request, $args, ['budget' => $this->budgetTarget($args, '')]);
@@ -686,7 +731,7 @@ final class TransactionController extends MachineController
     public function massDelete(Request $request): JsonResponse
     {
         $args    = $this->input($request, [
-            'group_ids'   => ['required', 'array', 'min:1', 'max:100000'],
+            'group_ids'   => ['required', 'array', 'min:1', 'max:5000'],
             'group_ids.*' => ['regex:/^\d{1,19}$/'],
         ]);
         $ids     = array_values(array_unique(array_map('intval', $args['group_ids'])));
@@ -714,13 +759,22 @@ final class TransactionController extends MachineController
     {
         $journalIds = $this->selectJournals($args);
         $admin      = $this->administration();
+        $ceiling    = max(0, intval($args['max_changes'] ?? config('machine.limits.max_changes_default', 200)));
 
-        return $this->write($request, $args, function (bool $dryRun) use ($journalIds, $plan, $admin): WriteResult {
-            $journals  = TransactionJournal::query()->where('user_group_id', $admin->id)->whereIn('id', $journalIds)->orderBy('date')->orderBy('id')->get();
+        return $this->write($request, $args, function (bool $dryRun) use ($journalIds, $plan, $admin, $ceiling): WriteResult {
+            // a filter can select tens of thousands of journals: load them in chunks, so no
+            // single whereIn overruns the database's bound-parameter limit
+            $journals  = new EloquentCollection();
+            foreach (array_chunk($journalIds, 1000) as $chunk) {
+                $journals = $journals->merge(TransactionJournal::query()->where('user_group_id', $admin->id)->whereIn('id', $chunk)->get());
+            }
+            $journals  = $journals->sortBy([['date', 'asc'], ['id', 'asc']])->values();
             $groupIds  = array_values(array_unique($journals->map(static fn (TransactionJournal $j): int => (int) $j->transaction_group_id)->all()));
             $watermark = Snapshot::watermark();
             $before    = Snapshot::capture($groupIds);
-            $outcome   = BulkEditor::apply($journals, $plan);
+            // past the ceiling the rest is counted, not written: the plan is refused with the
+            // real count either way (§7.1), and the real apply only runs once the count is under it
+            $outcome   = BulkEditor::apply($journals, $plan, $dryRun ? $ceiling : null);
             $result    = new WriteResult();
             $side      = Snapshot::record($result, $before, Snapshot::capture($groupIds), $watermark, $admin);
             foreach ($outcome['changes'] as $kind => $n) {

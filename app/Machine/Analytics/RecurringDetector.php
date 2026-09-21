@@ -121,7 +121,7 @@ final class RecurringDetector
                 'payments already linked to a subscription are skipped (they are one already)',
             ],
             'excluded'   => ['transfers', 'deposits', 'opening balances', 'reconciliations'],
-            'provenance' => $scope->provenance(['min_occurrences' => $minOccurrences, 'tolerance_days' => $toleranceDays, 'amount_band' => self::AMOUNT_BAND]),
+            'provenance' => $scope->provenance(['min_occurrences' => $minOccurrences, 'tolerance_days' => $toleranceDays, 'amount_band' => self::AMOUNT_BAND, 'transfers' => 'not counted (withdrawals only)']),
         ];
     }
 
@@ -172,10 +172,23 @@ final class RecurringDetector
         if (null === $median) {
             return null;
         }
-        foreach (self::CADENCES as $cadence => [$low, $high, $perYear, $step]) {
+        // with a wide tolerance several cadence windows can contain the median: the nearest one
+        // (by distance from the median to the window) wins, not the first in the list
+        $best     = null;
+        $bestDist = null;
+        foreach (self::CADENCES as $cadence => [$low, $high]) {
             if ($median < $low - $tolerance || $median > $high + $tolerance) {
                 continue;
             }
+            $dist = max(0, $low - $median, $median - $high);
+            if (null === $bestDist || $dist < $bestDist) {
+                $best     = $cadence;
+                $bestDist = $dist;
+            }
+        }
+        if (null !== $best) {
+            $cadence                            = $best;
+            [$low, $high, $perYear, $step]      = self::CADENCES[$cadence];
             $matched = count(array_filter($gaps, static fn (int $g): bool => $g >= $low - $tolerance && $g <= $high + $tolerance));
             if ($matched * 4 < count($gaps) * 3 || $matched + 1 < $minOccurrences) {
                 return null;

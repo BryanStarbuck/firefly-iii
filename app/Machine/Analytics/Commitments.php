@@ -95,6 +95,10 @@ final class Commitments
                 $paidOther[$rowCode] = Money::add($paidOther[$rowCode] ?? '0', $amount);
             }
             sort($paidDates);
+            $paidOtherFormatted = [];
+            foreach ($paidOther as $otherCode => $sum) {
+                $paidOtherFormatted[(string) $otherCode] = $this->ledger->fmt($sum, (string) $otherCode);
+            }
             $average     = self::average($bill);
             $annualised  = self::annualised($bill);
             $rows[]      = [
@@ -113,7 +117,7 @@ final class Commitments
                 'paid_count'          => $paid->count(),
                 'paid_dates'          => $paidDates,
                 'paid_amount'         => $this->ledger->fmt($paidAmount, $code),
-                'paid_other_currencies' => (object) $paidOther,
+                'paid_other_currencies' => (object) $paidOtherFormatted,
                 'missed_count'        => max(0, $dueSoFar - $paid->count()),
                 'annualised'          => null === $annualised ? null : $this->ledger->fmt($annualised, $code),
                 'next_expected'       => $bill->active ? $repository->nextExpectedMatch($bill, $today)->format('Y-m-d') : null,
@@ -136,7 +140,7 @@ final class Commitments
                 'annualised = (amount_min + amount_max) ÷ 2 × occurrences per year ÷ (skip + 1); totals count active subscriptions only',
             ],
             'excluded'      => [],
-            'provenance'    => $scope->provenance(['today' => $today->format('Y-m-d')]),
+            'provenance'    => $scope->provenance(['today' => $today->format('Y-m-d'), 'transfers' => 'not applicable']),
         ];
     }
 
@@ -151,8 +155,14 @@ final class Commitments
         $repository = $this->ledger->repo(PiggyBankRepositoryInterface::class);
         $today ??= today(config('app.timezone'));
         $rows       = [];
+        $skipped    = 0;
         foreach ($repository->getPiggyBanks()->sortBy('id')->values() as $piggy) {
             /** @var PiggyBank $piggy */
+            if ($scope->accountsExplicit && $piggy->accounts->every(static fn ($a): bool => !$scope->hasAccount((int) $a->id))) {
+                ++$skipped; // not on any of the named accounts
+
+                continue;
+            }
             $currency = $piggy->transactionCurrency;
             $code     = (string) ($currency?->code ?? $this->ledger->primary->code);
             if (null !== $scope->currencyCode && $code !== $scope->currencyCode) {
@@ -191,12 +201,14 @@ final class Commitments
 
         return [
             'piggy_banks' => $rows,
-            'notes'       => [
+            'notes'       => array_values(array_filter([
                 'saved is Firefly\'s current amount; target null means the piggy bank has no target (not a target of zero)',
                 'on track = saved ≥ target × (days elapsed ÷ days from start to target date); null when there is no target or no target date',
-            ],
+                'start/end are not used: a piggy bank is reported as of today',
+                $scope->accountsExplicit ? sprintf('only piggy banks on the named accounts (%d other%s left out)', $skipped, 1 === $skipped ? '' : 's') : null,
+            ])),
             'excluded'    => [],
-            'provenance'  => $scope->provenance(['today' => $today->format('Y-m-d')]),
+            'provenance'  => $scope->provenance(['today' => $today->format('Y-m-d'), 'range' => 'not used (piggy banks are as of today)', 'transfers' => 'not applicable']),
         ];
     }
 

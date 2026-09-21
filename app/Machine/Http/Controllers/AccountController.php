@@ -33,6 +33,7 @@ use FireflyIII\Helpers\Collector\GroupCollectorInterface;
 use FireflyIII\Machine\Confirm\ConfirmTokens;
 use FireflyIII\Machine\DryRun;
 use FireflyIII\Machine\MachineException;
+use FireflyIII\Machine\Transactions\GroupRenderer;
 use FireflyIII\Machine\Money;
 use FireflyIII\Machine\WriteResult;
 use FireflyIII\Models\Account;
@@ -40,17 +41,25 @@ use FireflyIII\Models\AccountMeta;
 use FireflyIII\Models\AccountType;
 use FireflyIII\Models\Location;
 use FireflyIII\Models\Note;
+use FireflyIII\Models\PiggyBank;
+use FireflyIII\Models\Recurrence;
+use FireflyIII\Models\RecurrenceMeta;
+use FireflyIII\Models\RecurrenceRepetition;
+use FireflyIII\Models\RecurrenceTransaction;
+use FireflyIII\Models\RecurrenceTransactionMeta;
+use FireflyIII\Models\RuleAction;
+use FireflyIII\Models\RuleTrigger;
 use FireflyIII\Models\Transaction;
 use FireflyIII\Models\TransactionCurrency;
 use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Models\TransactionJournal;
 use FireflyIII\Models\TransactionJournalMeta;
 use FireflyIII\Repositories\Account\AccountRepositoryInterface;
+use FireflyIII\Rules\UniqueAccountNumber;
+use FireflyIII\Rules\UniqueIban;
 use FireflyIII\Support\Facades\Steam;
 use FireflyIII\Support\JsonApi\Enrichments\AccountEnrichment;
-use FireflyIII\Support\JsonApi\Enrichments\TransactionGroupEnrichment;
 use FireflyIII\Transformers\AccountTransformer;
-use FireflyIII\Transformers\TransactionGroupTransformer;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -95,6 +104,14 @@ final class AccountController extends MachineController
 
     /** Order fields the account row itself carries — the list is paged before it is enriched. */
     private const array MODEL_ORDERABLE = ['name', 'id', 'order', 'active', 'created_at', 'updated_at'];
+
+    /** The rendered fields that exist only when balances are asked for. */
+    private const array BALANCE_FIELDS = ['current_balance'];
+
+    /** Rule triggers/actions Firefly's UpdatesAccountInformation listener rewrites when an account is renamed or re-numbered. */
+    private const array RULE_NAME_TRIGGERS  = ['source_account_is', 'source_account_contains', 'source_account_ends', 'source_account_starts', 'destination_account_is', 'destination_account_contains', 'destination_account_ends', 'destination_account_starts', 'account_is', 'account_contains', 'account_ends', 'account_starts'];
+    private const array RULE_NUMBER_TRIGGERS = ['source_account_nr_is', 'source_account_nr_contains', 'source_account_nr_ends', 'source_account_nr_starts', 'destination_account_nr_is', 'destination_account_nr_contains', 'destination_account_nr_starts', 'account_nr_is', 'account_nr_contains', 'account_nr_ends', 'account_nr_starts'];
+    private const array RULE_NAME_ACTIONS   = ['set_source_account', 'set_destination_account', 'convert_withdrawal', 'convert_deposit', 'convert_transfer'];
 
     /** The transaction `type` filter on /accounts/{id}/transactions. */
     private const array TRANSACTION_TYPES = [
@@ -150,6 +167,14 @@ final class AccountController extends MachineController
         $active   = strtolower((string) ($args['active'] ?? 'true'));
         $balances = (bool) ($args['with_balances'] ?? true);
         $asOf     = isset($args['as_of']) ? $this->date((string) $args['as_of'], 'as_of') : null;
+        if (!$balances && in_array($params->orderField, self::BALANCE_FIELDS, true)) {
+            // sorting by a field the answer will not carry is a silent, meaningless order
+            throw MachineException::invalid(
+                sprintf('Cannot order by %s without balances.', $params->orderField),
+                'Drop with_balances=false, or order by name, id, order, active, account_role, created_at or updated_at',
+                ['field' => 'order', 'order' => $params->order()],
+            );
+        }
 
         $query    = Account::query()
             ->where('accounts.user_group_id', $this->administration()->id)
@@ -287,11 +312,11 @@ final class AccountController extends MachineController
             'virtual_balance'      => null === $account->virtual_balance || '' === (string) $account->virtual_balance ? null : Money::forCurrency((string) $account->virtual_balance, $currency),
             'include_net_worth'    => '0' !== (string) ($repository->getMetaValue($account, 'include_net_worth') ?? '1'),
             'liability'            => $isLiab ? [
-                'liability_type'      => strtolower($type),
+                'liability_type'      => strtolower((string) config(sprintf('firefly.shortLiabilityNameByFullName.%s', $type), $type)), // the word AccountTransformer uses
                 'liability_direction' => $repository->getMetaValue($account, 'liability_direction'),
                 'interest'            => $repository->getMetaValue($account, 'interest'),
                 'interest_period'     => $repository->getMetaValue($account, 'interest_period'),
-                'current_debt'        => $repository->getMetaValue($account, 'current_debt'),
+                'current_debt'        => Money::isDecimal($debt = (string) $repository->getMetaValue($account, 'current_debt')) ? Money::forCurrency($debt, $currency) : null, // at the currency's places (§14.1); absent is null (§14.2)
             ] : null,
         ];
 
@@ -310,10 +335,11 @@ final class AccountController extends MachineController
         $account = $this->account($id);
         [$start, $end] = $this->range($args);
 
-        /** @var GroupCollectorInterface $collector */
-        $collector = app(GroupCollectorInterface::class);
-        $collector->setUser($this->operator())->setUserGroup($this->administration()); // the bound books, not the operator's own rows only
-        $collector->setAccounts(new Collection([$account]))->withAPIInformation()->setTypes(self::TRANSACTION_TYPES[$args['type'] ?? 'all']);
+        // one light row per GROUP (a split group is one transaction): ordered and paged here, so
+        // the order is total and a page never cuts a group in half — then only the page is
+        // rendered with Firefly's full API information (the expensive part), never the whole history
+        $collector = GroupRenderer::collector($this->operator(), $this->administration()); // the bound books, not the operator's own rows only
+        $collector->setAccounts(new Collection([$account]))->setTypes(self::TRANSACTION_TYPES[$args['type'] ?? 'all']);
         if ($start instanceof Carbon) {
             $collector->setStart($start);
         }
@@ -321,15 +347,20 @@ final class AccountController extends MachineController
             $collector->setEnd($end);
         }
         $groups  = [];
-        foreach ($collector->getGroups() as $group) {
-            $first            = is_array($group['transactions'] ?? null) ? reset($group['transactions']) : false;
-            $group['date']    = is_array($first) && $first['date'] instanceof Carbon ? $first['date']->format('Y-m-d H:i:s') : null;
-            $groups[]         = $group;
+        foreach ($collector->getExtractedJournals() as $journal) {
+            $groupId = (int) $journal['transaction_group_id'];
+            if (array_key_exists($groupId, $groups)) {
+                continue;
+            }
+            $groups[$groupId] = [
+                'id'   => $groupId,
+                'date' => $journal['date'] instanceof Carbon ? $journal['date']->format('Y-m-d H:i:s') : (string) $journal['date'],
+            ];
         }
-        $page    = $this->applyList($groups, $params);
-        $rows    = $this->renderGroups($page);
+        $page    = $this->applyList(array_values($groups), $params);
+        $rows    = GroupRenderer::groups(array_map(static fn (array $g): int => $g['id'], $page), $this->operator(), $this->administration());
 
-        return $this->ok(['transactions' => $rows], ['filters' => ['account_id' => (string) $account->id, 'start' => $start?->format('Y-m-d'), 'end' => $end?->format('Y-m-d'), 'type' => $args['type'] ?? 'all']]);
+        return $this->ok(['transactions' => $rows, 'total' => count($groups)], ['filters' => ['account_id' => (string) $account->id, 'start' => $start?->format('Y-m-d'), 'end' => $end?->format('Y-m-d'), 'type' => $args['type'] ?? 'all']]);
     }
 
     // ================================================================= writes ===
@@ -344,6 +375,7 @@ final class AccountController extends MachineController
             $result = new WriteResult();
             $this->assertNameFree($data, null, 409);
             $account = $this->trackCreated($result, fn (): Account => $this->accounts()->store($data));
+            $this->assertWasCreated($result, $account);
             $result->count('created');
 
             return $result->with(['account' => $this->renderAccounts(new Collection([$account->refresh()]), null, true)[0]]);
@@ -370,6 +402,7 @@ final class AccountController extends MachineController
         $args  = $this->input($request, $rules);
         $rows  = [];
         $seen  = [];
+        $ibans = [];
         foreach (array_values((array) $args['accounts']) as $i => $row) {
             $data     = $this->createData((array) $row, sprintf('accounts[%d]', $i));
             $key      = $data['__group'].'|'.mb_strtolower((string) $data['name']);
@@ -377,6 +410,13 @@ final class AccountController extends MachineController
                 throw MachineException::invalid(sprintf('accounts[%d] repeats the name "%s" of accounts[%d].', $i, $data['name'], $seen[$key]), 'Firefly refuses two accounts of one type with the same name — give each row its own name', ['index' => $i, 'duplicate_of' => $seen[$key]]);
             }
             $seen[$key] = $i;
+            $iban       = (string) ($data['iban'] ?? '');
+            if ('' !== $iban && array_key_exists($iban, $ibans)) {
+                throw MachineException::invalid(sprintf('accounts[%d] repeats the IBAN of accounts[%d].', $i, $ibans[$iban]), 'Firefly keeps an IBAN on one account — give each row its own, or leave it out', ['index' => $i, 'duplicate_of' => $ibans[$iban]]);
+            }
+            if ('' !== $iban) {
+                $ibans[$iban] = $i;
+            }
             $rows[]     = $data;
         }
 
@@ -387,6 +427,7 @@ final class AccountController extends MachineController
                 try {
                     $this->assertNameFree($data, null, 409);
                     $account = $this->trackCreated($result, fn (): Account => $this->accounts()->store($data));
+                    $this->assertWasCreated($result, $account);
                 } catch (MachineException $e) {
                     throw new MachineException($e->errorCode, sprintf('accounts[%d]: %s', $i, $e->getMessage()), $e->hint, ['index' => $i] + $e->details, $e->status());
                 }
@@ -412,21 +453,23 @@ final class AccountController extends MachineController
             'order'                => ['sometimes', 'integer', 'min:1', 'max:1000000'],
             'interest'             => ['sometimes', 'nullable', 'string', 'max:32'],
             'interest_period'      => ['sometimes', 'nullable', 'string', 'in:daily,weekly,monthly,quarterly,half-year,yearly'],
-            'liability_direction'  => ['sometimes', 'string', 'in:credit,debit'],
             'credit_card_type'     => ['sometimes', 'nullable', 'string', 'in:monthlyFull'],
             'monthly_payment_date' => ['sometimes', 'nullable', 'date_format:Y-m-d'],
         ]);
+        // liability_direction is deliberately NOT editable here: Firefly's update service stores the
+        // new direction but leaves the opening-balance journal's sign as it was (its own form re-sends
+        // the opening balance every time), so the plane would produce a ledger that contradicts itself.
         $account = $this->editable($this->routeAccount($request, $id));
         $fields  = array_diff_key($args, self::CONTROL_RULES);
         if ([] === $fields) {
-            throw MachineException::invalid('Nothing to change.', 'Pass at least one of: name, account_role, iban, bic, account_number, notes, include_net_worth, order, interest, interest_period, liability_direction, credit_card_type, monthly_payment_date');
+            throw MachineException::invalid('Nothing to change.', 'Pass at least one of: name, account_role, iban, bic, account_number, notes, include_net_worth, order, interest, interest_period, credit_card_type, monthly_payment_date');
         }
         $type    = (string) $account->accountType->type;
         if (array_key_exists('account_role', $fields) && AccountTypeEnum::ASSET->value !== $type) {
             throw MachineException::invalid('Only an asset account has an account_role.', 'Leave account_role out for this account', ['field' => 'account_role']);
         }
         if (!in_array($type, config('firefly.valid_liabilities'), true)) {
-            foreach (['liability_direction', 'interest', 'interest_period'] as $field) {
+            foreach (['interest', 'interest_period'] as $field) {
                 if (array_key_exists($field, $fields)) {
                     throw MachineException::invalid(sprintf('%s is only for a liability; "%s" is a %s account.', $field, $account->name, strtolower($type)), sprintf('Leave %s out for this account', $field), ['field' => $field]);
                 }
@@ -438,6 +481,15 @@ final class AccountController extends MachineController
                 if (array_key_exists($field, $fields) && null !== $fields[$field]) {
                     throw MachineException::invalid(sprintf('%s is only for a credit card (account_role ccAsset).', $field), sprintf('Leave %s out, or also send "account_role": "ccAsset"', $field), ['field' => $field]);
                 }
+            }
+        }
+        if ('ccAsset' === $role) {
+            // Firefly's own UpdateRequest: a credit card needs its monthly payment date (required_if:account_role,ccAsset)
+            $hasDate = array_key_exists('monthly_payment_date', $fields)
+                ? null !== $fields['monthly_payment_date']
+                : '' !== (string) $this->accounts()->getMetaValue($account, 'cc_monthly_payment_date');
+            if (!$hasDate) {
+                throw MachineException::invalid('A credit card (account_role ccAsset) needs monthly_payment_date.', 'Pass "monthly_payment_date": "YYYY-MM-DD" (the day of the month the card is paid) in the same edit', ['field' => 'monthly_payment_date']);
             }
         }
         $data    = [];
@@ -461,6 +513,9 @@ final class AccountController extends MachineController
         if (array_key_exists('credit_card_type', $fields)) {
             $data['cc_type'] = (string) ($fields['credit_card_type'] ?? '');
         }
+        if ('ccAsset' === $role && !array_key_exists('cc_type', $data) && '' === (string) $this->accounts()->getMetaValue($account, 'cc_type')) {
+            $data['cc_type'] = 'monthlyFull'; // Firefly's only credit-card type; the same default POST /accounts applies
+        }
         if (array_key_exists('monthly_payment_date', $fields)) {
             $data['cc_monthly_payment_date'] = null === $fields['monthly_payment_date'] ? '' : $this->date((string) $fields['monthly_payment_date'], 'monthly_payment_date')->startOfDay();
         }
@@ -471,6 +526,7 @@ final class AccountController extends MachineController
             $probe = ['name' => $data['name'], '__types' => $this->sameGroupTypes($type)];
             $this->assertNameFree($probe, (int) $account->id, 409);
         }
+        $this->assertBankIdsFree($account, $this->typeIdentifier($type), $data['iban'] ?? null, $data['account_number'] ?? null);
         $accountId = (int) $account->id;
 
         return $this->write($request, $args, function (bool $dryRun) use ($accountId, $data): WriteResult {
@@ -478,12 +534,17 @@ final class AccountController extends MachineController
             $result  = new WriteResult();
             $before  = $this->comparable($account);
             $this->recordAccountRows($result, $account, array_key_exists('order', $data));
-            $this->accounts()->update($account, $data);
+            $rules   = $this->recordRuleRows($result, $account, $data);
+            $this->trackCreated($result, fn (): Account => $this->accounts()->update($account, $data), [Account::class => [$accountId]]);
             $account = $this->freshAccount($accountId);
             $changed = $before !== $this->comparable($account);
             $result->count($changed ? 'updated' : 'unchanged');
             if (!$changed) {
                 $result->touched = [];
+            }
+            if ($changed && $rules > 0) {
+                // Firefly's UpdatesAccountInformation listener rewrites the rules that name the account
+                $result->count('rule_conditions_updated', $rules);
             }
 
             return $result->with(['account' => $this->renderAccounts(new Collection([$account]), null, true)[0]]);
@@ -517,25 +578,29 @@ final class AccountController extends MachineController
             $account = $this->freshAccount($accountId);
             $result  = new WriteResult();
             $this->recordAccountRows($result, $account, true, true);
+            // Firefly renumbers the whole set (1..n) before every reorder — orders with gaps change
+            // rows the move itself never names, so the change set is measured from BEFORE that
+            $before  = $this->orderSnapshot($account, true);
             $this->accounts()->resetAccountOrder(); // what upstream's list and store do first: orders 1..n
             $account = $this->freshAccount($accountId);
-            $from    = (int) $account->order;
-            if ($from === $order) {
-                $result->touched = [];
-
-                return $result->count('unchanged')->with(['account' => $this->renderAccounts(new Collection([$account]), null, true)[0], 'order_before' => $from]);
+            if ((int) $account->order !== $order) {
+                $this->accounts()->update($account, ['order' => $order]);
             }
-            $snapshot = $this->orderSnapshot($account);
-            $this->accounts()->update($account, ['order' => $order]);
-            $moved    = 0;
-            foreach ($this->orderSnapshot($account) as $aid => $newOrder) {
-                if (($snapshot[$aid] ?? null) !== $newOrder) {
+            $moved   = 0;
+            foreach ($this->orderSnapshot($account, true) as $aid => $newOrder) {
+                if (($before[$aid] ?? null) !== $newOrder) {
                     ++$moved;
                 }
             }
-            $result->count('updated', max(1, $moved));
+            $account = $this->freshAccount($accountId);
+            if (0 === $moved) {
+                $result->touched = [];
 
-            return $result->with(['account' => $this->renderAccounts(new Collection([$this->freshAccount($accountId)]), null, true)[0], 'order_before' => $from]);
+                return $result->count('unchanged')->with(['account' => $this->renderAccounts(new Collection([$account]), null, true)[0], 'order_before' => $before[$accountId] ?? null]);
+            }
+            $result->count('updated', $moved);
+
+            return $result->with(['account' => $this->renderAccounts(new Collection([$account]), null, true)[0], 'order_before' => $before[$accountId] ?? null]);
         });
     }
 
@@ -581,6 +646,7 @@ final class AccountController extends MachineController
             $journals = $this->journalIdsOf($account);
             $rendered = $this->renderAccounts(new Collection([$account]), null, true)[0];
             $this->recordDeletion($result, $account, $journals);
+            $side     = $this->recordDeletionSideEffects($result, $account, null !== $moveTo);
             $this->accounts()->destroy($account, $moveTo);
             $this->keepOnlyWhatWasDeleted($result);
             $result->count('deleted');
@@ -592,8 +658,20 @@ final class AccountController extends MachineController
                 $result->count('journals_moved', $gone);
                 $result->count('journals_deleted', count($journals) - $gone);
             }
+            foreach ($side as $kind => $n) {
+                if ($n > 0) {
+                    $result->count($kind, $n);
+                }
+            }
 
-            return $result->with(['account' => $rendered, 'deleted' => 1, 'moved_to' => null === $moveTo ? null : ['id' => (string) $moveTo->id, 'name' => (string) $moveTo->name]]);
+            return $result->with([
+                'account'   => $rendered,
+                'deleted'   => 1,
+                'moved_to'  => null === $moveTo ? null : ['id' => (string) $moveTo->id, 'name' => (string) $moveTo->name],
+                'undo_note' => ($side['piggy_banks_unlinked'] ?? 0) > 0 || ($side['attachments_deleted'] ?? 0) > 0
+                    ? 'undo restores the account and its history; piggy-bank links and attachment files are gone for good'
+                    : null,
+            ]);
         });
     }
 
@@ -623,8 +701,14 @@ final class AccountController extends MachineController
             $start = $this->date((string) $args['start'], 'start');
         }
         if (null === $start) {
+            // default: from the account's first transaction — or from `end` itself when the
+            // account has no history yet (or none before `end`), so the plan never refuses
+            // a default it chose
             $oldest = $this->accounts()->oldestJournalDate($account);
             $start  = null === $oldest ? $end->copy() : Carbon::parse($oldest->format('Y-m-d'), config('app.timezone'));
+            if ($start->gt($end)) {
+                $start = $end->copy();
+            }
         }
         if ($end->lt($start)) {
             throw MachineException::invalid('end is before start.', 'Pass start ≤ end (YYYY-MM-DD)', ['start' => $start->format('Y-m-d'), 'end' => $end->format('Y-m-d')]);
@@ -800,7 +884,7 @@ final class AccountController extends MachineController
 
         $groupId = null;
         if ($create && !Money::isZero($figures['difference_raw'])) {
-            $group   = $this->trackCreated($result, fn (): TransactionGroup => $this->createReconciliation($account, $start, $end, $figures['difference_raw']));
+            $group   = $this->trackCreated($result, fn (): TransactionGroup => $this->createReconciliation($result, $account, $start, $end, $figures['difference_raw']));
             $groupId = (string) $group->id;
             $result->count('reconciliation_created');
         }
@@ -831,8 +915,11 @@ final class AccountController extends MachineController
         $start    = $start->copy()->startOfDay();
         $end      = $end->copy()->endOfDay();
         $single   = new Collection([$account]);
-        $startBal = (string) (Steam::accountsBalancesOptimized($single, $start, null, false, false)[$account->id]['balance'] ?? '0');
-        $endBal   = (string) (Steam::accountsBalancesOptimized($single, $end, null, false)[$account->id]['balance'] ?? '0');
+        $places   = (int) $currency->decimal_places;
+        // Account\ReconcileController::reconcile() rounds both balances to the currency's places
+        // (Steam::bcround) before the screen — and overview() computes the difference from those
+        $startBal = Steam::bcround((string) (Steam::accountsBalancesOptimized($single, $start, null, false, false)[$account->id]['balance'] ?? '0'), $places);
+        $endBal   = Steam::bcround((string) (Steam::accountsBalancesOptimized($single, $end, null, false)[$account->id]['balance'] ?? '0'), $places);
 
         /** @var GroupCollectorInterface $collector */
         $collector = app(GroupCollectorInterface::class);
@@ -874,7 +961,6 @@ final class AccountController extends MachineController
             throw MachineException::invalid($message, 'Pick journal ids from GET /machine/v1/accounts/{id}/transactions in that range that are not reconciled yet — or leave journal_ids out to select every uncleared row', ['journal_ids' => $problems]);
         }
         $difference = Money::sub(Money::add(Money::add($startBal, $clearedSum), $selectedSum), $target);
-        $places     = (int) $currency->decimal_places;
 
         return [
             'account_id'      => (string) $account->id,
@@ -931,11 +1017,24 @@ final class AccountController extends MachineController
      * transaction — one visible row of type `reconciliation` between the account and its
      * reconciliation account, dated `end`, for the absolute difference.
      */
-    private function createReconciliation(Account $account, Carbon $start, Carbon $end, string $difference): TransactionGroup
+    private function createReconciliation(WriteResult $result, Account $account, Carbon $start, Carbon $end, string $difference): TransactionGroup
     {
         $user           = $this->operator();
         $repository     = $this->accounts();
-        $reconciliation = $repository->getReconciliation($account);
+        // tracked on its own, so a reconciliation account Firefly creates here lands in the bound books first
+        $reconciliation = $this->trackCreated($result, static fn (): ?Account => $repository->getReconciliation($account));
+        if (!$reconciliation instanceof Account) {
+            throw MachineException::upstream('Firefly could not provide a reconciliation account.', 'Reconcile this account once in the web UI, then retry');
+        }
+        $reconciliation->refresh();
+        if ((int) $reconciliation->user_group_id !== (int) $this->administration()->id && (int) $reconciliation->user_group_id !== 0) {
+            // Firefly looks the reconciliation account up by the OPERATOR's accounts, across administrations
+            throw MachineException::conflict(
+                sprintf('The reconciliation account for "%s" (#%d) belongs to another administration.', $account->name, $reconciliation->id),
+                'Rename this account so its reconciliation account gets a name of its own, or reconcile it in the web UI of that administration',
+                ['reconciliation_account_id' => (string) $reconciliation->id, 'administration_id' => (int) $reconciliation->user_group_id],
+            );
+        }
         $currency       = $this->accountCurrency($account);
         $source         = $reconciliation;
         $destination    = $account;
@@ -1021,7 +1120,15 @@ final class AccountController extends MachineController
                 return $result->count('unchanged')->with(['account' => $this->renderAccounts(new Collection([$account]), null, true)[0]]);
             }
             $result->updating($account);
-            $this->accounts()->update($account, ['active' => $active]);
+            if (!$active) {
+                // AccountUpdateService::updatePreferences() drops a deactivated account from the
+                // owner's front-page selection — record that row so undo puts it back
+                $preference = \FireflyIII\Support\Facades\Preferences::getForUser($account->user, 'frontpageAccounts');
+                if ($preference instanceof \FireflyIII\Models\Preference && $preference->exists) {
+                    $result->updating($preference);
+                }
+            }
+            $this->trackCreated($result, fn (): Account => $this->accounts()->update($account, ['active' => $active]), [Account::class => [$accountId]]);
             $result->count('updated');
 
             return $result->with(['account' => $this->renderAccounts(new Collection([$this->freshAccount($accountId)]), null, true)[0]]);
@@ -1099,17 +1206,29 @@ final class AccountController extends MachineController
         if (null === $opening && null !== ($row['opening_balance_date'] ?? null)) {
             throw MachineException::invalid(sprintf('%s: opening_balance_date needs opening_balance.', $label), 'Pass "opening_balance" as a decimal string, or leave both out', ['field' => 'opening_balance']);
         }
+        if (null !== $opening && Money::isZero($opening)) {
+            // Firefly's validOBData() treats a zero opening balance as "none" and stores nothing —
+            // the caller would read back null for the "0.00" it sent (§14.2)
+            throw MachineException::invalid(sprintf('%s: a zero opening_balance is no opening balance.', $label), 'Leave opening_balance and opening_balance_date out — Firefly stores no journal for zero', ['field' => 'opening_balance']);
+        }
         if ($liab && null !== $opening && -1 === Money::compare($opening, '0')) {
             throw MachineException::invalid(sprintf('%s: a liability\'s opening_balance is the positive amount owed.', $label), sprintf('Send "opening_balance": "%s" — liability_direction carries the direction', ltrim($opening, '-')), ['field' => 'opening_balance']);
         }
         $virtual = null;
         if (null !== ($row['virtual_balance'] ?? null)) {
+            if ('asset' !== $type) {
+                // AccountFactory nulls a virtual balance on anything but an asset account (can_have_virtual_amounts)
+                throw MachineException::invalid(sprintf('%s: only an asset account has a virtual_balance.', $label), 'Leave virtual_balance out for this type', ['field' => 'virtual_balance']);
+            }
             $virtual = Money::normalize($row['virtual_balance'], $places, 'virtual_balance', $currency->code);
         }
         if (null !== ($row['interest'] ?? null) && !Money::isDecimal(trim((string) $row['interest']))) {
             throw MachineException::invalid(sprintf('%s: interest must be a decimal string like "4.25".', $label), 'Send "interest": "4.25" (a percentage)', ['field' => 'interest']);
         }
         $fireflyType = $liab ? (string) $ltype : $type;
+        $iban        = $this->iban($row['iban'] ?? null);
+        $number      = null === ($row['account_number'] ?? null) ? null : trim((string) $row['account_number']);
+        $this->assertBankIdsFree(null, $this->typeIdentifier($fireflyType), $iban, $number, $label);
 
         return [
             'name'                    => trim((string) $row['name']),
@@ -1120,9 +1239,9 @@ final class AccountController extends MachineController
             'currency_id'             => (int) $currency->id,
             'currency_code'           => $currency->code,
             'virtual_balance'         => $virtual,
-            'iban'                    => $this->iban($row['iban'] ?? null),
+            'iban'                    => $iban,
             'BIC'                     => null === ($row['bic'] ?? null) ? null : trim((string) $row['bic']),
-            'account_number'          => null === ($row['account_number'] ?? null) ? null : trim((string) $row['account_number']),
+            'account_number'          => $number,
             'account_role'            => $row['account_role'] ?? null,
             'opening_balance'         => $opening,
             'opening_balance_date'    => $obDate,
@@ -1147,10 +1266,18 @@ final class AccountController extends MachineController
     {
         $types = (array) ($data['__types'] ?? []);
         unset($data['__types'], $data['__group']);
+        $admin = (int) $this->administration()->id;
+        $user  = (int) $this->operator()->id;
+        // the bound books (any member's account) — and the operator's own accounts in ANY of their
+        // administrations, because AccountFactory::find() looks there and would hand one of those back
         $query = Account::query()
-            ->where('user_group_id', $this->administration()->id)
+            ->where(static function ($q) use ($admin, $user): void {
+                $q->where('user_group_id', $admin)->orWhere('user_id', $user);
+            })
             ->whereIn('account_type_id', $this->typeIds($types))
             ->whereRaw('LOWER(name) = ?', [mb_strtolower((string) $data['name'])])
+            ->orderByRaw('CASE WHEN user_group_id = ? THEN 0 ELSE 1 END', [$admin])
+            ->orderBy('id')
         ;
         if (null !== $except) {
             $query->where('id', '!=', $except);
@@ -1159,12 +1286,82 @@ final class AccountController extends MachineController
         /** @var null|Account $existing */
         $existing = $query->first();
         if (null !== $existing) {
+            $elsewhere = (int) $existing->user_group_id !== $admin;
+
             throw MachineException::conflict(
-                sprintf('An account named "%s" already exists (#%d).', $existing->name, $existing->id),
-                sprintf('GET /machine/v1/accounts/%d — use it, or choose another name', $existing->id),
-                ['existing' => ['id' => (string) $existing->id, 'name' => (string) $existing->name]],
+                $elsewhere
+                    ? sprintf('An account named "%s" already exists (#%d) in another of the operator\'s administrations (#%d).', $existing->name, $existing->id, $existing->user_group_id)
+                    : sprintf('An account named "%s" already exists (#%d).', $existing->name, $existing->id),
+                $elsewhere
+                    ? 'Firefly keeps account names unique per user across administrations — choose another name'
+                    : sprintf('GET /machine/v1/accounts/%d — use it, or choose another name', $existing->id),
+                ['existing' => ['id' => (string) $existing->id, 'name' => (string) $existing->name, 'administration_id' => (int) $existing->user_group_id]],
             );
         }
+    }
+
+    /**
+     * Firefly's own UniqueIban / UniqueAccountNumber rules (Account\StoreRequest, UpdateRequest):
+     * an IBAN or account number may not be reused across the operator's accounts of these types.
+     * Both rules read auth()->user(), which the operator binding set.
+     */
+    private function assertBankIdsFree(?Account $account, ?string $typeIdentifier, ?string $iban, ?string $number, string $label = ''): void
+    {
+        if (null === $typeIdentifier) {
+            return;
+        }
+        $prefix = '' === $label ? '' : $label.': ';
+        if (null !== $iban && '' !== $iban) {
+            $validator = \Illuminate\Support\Facades\Validator::make(['iban' => $iban], ['iban' => [new UniqueIban($account, $typeIdentifier)]]);
+            if ($validator->fails()) {
+                throw MachineException::conflict(
+                    sprintf('%sthe IBAN ending in %s is already on another of the operator\'s accounts.', $prefix, substr($iban, -4)),
+                    'GET /machine/v1/accounts?search=… finds it — use that account, or leave iban out',
+                    ['field' => 'iban', 'iban_last4' => substr($iban, -4)],
+                );
+            }
+        }
+        if (null !== $number && '' !== $number && 'liabilities' !== $typeIdentifier) {
+            $validator = \Illuminate\Support\Facades\Validator::make(['account_number' => $number], ['account_number' => [new UniqueAccountNumber($account, $typeIdentifier)]]);
+            if ($validator->fails()) {
+                throw MachineException::conflict(
+                    sprintf('%sthe account number ending in %s is already on another of the operator\'s accounts.', $prefix, substr($number, -4)),
+                    'Use that account, or leave account_number out',
+                    ['field' => 'account_number', 'account_number_last4' => substr($number, -4)],
+                );
+            }
+        }
+    }
+
+    /** Firefly's type identifier for its uniqueness rules: asset, expense, revenue, liabilities — or null for the rest. */
+    private function typeIdentifier(string $fireflyType): ?string
+    {
+        return match ($fireflyType) {
+            AccountTypeEnum::ASSET->value, AccountTypeEnum::DEFAULT->value, 'asset'       => 'asset',
+            AccountTypeEnum::EXPENSE->value, AccountTypeEnum::BENEFICIARY->value, 'expense' => 'expense',
+            AccountTypeEnum::REVENUE->value, 'revenue'                                     => 'revenue',
+            AccountTypeEnum::LOAN->value, AccountTypeEnum::DEBT->value, AccountTypeEnum::MORTGAGE->value, 'loan', 'debt', 'mortgage' => 'liabilities',
+            default => null,
+        };
+    }
+
+    /**
+     * AccountFactory::create() silently RETURNS an existing account of that name instead of
+     * creating one; the plane never reports a reused row as created.
+     */
+    private function assertWasCreated(WriteResult $result, Account $account): void
+    {
+        foreach ($result->touched as $t) {
+            if ('created' === $t['op'] && Account::class === $t['class'] && (int) $t['id'] === (int) $account->id) {
+                return;
+            }
+        }
+
+        throw MachineException::conflict(
+            sprintf('Firefly returned the existing account "%s" (#%d) instead of creating one.', $account->name, $account->id),
+            'Choose another name, or use that account',
+            ['existing' => ['id' => (string) $account->id, 'name' => (string) $account->name, 'administration_id' => (int) $account->user_group_id]],
+        );
     }
 
     /** A validated, space-free IBAN (Firefly's own `iban` rule), or null. */
@@ -1185,33 +1382,221 @@ final class AccountController extends MachineController
     /**
      * Run $fn and record every row it inserted (undo deletes them, children first).
      *
+     * A new row counts as this write's only when it is the operator's (user_id) or hangs off a
+     * row that is — one this call created, or one named in $anchors (the account an edit adds a
+     * note to). A row the browser inserted in the same instant is never claimed: undo must never
+     * delete a human's row, and the books it lands in are not ours to move.
+     *
      * @template T
      *
-     * @param Closure(): T $fn
+     * @param Closure(): T                          $fn
+     * @param array<class-string<Model>, list<int>> $anchors parent rows that already exist
      *
      * @return T
      */
-    private function trackCreated(WriteResult $result, Closure $fn): mixed
+    private function trackCreated(WriteResult $result, Closure $fn, array $anchors = []): mixed
     {
         $classes = [Account::class, AccountMeta::class, Location::class, TransactionGroup::class, TransactionJournal::class, TransactionJournalMeta::class, Transaction::class, Note::class];
+        // child table => [parent-id column, parent classes, morph-type column]
+        $parents = [
+            AccountMeta::class            => ['account_id', [Account::class], null],
+            Location::class               => ['locatable_id', [Account::class, TransactionJournal::class], 'locatable_type'],
+            TransactionJournal::class     => ['transaction_group_id', [TransactionGroup::class], null],
+            TransactionJournalMeta::class => ['transaction_journal_id', [TransactionJournal::class], null],
+            Transaction::class            => ['transaction_journal_id', [TransactionJournal::class], null],
+            Note::class                   => ['noteable_id', [Account::class, TransactionJournal::class], 'noteable_type'],
+        ];
         $before  = [];
         foreach ($classes as $class) {
             $table          = (new $class())->getTable();
             $before[$class] = (int) (DB::table($table)->max('id') ?? 0);
         }
         $value   = $fn();
+        $admin   = (int) $this->administration()->id;
+        $user    = (int) $this->operator()->id;
+        $mine    = [];
+        foreach ($anchors as $class => $ids) {
+            $mine[$class] = array_map('intval', $ids);
+        }
         foreach ($classes as $class) {
             /** @var Model $model */
-            $model = new $class();
-            foreach (DB::table($model->getTable())->where('id', '>', $before[$class])->orderBy('id')->pluck('id') as $newId) {
+            $model   = new $class();
+            $table   = $model->getTable();
+            $columns = self::tableColumns($table);
+            $known   = [];
+            foreach ($result->touched as $t) {
+                if ('created' === $t['op'] && $class === $t['class']) {
+                    $known[(int) $t['id']] = true;
+                }
+            }
+            $query   = DB::table($table)->where('id', '>', $before[$class]);
+            if (in_array('user_id', $columns, true)) {
+                $query->where('user_id', $user);
+            }
+            if (array_key_exists($class, $parents)) {
+                [$column, $parentClasses, $morph] = $parents[$class];
+                $query->where(static function ($q) use ($column, $parentClasses, $morph, $mine): void {
+                    $any = false;
+                    foreach ($parentClasses as $parentClass) {
+                        $ids = $mine[$parentClass] ?? [];
+                        if ([] === $ids) {
+                            continue;
+                        }
+                        $any = true;
+                        $q->orWhere(static function ($w) use ($column, $morph, $parentClass, $ids): void {
+                            $w->whereIn($column, $ids);
+                            if (null !== $morph) {
+                                $w->where($morph, $parentClass);
+                            }
+                        });
+                    }
+                    if (!$any) {
+                        $q->whereRaw('1 = 0');
+                    }
+                });
+            }
+            $newIds  = $query->orderBy('id')->pluck('id')->map(static fn ($id): int => (int) $id)->all();
+            $mine[$class] = array_values(array_unique(array_merge($mine[$class] ?? [], $newIds)));
+            foreach ($newIds as $newId) {
+                if (isset($known[$newId])) {
+                    continue; // recorded by a nested trackCreated()
+                }
                 $row = new $class();
                 $row->setAttribute($row->getKeyName(), $newId);
                 $row->exists = true;
                 $result->created($row);
             }
+            // Firefly's factories stamp new rows with the OPERATOR's current administration
+            // (user.user_group_id); the plane may be bound to another one (§4.9). What this write
+            // created belongs to the bound books — move it there before anything reads it back.
+            if ([] !== $newIds && in_array('user_group_id', $columns, true)) {
+                DB::table($table)->whereIn('id', $newIds)->where('user_group_id', '!=', $admin)->update(['user_group_id' => $admin]);
+            }
         }
 
         return $value;
+    }
+
+    /** @return list<string> */
+    private static function tableColumns(string $table): array
+    {
+        static $cache = [];
+
+        return $cache[$table] ??= \Illuminate\Support\Facades\Schema::getColumnListing($table);
+    }
+
+    /**
+     * Before-images of the rule triggers and actions Firefly's UpdatesAccountInformation listener
+     * rewrites when the account's name, IBAN or account number changes; returns how many.
+     *
+     * @param array<string, mixed> $data the update-service data
+     */
+    private function recordRuleRows(WriteResult $result, Account $account, array $data): int
+    {
+        $names   = [];
+        $numbers = [];
+        if (array_key_exists('name', $data) && (string) $data['name'] !== (string) $account->name) {
+            $names[] = (string) $account->name;
+        }
+        if (array_key_exists('iban', $data) && '' !== (string) $account->iban && (string) $data['iban'] !== (string) $account->iban) {
+            $numbers[] = (string) $account->iban;
+        }
+        $number  = (string) $this->accounts()->getMetaValue($account, 'account_number');
+        if (array_key_exists('account_number', $data) && '' !== $number && (string) $data['account_number'] !== $number) {
+            $numbers[] = $number;
+        }
+        if ([] === $names && [] === $numbers) {
+            return 0;
+        }
+        $ruleIds = DB::table('rules')->where('user_id', $account->user_id)->whereNull('deleted_at')->pluck('id')->all();
+        if ([] === $ruleIds) {
+            return 0;
+        }
+        $n       = 0;
+        $query   = RuleTrigger::query()->whereIn('rule_id', $ruleIds)->where(static function ($q) use ($names, $numbers): void {
+            if ([] !== $names) {
+                $q->orWhere(static fn ($w) => $w->whereIn('trigger_value', $names)->whereIn('trigger_type', self::RULE_NAME_TRIGGERS));
+            }
+            if ([] !== $numbers) {
+                $q->orWhere(static fn ($w) => $w->whereIn('trigger_value', $numbers)->whereIn('trigger_type', self::RULE_NUMBER_TRIGGERS));
+            }
+        });
+        foreach ($query->orderBy('id')->get() as $trigger) {
+            $result->updating($trigger);
+            ++$n;
+        }
+        if ([] !== $names) {
+            foreach (RuleAction::query()->whereIn('rule_id', $ruleIds)->whereIn('action_value', $names)->whereIn('action_type', self::RULE_NAME_ACTIONS)->orderBy('id')->get() as $action) {
+                $result->updating($action);
+                ++$n;
+            }
+        }
+
+        return $n;
+    }
+
+    /**
+     * What AccountDestroyService and the DeletedAccountObserver remove BESIDE the account and its
+     * journals: piggy-bank links (hard-deleted pivot rows — not restorable), piggy banks still
+     * bound by the legacy account_id column, recurring transactions (deleted, or re-pointed when
+     * the history moves), and attachments (files, gone for good). Recurrence rows are recorded
+     * for undo; the rest is counted so the operator learns about it before it happens (§7.6).
+     *
+     * @return array<string, int>
+     */
+    private function recordDeletionSideEffects(WriteResult $result, Account $account, bool $moving): array
+    {
+        $side  = [];
+        $links = (int) DB::table('account_piggy_bank')->where('account_id', $account->id)->count();
+        foreach (PiggyBank::query()->where('account_id', $account->id)->orderBy('id')->get() as $piggy) {
+            $result->deleting($piggy);
+            ++$links;
+        }
+        $side['piggy_banks_unlinked'] = $links;
+
+        $recurrenceIds = RecurrenceTransaction::query()
+            ->where(static function ($q) use ($account): void {
+                $q->where('source_id', $account->id)->orWhere('destination_id', $account->id);
+            })
+            ->pluck('recurrence_id')->map(static fn ($id): int => (int) $id)->unique()->values()->all()
+        ;
+        if ([] !== $recurrenceIds) {
+            $side[$moving ? 'recurrences_moved' : 'recurrences_deleted'] = count($recurrenceIds);
+            $rtQuery = RecurrenceTransaction::query()->whereIn('recurrence_id', $recurrenceIds);
+            if ($moving) {
+                $rtQuery->where(static function ($q) use ($account): void {
+                    $q->where('source_id', $account->id)->orWhere('destination_id', $account->id);
+                });
+                foreach ($rtQuery->orderBy('id')->get() as $rt) {
+                    $result->updating($rt);
+                }
+            }
+            if (!$moving) {
+                $rtIds = $rtQuery->pluck('id')->all();
+                foreach (RecurrenceTransactionMeta::query()->whereIn('rt_id', [] === $rtIds ? [0] : $rtIds)->orderBy('id')->get() as $row) {
+                    $result->deleting($row);
+                }
+                foreach ($rtQuery->orderBy('id')->get() as $rt) {
+                    $result->deleting($rt);
+                }
+                foreach (RecurrenceRepetition::query()->whereIn('recurrence_id', $recurrenceIds)->orderBy('id')->get() as $row) {
+                    $result->deleting($row);
+                }
+                foreach (RecurrenceMeta::query()->whereIn('recurrence_id', $recurrenceIds)->orderBy('id')->get() as $row) {
+                    $result->deleting($row);
+                }
+                foreach (Recurrence::query()->whereIn('id', $recurrenceIds)->orderBy('id')->get() as $row) {
+                    $result->deleting($row);
+                }
+            }
+        }
+
+        $attachments = (int) $account->attachments()->count();
+        if ($attachments > 0) {
+            $side['attachments_deleted'] = $attachments;
+        }
+
+        return $side;
     }
 
     /** Before-images of an account, its meta, its notes — and, when order may shift, of its orderable siblings. */
@@ -1220,12 +1605,7 @@ final class AccountController extends MachineController
         if ($siblings) {
             // resetAccountOrder() renumbers default+asset and loan/debt/credit-card/mortgage accounts,
             // a wider set than updateAccountOrder() shifts — record every row it can rewrite
-            $query = $afterReset
-                ? Account::query()->where('user_id', $account->user_id)->whereIn('account_type_id', $this->typeIds([
-                    AccountTypeEnum::DEFAULT->value, AccountTypeEnum::ASSET->value,
-                    AccountTypeEnum::LOAN->value, AccountTypeEnum::DEBT->value, AccountTypeEnum::CREDITCARD->value, AccountTypeEnum::MORTGAGE->value,
-                ]))
-                : $this->orderSiblingsQuery($account);
+            $query = $afterReset ? $this->resetSetQuery($account) : $this->orderSiblingsQuery($account);
             $ids   = $query->where('id', '!=', $account->id)->orderBy('id')->get();
             foreach ($ids as $sibling) {
                 $result->updating($sibling);
@@ -1315,15 +1695,35 @@ final class AccountController extends MachineController
             ->all()));
     }
 
-    /** @return array<int, int> account id → order, for the accounts that share $account's ordering */
-    private function orderSnapshot(Account $account): array
+    /**
+     * account id → order, for the accounts that share $account's ordering; $wide takes the set
+     * AccountRepository::resetAccountOrder() renumbers (default+asset, or every liability type).
+     *
+     * @return array<int, int>
+     */
+    private function orderSnapshot(Account $account, bool $wide = false): array
     {
-        $out = [];
-        foreach ($this->orderSiblingsQuery($account)->orderBy('id')->get(['id', 'order']) as $row) {
+        $out   = [];
+        $query = $wide ? $this->resetSetQuery($account) : $this->orderSiblingsQuery($account);
+        foreach ($query->orderBy('id')->get(['id', 'order']) as $row) {
             $out[(int) $row->id] = (int) $row->order;
         }
 
         return $out;
+    }
+
+    /**
+     * Every account AccountRepository::resetAccountOrder() renumbers — BOTH its sets (default+asset
+     * and the liability types), whichever set $account is in, because it always renumbers both.
+     *
+     * @return \Illuminate\Database\Eloquent\Builder<Account>
+     */
+    private function resetSetQuery(Account $account): \Illuminate\Database\Eloquent\Builder
+    {
+        return Account::query()->where('user_id', $account->user_id)->whereIn('account_type_id', $this->typeIds([
+            AccountTypeEnum::DEFAULT->value, AccountTypeEnum::ASSET->value,
+            AccountTypeEnum::LOAN->value, AccountTypeEnum::DEBT->value, AccountTypeEnum::CREDITCARD->value, AccountTypeEnum::MORTGAGE->value,
+        ]));
     }
 
     /** @return \Illuminate\Database\Eloquent\Builder<Account> */
@@ -1378,8 +1778,10 @@ final class AccountController extends MachineController
 
     private function account(string $idOrName): Account
     {
+        // the router already URL-decodes the {id} segment; decoding it again would turn a
+        // literal "%20" in a name into a space and miss the account
         /** @var Account $account */
-        $account = $this->resolve(Account::class, rawurldecode($idOrName));
+        $account = $this->resolve(Account::class, $idOrName);
 
         return $account;
     }
@@ -1506,39 +1908,6 @@ final class AccountController extends MachineController
                     unset($row[$k]);
                 }
             }
-            $rows[] = $row;
-        }
-
-        return $rows;
-    }
-
-    /**
-     * TransactionGroupEnrichment + TransactionGroupTransformer (the /api/v1 shapes), flattened.
-     *
-     * @param array<int, array<string, mixed>>|Collection<int, mixed> $groups
-     *
-     * @return list<array<string, mixed>>
-     */
-    private function renderGroups(array|Collection $groups): array
-    {
-        $groups = $groups instanceof Collection ? $groups : new Collection($groups);
-        if ($groups->isEmpty()) {
-            return [];
-        }
-        $enrichment  = new TransactionGroupEnrichment();
-        $enrichment->setUser($this->operator());
-        $groups      = $enrichment->enrich($groups->map(static function (array $g): array {
-            unset($g['date']);
-
-            return $g;
-        }));
-
-        /** @var TransactionGroupTransformer $transformer */
-        $transformer = app(TransactionGroupTransformer::class);
-        $rows        = [];
-        foreach ($groups as $group) {
-            $row = $transformer->transform($group);
-            unset($row['links']);
             $rows[] = $row;
         }
 

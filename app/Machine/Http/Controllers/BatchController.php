@@ -29,6 +29,7 @@ use FireflyIII\Events\Model\TransactionGroup\UserRequestedBatchProcessing;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\RouteTable;
 use FireflyIII\Machine\WriteResult;
+use FireflyIII\Models\TransactionGroup;
 use FireflyIII\Repositories\Journal\JournalRepositoryInterface;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -290,9 +291,20 @@ final class BatchController extends MachineController
         }
         $decoded = json_decode((string) $response->getContent(), true);
         if (!is_array($decoded) || true !== ($decoded['ok'] ?? null)) {
-            $error = is_array($decoded['error'] ?? null) ? $decoded['error'] : [];
+            $error   = is_array($decoded['error'] ?? null) ? $decoded['error'] : [];
+            $details = is_array($error['details'] ?? null) ? $error['details'] : [];
+            $message = (string) ($error['message'] ?? 'The operation failed.');
+            $hint    = isset($error['hint']) ? (string) $error['hint'] : null;
+            // A duplicate of a row an EARLIER operation of this same batch created: name that
+            // operation, not a transaction group id that only existed inside the rolled-back plan.
+            $twin    = isset($details['duplicate_of']) ? self::createdBy(TransactionGroup::class, $details['duplicate_of']) : null;
+            if (null !== $twin) {
+                $message = sprintf('this transaction is a duplicate of operation %d of this batch.', $twin);
+                $hint    = sprintf('Operations %d and %d would store the same transaction (same date, amount, accounts and description) — drop one, or make them differ', $twin, $i);
+                $details = ['duplicate_of_operation' => $twin] + array_diff_key($details, ['duplicate_of' => true]);
+            }
 
-            throw self::failed($i, $op, (string) ($error['code'] ?? 'internal'), (string) ($error['message'] ?? 'The operation failed.'), isset($error['hint']) ? (string) $error['hint'] : null, is_array($error['details'] ?? null) ? $error['details'] : []);
+            throw self::failed($i, $op, (string) ($error['code'] ?? 'internal'), $message, $hint, $details);
         }
         if (count(self::$frame['results'] ?? []) !== $before + 1) {
             throw self::failed($i, $op, 'internal', 'The operation did not report a write.', null, []);
@@ -300,6 +312,27 @@ final class BatchController extends MachineController
         $data = is_array($decoded['data'] ?? null) ? $decoded['data'] : [];
 
         return ['index' => $i, 'op' => $op, 'route' => $spec[0].' '.$spec[1], 'changes' => $data['changes'] ?? [], 'data' => $data];
+    }
+
+    /**
+     * The index of the operation in the open frame that created row $id of $class, or null.
+     * Each operation reports exactly one result, so a result's position is its operation index.
+     *
+     * @param class-string $class
+     */
+    private static function createdBy(string $class, mixed $id): ?int
+    {
+        foreach (self::$frame['results'] ?? [] as $index => $entry) {
+            /** @var WriteResult $result */
+            $result = $entry['result'];
+            foreach ($result->touched as $t) {
+                if ('created' === ($t['op'] ?? null) && $class === ($t['class'] ?? null) && (string) ($t['id'] ?? '') === (string) $id) {
+                    return (int) $index;
+                }
+            }
+        }
+
+        return null;
     }
 
     /** @param array<string, mixed> $details */

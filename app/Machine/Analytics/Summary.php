@@ -157,7 +157,7 @@ final class Summary
                 'net_worth is at end, over active asset and liability accounts with include_net_worth on',
             ],
             'excluded'   => $scope->excluded(),
-            'provenance' => $scope->provenance(['budget_period' => ['start' => $abStart->format('Y-m-d'), 'end' => $abEnd->format('Y-m-d'), 'view_range' => $range]]),
+            'provenance' => $scope->provenance(['budget_period' => ['start' => $abStart->format('Y-m-d'), 'end' => $abEnd->format('Y-m-d'), 'view_range' => $range], 'balances' => Ledger::BALANCE_NOTE]),
         ];
     }
 

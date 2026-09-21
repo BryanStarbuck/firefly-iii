@@ -35,10 +35,10 @@ beforeEach(() => {
 const WRITE_ON = { FFMCP_ALLOW_WRITE: '1' };
 
 describe('gate 4 — the write tier is off by default', () => {
-  it('every one of the 18 write tools is LISTED, says it is disabled, and names both switches', () => {
+  it('every one of the 19 write tools is LISTED, says it is disabled, and names both switches', () => {
     const { host: h } = host(plane);
     const writes = h.handleListTools().tools.filter((t) => TOOLS.find((x) => x.name === t.name)?.tier === 'write');
-    assert.equal(writes.length, 18);
+    assert.equal(writes.length, 19);
     for (const t of writes) {
       assert.match(t.description, /CURRENTLY DISABLED/);
       assert.match(t.description, /FIREFLY_MACHINE_ALLOW_WRITE=1/);
@@ -438,6 +438,81 @@ describe('§12 — the envelope', () => {
     const { host: h } = host(plane);
     const r = await call(h, 'ff_get_account', { id: 9 });
     assert.ok(findUnredacted(r.envelope.data).length > 0);
+  });
+});
+
+describe('the category tree and categorize-by-import (apis.mdx §8.4a, §8.3)', () => {
+  const YAML = 'app: firefly_iii\ngenerated_at: 2026-09-21T22:00:00Z\ncounts:\n  groups: 1\n  subcategories: 1\ngroups:\n  - name: Food\n    id: "12"\n    subcategories:\n      - name: Groceries\n        full_name: Food > Groceries\n        id: "13"\n';
+  const TREE = {
+    app: 'firefly_iii',
+    counts: { groups: 1, subcategories: 1 },
+    groups: [{ name: 'Food', id: '12', subcategories: [{ name: 'Groceries', full_name: 'Food > Groceries', id: '13' }] }],
+    yaml: YAML,
+  };
+
+  it('ff_get_category_tree: the text is the plane\'s YAML under one comment line; the envelope is structuredContent', async () => {
+    plane.routes.set('GET /categories/tree', () => ok(TREE, { untrusted: ['yaml'] }));
+    const { host: h } = host(plane);
+    const res = await h.handleCallTool('ff_get_category_tree', {});
+    assert.equal(res.isError, undefined);
+    assert.equal(res.content.length, 1);
+    const text = res.content[0]?.text ?? '';
+    const [header, ...rest] = text.split('\n');
+    assert.match(header ?? '', /^# firefly_iii · administration: Household \(id 1\) · asOf 2026-09-21T18:41:02\.118Z$/);
+    assert.equal(rest.join('\n'), YAML, 'the document is the plane\'s, byte for byte');
+    const env = res.structuredContent as Record<string, unknown>;
+    assert.equal(env.ok, true);
+    assert.equal(env.tool, 'ff_get_category_tree');
+    assert.deepEqual(env.data, TREE);
+    assert.equal((env.meta as Record<string, unknown>).administrationName, 'Household');
+    assert.equal(plane.calls.length, 1);
+    assert.equal(plane.calls[0]?.path, '/categories/tree');
+  });
+
+  it('ff_get_category_tree: a failure is the ordinary JSON envelope, never YAML', async () => {
+    plane.routes.set('GET /categories/tree', () => failure(503, 'not_ready', 'Firefly III is not running.', 'ffx up'));
+    const { host: h } = host(plane);
+    const res = await h.handleCallTool('ff_get_category_tree', {});
+    assert.equal(res.isError, true);
+    assert.equal(res.structuredContent, undefined);
+    assert.equal((JSON.parse(res.content[0]?.text ?? '{}') as { ok: boolean }).ok, false);
+  });
+
+  it('ff_categorize_imported_transactions: sends the assignments as given, dry run first, create_missing only when asked', async () => {
+    plane.routes.set('POST /transactions/categorize-by-import', writeRoute({ updated: 1, unmatched: 1 }, { unknown_categories: ['Food > Snacks'] }));
+    const { host: h } = host(plane, WRITE_ON);
+    const assignments = [
+      { account: 'Northbank Checking 4021', import_id: 'ofx:4021:20260903001', category: 'Food > Groceries' },
+      { account: 7, import_id: 'ff1:4021:20260904:18.00:0:ab12cd34', category: 13 },
+    ];
+    const r = await call(h, 'ff_categorize_imported_transactions', { assignments });
+    assert.equal(r.isError, false, r.raw);
+    const body = plane.calls[0]?.body as Record<string, unknown>;
+    assert.deepEqual(body.assignments, assignments);
+    assert.equal(body.dry_run, true);
+    assert.equal('create_missing' in body, false);
+    assert.deepEqual((r.envelope.data as Record<string, unknown>).unknown_categories, ['Food > Snacks']);
+
+    const refused = await call(h, 'ff_categorize_imported_transactions', { assignments, dry_run: false });
+    assert.equal(errorOf(refused).code, 'confirm_required');
+    assert.equal(plane.calls.length, 1, 'nothing sent without the echo');
+
+    const applied = await call(h, 'ff_categorize_imported_transactions', { assignments, create_missing: true, dry_run: false, confirm: TEST_TOKEN });
+    assert.equal(applied.isError, false, applied.raw);
+    const sent = plane.calls[1]?.body as Record<string, unknown>;
+    assert.equal(sent.create_missing, true);
+    assert.equal(sent.confirm_token, TEST_TOKEN);
+  });
+
+  it('ff_categorize_imported_transactions: an assignment missing its import id, or with an extra field, never reaches the plane', async () => {
+    const { host: h } = host(plane, WRITE_ON);
+    const missing = await call(h, 'ff_categorize_imported_transactions', { assignments: [{ account: 7, category: 'Food > Groceries' }] });
+    assert.equal(errorOf(missing).code, 'invalid_input');
+    const extra = await call(h, 'ff_categorize_imported_transactions', { assignments: [{ account: 7, import_id: 'ofx:4021:1', category: 13, payee: 'x' }] });
+    assert.equal(errorOf(extra).code, 'invalid_input');
+    const empty = await call(h, 'ff_categorize_imported_transactions', { assignments: [] });
+    assert.equal(errorOf(empty).code, 'invalid_input');
+    assert.equal(plane.calls.length, 0);
   });
 });
 

@@ -4,7 +4,7 @@ The spec is [`../pm/mcp.mdx`](../pm/mcp.mdx). The API it calls is [`../pm/apis.m
 instructions it sends at `initialize` come from [`../ai/mcp_prompt_firefly.md`](../ai/mcp_prompt_firefly.md).
 
 This is a stdio MCP server that exposes the operator's own Firefly III books to Claude Code as
-**77 typed tools**, all named `ff_*`. **59 of them read** and **18 write**. It computes nothing.
+**79 typed tools**, all named `ff_*`. **60 of them read** and **19 write**. It computes nothing.
 Each tool validates its arguments, makes one authenticated call to the machine plane at
 `http://127.0.0.1:7373/machine/v1/*`, and returns Firefly's answer inside a fixed envelope.
 

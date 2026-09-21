@@ -1,7 +1,7 @@
 /**
  * The read families that describe the ledger as it is — pm/mcp.mdx §9.5:
- * Orientation (4), Accounts (4), Transactions (4), Budgets and categories (7),
- * Reference data (7). Twenty-six tools, every one read-only, every one ONE
+ * Orientation (4), Accounts (4), Transactions (4), Budgets and categories (8),
+ * Reference data (7). Twenty-seven tools, every one read-only, every one ONE
  * route in apis.mdx §8.
  */
 import { at, bool, choice, date, id, ids, limit, numericId, offset, order, str, amount, tool } from './tool.js';
@@ -236,6 +236,19 @@ const budgets: ToolDef[] = [
     what: 'One Firefly III category with what was spent and earned in it over a range, per currency.',
     instead: 'For every category at once use ff_spending_by_category.',
     untrusted: NAME_UNTRUSTED,
+  }),
+  tool({
+    name: 'ff_get_category_tree',
+    tier: 'read',
+    route: { method: 'GET', path: '/categories/tree' },
+    what: 'Every Firefly III category as the two-level tree Firefly computes from the "Group > Sub" naming convention (a category named "Food > Groceries" is subcategory Groceries of group Food; a name with no " > " is a group; a group with id null exists only as a prefix), returned as the server\'s YAML document, with the structured tree beside it.',
+    instead: 'Read it BEFORE categorising — with ff_categorize_transactions or ff_categorize_imported_transactions — and pick a full_name (or id) from it; use ff_list_categories instead to search by part of a name.',
+    extra: 'Assign the FULL name ("Food > Groceries"), never the bare subcategory; a category the tree does not contain does not exist — ask the operator rather than inventing one.',
+    untrusted: ['name', 'full_name', 'yaml'],
+    text: (data) => {
+      const yaml = (data as { yaml?: unknown } | null)?.yaml;
+      return typeof yaml === 'string' ? yaml : undefined;
+    },
   }),
 ];
 

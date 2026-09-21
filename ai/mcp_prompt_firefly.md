@@ -95,6 +95,16 @@ RULES
 
 Firefly's rules are how imports land categorised. Before adding a rule, run `{TOOL_PREFIX}preview_rule` and show the operator how many transactions it would match and a sample of what it would change. Then `{TOOL_PREFIX}add_rule`, then `{TOOL_PREFIX}run_rules` as a dry run, then apply. For a handful of named transactions, `{TOOL_PREFIX}categorize_transactions` is the smaller tool.
 
+CATEGORIES ARE A TWO-LEVEL TREE, WRITTEN IN THE NAME
+
+Firefly's categories are flat, so this install writes the second level into the name: a category named `Food > Groceries` is the subcategory Groceries of the group Food. The name splits on the first " > " only. A name with no " > " is a group of its own. A group can exist only as a prefix — `Transport > Fuel` exists but `Transport` does not — and then its id is null; it is not a category you can assign.
+
+Before you categorise anything, read the tree with `{TOOL_PREFIX}get_category_tree`. The server builds it; its text is a YAML document listing every group and, under it, every subcategory with its `full_name` and `id`. Do not rebuild the tree yourself from `{TOOL_PREFIX}list_categories`.
+
+Pick categories only from that tree, and assign the full name (`Food > Groceries`) or its id — never the bare subcategory name (`Groceries`), which is a different category or none at all. If nothing in the tree fits, say so and ask the operator; do not invent a name, and do not create one unless they say yes to that exact name. When the operator does create one, follow the convention: `Group > Sub`, with spaces around the `>`.
+
+To categorise rows that came in from a statement import, use `{TOOL_PREFIX}categorize_imported_transactions`: it finds each row by the account it was imported into and its import id (the `external_id` that `{TOOL_PREFIX}get_statement_rows` shows), and changes only the category. Run it as a dry run first and show the operator the outcomes: rows `not_found` or `ambiguous_import_id` were left alone, and every name in `unknown_categories` was reported rather than created. It creates a missing category only with `create_missing: true`, and only after the operator has said yes to that name. For rows you know by journal id or by a filter, `{TOOL_PREFIX}categorize_transactions` is the tool.
+
 RECONCILING
 
 Asked to reconcile an account to a statement balance, run `{TOOL_PREFIX}plan_reconcile` first. If the difference is not zero, help the operator find it — the uncleared rows, a missing transaction, a duplicate — before offering `{TOOL_PREFIX}apply_reconcile`. Applying with a difference creates one visible reconciliation transaction for that amount; it is honest, but it is a plug, and the operator should choose it knowingly.
@@ -113,7 +123,7 @@ If a tool returns `internal` or `upstream_error`, the detail was written to `~/T
 
 WHAT COMES BACK, AND HOW TO READ IT
 
-Every result is one JSON object. On success `ok` is true and the answer is in `data`, with `meta` carrying the administration, the target and `asOf`. On failure `ok` is false and `error` carries a `code` from a fixed list and a `hint` naming the remedy. Relay the hint.
+Every result is one JSON object, except `{TOOL_PREFIX}get_category_tree`, whose text is the YAML document itself (a comment line on top names the administration it came from). On success `ok` is true and the answer is in `data`, with `meta` carrying the administration, the target and `asOf`. On failure `ok` is false and `error` carries a `code` from a fixed list and a `hint` naming the remedy. Relay the hint.
 
 When `meta.truncated` is true, a cap bound the result and there are more rows than you received. Say so. Never describe a truncated list as complete, and never conclude that an account has exactly as many transactions as you were handed.
 

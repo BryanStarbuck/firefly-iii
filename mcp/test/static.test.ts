@@ -112,7 +112,7 @@ describe('the instructions pipeline', () => {
     assert.doesNotMatch(INSTRUCTIONS, /\{[A-Z_]+\}/);
     assert.doesNotMatch(INSTRUCTIONS, /\/Users\//);
     assert.doesNotMatch(INSTRUCTIONS, /\b[0-9a-f]{32,}\b/i);
-    assert.match(INSTRUCTIONS, /There are 77 of them: 59 read and 18 write\./);
+    assert.match(INSTRUCTIONS, /There are 79 of them: 60 read and 19 write\./);
     assert.match(INSTRUCTIONS, /~\/\.credentials\/firefly_iii\.json/);
   });
 });

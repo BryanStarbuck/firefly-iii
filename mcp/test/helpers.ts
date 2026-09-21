@@ -212,12 +212,17 @@ export interface ToolReply {
   isError: boolean;
   envelope: Record<string, unknown>;
   raw: string;
+  /** Set only for a document-shaped tool (§12.1): the text block, when the envelope is structuredContent. */
+  document?: string;
 }
 
 export async function call(h: McpServerHost, name: string, args: unknown = {}): Promise<ToolReply> {
   const res = await h.handleCallTool(name, args);
   if (res.content.length !== 1 || res.content[0]?.type !== 'text') throw new Error('expected one text block');
   const raw = res.content[0].text;
+  if (res.structuredContent !== undefined) {
+    return { isError: res.isError === true, envelope: res.structuredContent, raw: JSON.stringify(res.structuredContent, null, 2), document: raw };
+  }
   return { isError: res.isError === true, envelope: JSON.parse(raw) as Record<string, unknown>, raw };
 }
 

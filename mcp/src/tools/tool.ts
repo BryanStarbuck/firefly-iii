@@ -79,14 +79,20 @@ export interface ToolDef {
   refine: ((args: Record<string, unknown>) => void) | undefined;
   /** Concrete route for a call; the default fills {placeholders} from path params. */
   resolvePath: (args: Record<string, unknown>) => string;
+  /**
+   * The document-shaped exception (§12.1): picks, from the plane's `data`, the string that becomes
+   * the text content on success (ff_get_category_tree → `data.yaml`); the envelope then rides as
+   * structuredContent. It only CHOOSES one of the plane's renderings — it never builds one.
+   */
+  text: ((data: unknown) => string | undefined) | undefined;
 }
 
 // ------------------------------------------------------------ the clauses ---
 
-/** Clause 2 for the fifty-nine read tools (§9.2). */
+/** Clause 2 for the sixty read tools (§9.2). */
 export const READS_ONLY = 'Reads only.';
 
-/** Clause 2 for the eighteen write tools (§9.2), verbatim. */
+/** Clause 2 for the nineteen write tools (§9.2), verbatim. */
 export const WRITES =
   "WRITES to the operator's real Firefly III ledger. Dry run by default; applying needs the confirm token from the dry run.";
 
@@ -387,6 +393,7 @@ export interface ToolInput {
   fixedQuery?: Record<string, string | boolean>;
   refine?: (args: Record<string, unknown>) => void;
   resolvePath?: (args: Record<string, unknown>) => string;
+  text?: (data: unknown) => string | undefined;
 }
 
 function defaultResolvePath(pattern: string): (args: Record<string, unknown>) => string {
@@ -462,6 +469,7 @@ export function tool(t: ToolInput): ToolDef {
     zod: z.strictObject(shape),
     refine: t.refine,
     resolvePath: t.resolvePath ?? defaultResolvePath(t.route.path),
+    text: t.text,
   };
 }
 

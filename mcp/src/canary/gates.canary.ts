@@ -1,6 +1,6 @@
 /**
  * T1 / T2 / T16 — money moved, a silent large write, admin from an agent.
- * The write tier's shape, checked on the one array: 18 writes; 16 dry-run by
+ * The write tier's shape, checked on the one array: 19 writes; 17 dry-run by
  * default with a confirm echo and a ceiling; ff_undo and ff_trigger_recurrence
  * with no dry_run; no delete, purge, destroy, rotate or admin tool of anything.
  */
@@ -16,7 +16,7 @@ export const canary: Canary = {
   check(ctx) {
     const problems: string[] = [];
     const writes = ctx.tools.filter((t) => t.tier === 'write');
-    if (writes.length !== 18) problems.push(`expected 18 write tools, found ${writes.length}`);
+    if (writes.length !== 19) problems.push(`expected 19 write tools, found ${writes.length}`);
     for (const t of ctx.tools) {
       if (FORBIDDEN_NAME.test(t.name)) problems.push(`${t.name}: a name this catalogue must never have`);
       if (t.tier === 'write' && !t.write) problems.push(`${t.name}: write tier with no write spec`);

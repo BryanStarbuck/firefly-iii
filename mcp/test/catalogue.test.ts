@@ -82,11 +82,11 @@ function leaves(schema: Record<string, unknown>, where = ''): Array<{ where: str
 const MONEY_FIELD = /(^|\.)(amount|min_amount|max_amount|foreign_amount|min_spent|target_balance)$/;
 
 describe('the catalogue', () => {
-  it('has 77 tools: 59 read, 18 write', () => {
-    assert.equal(TOTAL_TOOLS, 77);
-    assert.equal(READ_TOOLS, 59);
-    assert.equal(WRITE_TOOL_COUNT, 18);
-    assert.equal(new Set(TOOLS.map((t) => t.name)).size, 77, 'names are unique');
+  it('has 79 tools: 60 read, 19 write', () => {
+    assert.equal(TOTAL_TOOLS, 79);
+    assert.equal(READ_TOOLS, 60);
+    assert.equal(WRITE_TOOL_COUNT, 19);
+    assert.equal(new Set(TOOLS.map((t) => t.name)).size, 79, 'names are unique');
   });
 
   it('the counts the instructions quote are the registry\'s counts', () => {
@@ -97,7 +97,7 @@ describe('the catalogue', () => {
 
   it('is exactly the §9.5 tables, both directions, route for route', () => {
     const spec = specCatalogue();
-    assert.equal(spec.size, 77, 'the spec tables parse to 77 tools');
+    assert.equal(spec.size, 79, 'the spec tables parse to 79 tools');
     assert.deepEqual([...spec.keys()].sort(), TOOLS.map((t) => t.name).sort());
     for (const t of TOOLS) {
       const want = (spec.get(t.name) as string).replace('?without_category=true', '').replace(/ · .*$/, '');
@@ -169,10 +169,10 @@ describe('the catalogue', () => {
     }
   });
 
-  it('gives sixteen writes dry_run and a confirm echo, and ff_undo / ff_trigger_recurrence no dry_run', () => {
+  it('gives seventeen writes dry_run and a confirm echo, and ff_undo / ff_trigger_recurrence no dry_run', () => {
     const writes = TOOLS.filter((t) => t.tier === 'write');
     const withDryRun = writes.filter((t) => 'dry_run' in (t.inputSchema.properties as object));
-    assert.equal(withDryRun.length, 16);
+    assert.equal(withDryRun.length, 17);
     for (const name of ['ff_undo', 'ff_trigger_recurrence']) {
       const t = findTool(name) as ToolDef;
       assert.ok(!('dry_run' in (t.inputSchema.properties as object)), `${name} offers dry_run`);

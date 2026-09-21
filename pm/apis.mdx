@@ -337,8 +337,8 @@ firefly-iii/
 │   │       ├── PlannedController.php      declared-but-unbuilt routes (§6.3a)
 │   │       ├── AdministrationController.php
 │   │       ├── AccountController.php      accounts, reconcile
-│   │       ├── TransactionController.php  groups, journals, splits, convert, links, bulk
-│   │       ├── CategoryController.php
+│   │       ├── TransactionController.php  groups, journals, splits, convert, links, bulk, categorize-by-import
+│   │       ├── CategoryController.php     categories, merge, the tree (§8.4a)
 │   │       ├── BudgetController.php       budgets, limits, available budgets, the budget period
 │   │       ├── SubscriptionController.php bills / subscriptions
 │   │       ├── PiggyBankController.php
@@ -352,6 +352,7 @@ firefly-iii/
 │   │       ├── MirrorController.php       §8.12 read-only /api/v1 passthrough
 │   │       ├── UndoController.php         §7.5
 │   │       └── AdminController.php        the destructive tier
+│   ├── Categories/CategoryTree.php        the "Group > Sub" tree and its YAML document (§8.4a)
 │   ├── Validation/                        gate 5 — one validator class per route
 │   ├── Confirm/ConfirmTokens.php          gate 6 — plan tokens, ceilings
 │   ├── DryRun.php                         the rolled-back-transaction harness (§7.2)
@@ -1179,6 +1180,7 @@ tags, notes, bill, piggy bank and metadata. Amounts are **positive**; direction 
 | `/transactions/{group_id}/clone`            | POST   | W     | `date`, `dry_run` — the UI's "clone"                                                                                                                                                                                                                  |
 | `/transactions/bulk`                        | POST   | W     | `journal_ids[]` \| `filter{}`, `set{ category_id?, budget_id?, tags_add[]?, tags_remove[]?, tags_replace[]? }`, `max_changes`, `dry_run` — the UI's bulk edit (`TransactionController@update` under `/api/v1/data/bulk`)                             |
 | `/transactions/categorize`                  | POST   | W     | `journal_ids[]` \| `filter{}`, `category_id` \| `category_name`, `max_changes`, `dry_run`                                                                                                                                                              |
+| `/transactions/categorize-by-import`        | POST   | W     | `assignments[]{account, import_id, category}`, `create_missing` (false), `max_changes`, `dry_run` — categories for rows ALREADY imported, keyed by account + import id (the row's `external_id`, §11.5); unknown categories are reported, not created |
 | `/transactions/set-budget`                  | POST   | W     | `journal_ids[]` \| `filter{}`, `budget_id` \| `null`, `max_changes`, `dry_run`                                                                                                                                                                         |
 | `/transaction-links`                        | POST   | W     | `link_type_id`, `inward_id`, `outward_id`, `notes`                                                                                                                                                                                                    |
 | `/transaction-links/{id}`                   | DELETE | W     | — (a link is metadata; the transactions survive)                                                                                                                                                                                                      |
@@ -1202,6 +1204,23 @@ Notes that matter:
 - **Splits go through `transactions[]` on the group**, never as separate groups. Firefly owns the
   invariants — every split in a group shares a type, and a transfer's splits share accounts — and
   its validators enforce them.
+- **`categorize-by-import` finds rows by the id the import stamped on them**, so an agent that
+  read a statement row (`GET /ingest/rows` shows its `external_id`: `ofx:{last4}:{FITID}` or
+  `ff1:…`, §11.5) can categorise the transaction it became without first searching for its group
+  id. `account` is the Firefly account (id or exact name) the row was imported into; `import_id`
+  must be the `external_id` journal meta of a **live** journal with a live transaction on that
+  account. `category` is an id or a name, resolved like every name (§14.4) — `"Food > Groceries"`
+  is one Firefly category (§8.4a). Only the category changes, through the same `BulkEditor` path
+  as `/transactions/categorize` (rules are not re-run). Nothing is guessed: every assignment comes
+  back in `results[]` with an `outcome` — `updated`, `unchanged`, `not_found` (no live journal
+  carries that import id on that account), `ambiguous_import_id` (more than one does; their
+  `journal_ids` are listed, none is touched), `unknown_account`, or `unknown_category` — and the
+  unmatched ones are counted as `changes.unmatched`, which is not a change. **An unknown category
+  name is reported in `unknown_categories[]` and its rows are left alone**; only
+  `create_missing: true` creates it, the way the UI's bulk edit creates a typed name (and undo
+  removes it again). The same `(account, import_id)` given two different categories is
+  `invalid_input`; given twice with one category, it is one assignment. An ambiguous account or
+  category name is `invalid_input` with the candidates, as everywhere.
 - **Transfers are one row, not two.** A transfer is one journal with an asset source and an asset
   destination. A caller that creates a withdrawal from checking and a deposit into savings has
   created two unrelated transactions that double-count spending; the route's hint says so when both
@@ -1212,17 +1231,105 @@ Code: `~/BGit/Bryan_git/firefly-iii/app/Api/V1/Controllers/Models/Transaction/St
 Code: `~/BGit/Bryan_git/firefly-iii/app/Factory/TransactionGroupFactory.php` — `create()` (exists today; the engine)
 Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Controllers/TransactionController.php` — `store()`, `bulk()`, `convert()`
 
+Handles: categorising already-imported rows by account + import id, reporting (never creating) unknown categories.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Controllers/TransactionController.php` — `categorizeByImport()`, `journalsByImportId()`
+
 ### 8.4 Categories
 
 | Route                          | M      | Tier  | Arguments                                    |
 | ------------------------------ | ------ | ----- | -------------------------------------------- |
 | `/categories`                  | GET    | R     | `search`                                     |
+| `/categories/tree`             | GET    | R     | `format` (`json` \| `yaml`) — every category as the "Group > Sub" tree, plus the same tree as YAML (§8.4a) |
 | `/categories/{id}`             | GET    | R     | `start`, `end` — with spent/earned in range, per currency |
 | `/categories/{id}/transactions`| GET    | R     | `start`, `end`, `limit`, `offset`            |
 | `/categories`                  | POST   | W     | `name`, `notes`, `dry_run`                   |
 | `/categories/{id}`             | PUT    | W     | `name`, `notes`, `dry_run`                   |
 | `/categories/merge`            | POST   | W     | `keep_id`, `merge_ids[]`, `dry_run` — re-points every journal, then removes the merged categories |
 | `/categories/{id}`             | DELETE | **A** | `confirm_token` — journals keep their amounts and lose the category |
+
+### 8.4a The category tree — the "Group > Sub" convention (LOCKED)
+
+Firefly III categories are **flat**: a category has a name and nothing else — no parent, no type,
+no hidden flag. The sister apps have two levels (ezBookkeeping's primary and secondary
+categories, Actual Budget's category groups), and one agent works across all three, so this fork
+carries the second level **in the name**:
+
+- A category named **`Group > Sub`** — split on the **first** `" > "` (space, `>`, space) — is
+  subcategory `Sub` of group `Group`. `Home > Repairs > Plumbing` is subcategory
+  `Repairs > Plumbing` of `Home`; there is no third level.
+- A name with **no** `" > "` is a group of its own. `Food>Snacks` (no spaces) does not split, and
+  neither does a name with a blank side (`Food > `, ` > Groceries`) — it is a group named as written.
+- If both `Food` and `Food > Groceries` exist, **`Food` is the group's own id**. If only
+  `Food > Groceries` exists, the group `Food` exists only as a prefix and its `id` is **`null`**.
+- The full name is the category. Assigning `"Food > Groceries"` to a transaction is assigning that
+  one Firefly category; the plane never creates a missing parent, and renaming a group means
+  renaming each `Group > …` category (`PUT /categories/{id}`).
+
+`GET /categories/tree` computes the tree **on the server**, from every category of the bound
+administration; the CLI and the MCP print it and never assemble it themselves. Groups are sorted
+by name (case-insensitively, then byte order), and so are the subcategories inside each group.
+
+```json
+{
+  "ok": true,
+  "data": {
+    "app": "firefly_iii",
+    "counts": { "groups": 2, "subcategories": 3 },
+    "groups": [
+      { "name": "Food", "id": "12", "subcategories": [
+        { "name": "Dining Out", "full_name": "Food > Dining Out", "id": "14" },
+        { "name": "Groceries",  "full_name": "Food > Groceries",  "id": "13" } ] },
+      { "name": "Transport", "id": null, "subcategories": [
+        { "name": "Fuel", "full_name": "Transport > Fuel", "id": "21" } ] }
+    ],
+    "yaml": "app: firefly_iii\ngenerated_at: 2026-09-21T22:00:00Z\n…"
+  },
+  "meta": { "untrusted": ["groups[].name", "groups[].subcategories[].name", "groups[].subcategories[].full_name", "yaml"], "…": "…" }
+}
+```
+
+**`data.yaml` is the same tree as one YAML document**, in the shape the three sister apps
+(ezBookkeeping, Actual Budget, Firefly III) share. Firefly has no category type or hidden flag, so
+those keys are **absent** rather than faked:
+
+```yaml
+app: firefly_iii
+generated_at: 2026-09-21T22:00:00Z
+counts:
+  groups: 2
+  subcategories: 3
+groups:
+  - name: Food
+    id: "12"
+    subcategories:
+      - name: Dining Out
+        full_name: Food > Dining Out
+        id: "14"
+      - name: Groceries
+        full_name: Food > Groceries
+        id: "13"
+  - name: Transport
+    id: null
+    subcategories:
+      - name: Fuel
+        full_name: Transport > Fuel
+        id: "21"
+```
+
+- Key order is fixed; ids are always quoted strings (`"12"`), a prefix-only group is `id: null`,
+  an empty list is `[]`, `generated_at` is UTC to the second.
+- A name stays plain only when no YAML reader could misread it (starts with a letter; letters,
+  digits, spaces and `_ . , ( ) / ' + - >` only; not `yes`/`no`/`on`/`off`/`true`/`false`/`null`).
+  Anything else — `Tax: 2026`, `Bills & Utilities`, `Gifts #1`, `2026`, a leading `-` or `*` — is
+  double-quoted with JSON escapes. The plane writes the document itself (the fork adds no
+  Composer dependency; `symfony/yaml` is not in `vendor/`), and the tests pin the quoting.
+- **`format=yaml`** is for curl and the CLI. The plane always answers JSON (§5.1), so it keeps the
+  envelope and carries only the document: `data = { app, format: "yaml", counts, yaml }`. Print
+  `data.yaml` (`ffx categories tree` does).
+
+Handles: the "Group > Sub" split, the tree, and its YAML document.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Categories/CategoryTree.php` — `CategoryTree::split()`, `build()`, `yaml()`, `scalar()`
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Controllers/CategoryController.php` — `tree()`
 
 ### 8.5 Budgets — limits, available money, and the budget period
 

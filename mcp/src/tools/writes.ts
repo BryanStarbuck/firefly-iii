@@ -1,11 +1,11 @@
 /**
- * The write tier (18, off by default) — pm/mcp.mdx §9.5, §9.7; apis.mdx §7.
+ * The write tier (19, off by default) — pm/mcp.mdx §9.5, §9.7; apis.mdx §7.
  *
  * Before one transaction changes: the plane's write tier is on
  * (FIREFLY_MACHINE_ALLOW_WRITE=1), this server's is on (FFMCP_ALLOW_WRITE=1),
  * and the call carries dry_run: false plus a `confirm` echoing the token the
  * dry run (or the matching plan_/preview_ tool) returned — under a ceiling.
- * Sixteen default dry_run to true; ff_undo and ff_trigger_recurrence have no
+ * Seventeen default dry_run to true; ff_undo and ff_trigger_recurrence have no
  * dry_run at all, and their schemas do not offer one.
  *
  * There is no delete tool of anything, no tool that marks a duplicate, and
@@ -149,6 +149,31 @@ const writes: ToolDef[] = [
     what: 'Sets one category on named journals, or on every journal a filter selects, under a ceiling.',
     instead: 'For a pattern that will recur (every Whole Foods row), author a rule instead: ff_preview_rule, then ff_add_rule, then ff_run_rules.',
     extra: ONE_AT_A_TIME,
+  }),
+  tool({
+    name: 'ff_categorize_imported_transactions',
+    tier: 'write',
+    route: { method: 'POST', path: '/transactions/categorize-by-import' },
+    params: {
+      assignments: at.required(
+        at.body(
+          array(
+            'One entry per imported row: which account it was imported into, its import id, and the category to give it.',
+            object('One imported row and its category.', {
+              account: at.required(id('The Firefly account the row was imported into.')),
+              import_id: at.required(str('The row\'s import id — its external_id exactly as ff_get_statement_rows shows it (ofx:4021:… or ff1:4021:…).', { max: 255 })),
+              category: at.required(id('The category — its id, or its FULL name from ff_get_category_tree, e.g. "Food > Groceries".')),
+            }),
+            { min: 1, max: 5000 },
+          ),
+        ),
+      ),
+      create_missing: at.body(bool('true creates a category name that does not exist yet (the default, false, reports it in unknown_categories and leaves its rows alone). Only with the operator\'s explicit yes.')),
+    },
+    write: { sendsMaxChanges: true },
+    what: 'Sets categories on transactions ALREADY in the books, found by account + the import id the statement import stamped on each row; only the category changes, and every assignment comes back with an outcome (updated, unchanged, not_found, ambiguous_import_id, unknown_account, unknown_category).',
+    instead: 'Read ff_get_category_tree first and use only its names; for rows you know by journal id or a filter, use ff_categorize_transactions instead.',
+    extra: `An unknown category is reported, never invented — show unknown_categories to the operator. ${ONE_AT_A_TIME}`,
   }),
   tool({
     name: 'ff_set_transaction_budget',

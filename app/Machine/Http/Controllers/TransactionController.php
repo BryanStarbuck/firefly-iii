@@ -63,6 +63,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 
 /**
  * Transactions — apis.mdx §8.3. Firefly's unit of entry is the transaction GROUP (one or more
@@ -558,6 +559,167 @@ final class TransactionController extends MachineController
         return $this->bulkWrite($request, $args, ['category' => $this->categoryTarget($args, '')]);
     }
 
+    /**
+     * POST /transactions/categorize-by-import — categories for rows ALREADY in the books, keyed by
+     * account + the import id the statement pipeline stamped on each row (its `external_id`,
+     * §11.5: `ofx:{last4}:{FITID}` or `ff1:…`). assignments[{account, import_id, category}].
+     *
+     * Only the category changes — through BulkEditor, as the UI's bulk edit does — and nothing is
+     * ever created unless `create_missing: true`: an unknown category name is REPORTED
+     * (unknown_categories, outcome unknown_category) and its rows are left alone. An import id
+     * that is not on a live journal touching that account is `not_found`; one that is on more
+     * than one journal is `ambiguous_import_id` — never a guess.
+     */
+    public function categorizeByImport(Request $request): JsonResponse
+    {
+        $args        = $this->input($request, [
+            'assignments'             => ['required', 'array', 'min:1', 'max:5000'],
+            'assignments.*'           => ['array:account,import_id,category'],
+            'assignments.*.account'   => ['required'],
+            'assignments.*.import_id' => ['required', 'string', 'min:1', 'max:255'],
+            'assignments.*.category'  => ['required'],
+            'create_missing'          => ['sometimes', 'boolean'],
+        ]);
+        $createNew   = (bool) ($args['create_missing'] ?? false);
+        $assignments = [];
+        $seen        = [];
+        foreach ((array) $args['assignments'] as $i => $a) {
+            foreach (['account', 'category'] as $field) {
+                if ((!is_string($a[$field]) && !is_int($a[$field])) || '' === trim((string) $a[$field]) || strlen((string) $a[$field]) > 255) {
+                    throw MachineException::invalid(sprintf('assignments.%d.%s must be an id or a name.', $i, $field), 'Send {"account": "Northbank Checking 4021", "import_id": "ofx:4021:20260903001", "category": "Food > Groceries"}', ['field' => sprintf('assignments.%d.%s', $i, $field)]);
+                }
+            }
+            $row = ['account' => trim((string) $a['account']), 'import_id' => trim((string) $a['import_id']), 'category' => trim((string) $a['category'])];
+            $key = $row['account']."\0".$row['import_id'];
+            if (array_key_exists($key, $seen)) {
+                if ($seen[$key] !== $row['category']) {
+                    throw MachineException::invalid(sprintf('Import id "%s" on account "%s" is assigned two categories.', $row['import_id'], $row['account']), 'Give each (account, import_id) one category', ['import_id' => $row['import_id'], 'categories' => [$seen[$key], $row['category']]]);
+                }
+
+                continue; // the same assignment twice is one assignment
+            }
+            $seen[$key]    = $row['category'];
+            $assignments[] = $row;
+        }
+
+        // accounts and categories resolve ONCE, before the write: an unknown one is reported per
+        // row; an ambiguous name refuses the call with the candidates (never a silent pick)
+        $accounts    = [];
+        foreach (array_unique(array_column($assignments, 'account')) as $ref) {
+            try {
+                $accounts[$ref] = (int) $this->resolve(Account::class, $ref)->id;
+            } catch (MachineException $e) {
+                if ('not_found' !== $e->code()) {
+                    throw $e;
+                }
+                $accounts[$ref] = null;
+            }
+        }
+        $categories  = [];
+        $unknown     = [];
+        foreach (array_unique(array_column($assignments, 'category')) as $ref) {
+            try {
+                /** @var Category $category */
+                $category         = $this->finder()(Category::class, 1 === preg_match('/^\d{1,19}$/', $ref) ? $ref : TransactionFilter::nameRef($ref), 'name');
+                $categories[$ref] = ['id' => (int) $category->id, 'name' => $category->name];
+            } catch (MachineException $e) {
+                if ('not_found' !== $e->code()) {
+                    throw $e;
+                }
+                $categories[$ref] = $createNew && 1 !== preg_match('/^\d{1,19}$/', $ref) ? ['id' => null, 'name' => $ref] : null;
+                $unknown[]        = $ref;
+            }
+        }
+        $admin       = $this->administration();
+        $ceiling     = max(0, intval($args['max_changes'] ?? config('machine.limits.max_changes_default', 200)));
+        $matches     = $this->journalsByImportId($assignments, $accounts);
+
+        return $this->write($request, $args, function (bool $dryRun) use ($assignments, $accounts, $categories, $unknown, $createNew, $matches, $admin, $ceiling): WriteResult {
+            $results   = [];
+            $byTarget  = [];
+            $counts    = ['not_found' => 0, 'ambiguous_import_id' => 0, 'unknown_category' => 0, 'unknown_account' => 0];
+            foreach ($assignments as $i => $a) {
+                $key            = ($accounts[$a['account']] ?? 0).'|'.$a['import_id'];
+                $found          = $matches[$key] ?? [];
+                $row            = $a;
+                $row['outcome'] = match (true) {
+                    null === $accounts[$a['account']]    => 'unknown_account',
+                    null === $categories[$a['category']] => 'unknown_category',
+                    0 === count($found)                  => 'not_found',
+                    count($found) > 1                    => 'ambiguous_import_id',
+                    default                              => 'pending',
+                };
+                $results[$i]    = $row;
+                if ('pending' !== $row['outcome']) {
+                    ++$counts[$row['outcome']];
+                    if ('ambiguous_import_id' === $row['outcome']) {
+                        $results[$i]['journal_ids'] = array_map('strval', $found);
+                    }
+
+                    continue;
+                }
+                $target                                              = $categories[$a['category']];
+                $byTarget[$target['id'] ?? 'new:'.$target['name']][] = [$i, $found[0]];
+            }
+
+            $journalIds = [];
+            foreach ($byTarget as $pairs) {
+                foreach ($pairs as [, $journalId]) {
+                    $journalIds[] = $journalId;
+                }
+            }
+            $groupIds   = TransactionJournal::query()->where('user_group_id', $admin->id)->whereIn('id', $journalIds)->pluck('transaction_group_id')->map(static fn ($id): int => (int) $id)->unique()->values()->all();
+            $watermark  = Snapshot::watermark();
+            $before     = Snapshot::capture($groupIds);
+            $result     = new WriteResult();
+            $applied    = 0;
+            foreach ($byTarget as $pairs) {
+                $target   = $categories[$assignments[$pairs[0][0]]['category']];
+                $journals = TransactionJournal::query()->where('user_group_id', $admin->id)->whereIn('id', array_column($pairs, 1))->orderBy('date')->orderBy('id')->get();
+                $outcome  = BulkEditor::apply($journals, ['category' => $target], $dryRun ? max(0, $ceiling - $applied) : null);
+                $applied += $outcome['applied'];
+                $rows     = [];
+                foreach ($outcome['affected'] as $affected) {
+                    $rows[(int) $affected['journal_id']] = $affected;
+                }
+                foreach ($outcome['changes'] as $kind => $n) {
+                    $result->count($kind, $n);
+                }
+                foreach ($pairs as [$i, $journalId]) {
+                    $row                           = $rows[$journalId] ?? [];
+                    $results[$i]['outcome']        = (string) ($row['outcome'] ?? 'updated');
+                    $results[$i]['journal_id']     = (string) $journalId;
+                    $results[$i]['group_id']       = $row['group_id'] ?? null;
+                    $results[$i]['date']           = $row['date'] ?? null;
+                    $results[$i]['description']    = $row['description'] ?? null;
+                    $results[$i]['amount']         = $row['amount'] ?? null;
+                    $results[$i]['currency_code']  = $row['currency_code'] ?? null;
+                    $results[$i]['category_name']  = $row['category_name'] ?? null;
+                    $results[$i]['new_category_name'] = $target['name'];
+                }
+            }
+            $side       = Snapshot::record($result, $before, Snapshot::capture($groupIds), $watermark, $admin);
+            $this->countSide($result, $side);
+            if (array_sum($counts) > 0) {
+                $result->count('unmatched', array_sum($counts)); // reported, never changed
+            }
+            $result->basis = ['assignments' => $assignments, 'journal_ids' => $journalIds, 'create_missing' => $createNew];
+            ksort($results);
+            $list      = array_values($results);
+
+            return $result->with([
+                'assignments'          => count($assignments),
+                'matched'              => count($journalIds),
+                'outcomes'             => array_filter($counts),
+                'unknown_categories'   => $unknown,
+                'create_missing'       => $createNew,
+                'results'              => array_slice($list, 0, BulkEditor::AFFECTED_ROWS),
+                'results_truncated'    => count($list) > BulkEditor::AFFECTED_ROWS,
+                'created_alongside'    => $side,
+            ]);
+        });
+    }
+
     /** POST /transactions/set-budget — one budget (or none) on many journals (ids or a filter). */
     public function setBudget(Request $request): JsonResponse
     {
@@ -790,6 +952,52 @@ final class TransactionController extends MachineController
                 'created_alongside'  => $side,
             ]);
         });
+    }
+
+    /**
+     * The live journals each (account, import id) names: journal meta `external_id` equal to the
+     * import id, on a journal of this administration with a live transaction on that account.
+     * Keyed "{account_id}|{import_id}"; more than one id under a key is reported, never picked.
+     *
+     * @param list<array{account: string, import_id: string, category: string}> $assignments
+     * @param array<string, null|int>                                           $accounts account ref => id (null: unknown)
+     *
+     * @return array<string, list<int>>
+     */
+    private function journalsByImportId(array $assignments, array $accounts): array
+    {
+        $accountIds = array_values(array_unique(array_filter($accounts, static fn (?int $id): bool => null !== $id)));
+        $importIds  = array_values(array_unique(array_column($assignments, 'import_id')));
+        $found      = [];
+        if ([] === $accountIds) {
+            return $found;
+        }
+        foreach (array_chunk($importIds, 500) as $chunk) {
+            $rows = DB::table('journal_meta')
+                ->join('transaction_journals', 'transaction_journals.id', '=', 'journal_meta.transaction_journal_id')
+                ->join('transactions', 'transactions.transaction_journal_id', '=', 'transaction_journals.id')
+                ->where('journal_meta.name', 'external_id')
+                ->whereIn('journal_meta.data', array_map(static fn (string $id): string => (string) json_encode($id), $chunk))
+                ->whereIn('transactions.account_id', $accountIds)
+                ->where('transaction_journals.user_group_id', (int) $this->administration()->id)
+                ->whereNull('journal_meta.deleted_at')
+                ->whereNull('transaction_journals.deleted_at')
+                ->whereNull('transactions.deleted_at')
+                ->distinct()
+                ->get(['journal_meta.transaction_journal_id', 'journal_meta.data', 'transactions.account_id'])
+            ;
+            foreach ($rows as $row) {
+                $key           = (int) $row->account_id.'|'.(string) json_decode((string) $row->data, true);
+                $found[$key][] = (int) $row->transaction_journal_id;
+            }
+        }
+        foreach ($found as $key => $ids) {
+            $ids = array_values(array_unique($ids));
+            sort($ids);
+            $found[$key] = $ids;
+        }
+
+        return $found;
     }
 
     /**

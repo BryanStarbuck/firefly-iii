@@ -12,9 +12,9 @@
 export const PROMPT_TOKENS: Readonly<Record<string, string>> = Object.freeze({
   SERVER_KEY: 'firefly_iii',
   TOOL_PREFIX: 'ff_',
-  TOTAL_TOOLS: '77',
-  READ_TOOLS: '59',
-  WRITE_TOOLS: '18',
+  TOTAL_TOOLS: '79',
+  READ_TOOLS: '60',
+  WRITE_TOOLS: '19',
   CLI_BINARY: 'ffx',
   API_URL: 'http://127.0.0.1:7373',
   CREDENTIALS_FILE: '~/.credentials/firefly_iii.json',

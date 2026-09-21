@@ -26,6 +26,7 @@ namespace FireflyIII\Machine\Http\Controllers;
 
 use Carbon\Carbon;
 use Closure;
+use FireflyIII\Machine\Categories\CategoryTree;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Money;
 use FireflyIII\Machine\Transactions\GroupRenderer;
@@ -84,6 +85,28 @@ final class CategoryController extends MachineController
         $rows   = $this->applyList($query->select('categories.*'), $params, 'categories.id');
 
         return $this->ok(['categories' => $this->render($rows)]);
+    }
+
+    /**
+     * GET /categories/tree — every category as the two-level "Group > Sub" tree (§8.4a), both as
+     * structure and as the YAML document the sister apps share. format=yaml keeps the envelope
+     * (a plane response is always JSON, §5.1) and carries only the document: data.yaml.
+     */
+    public function tree(Request $request): JsonResponse
+    {
+        $args   = $this->input($request, ['format' => ['sometimes', 'nullable', 'string', 'in:json,yaml']], true);
+        $format = (string) ($args['format'] ?? 'json');
+        $rows   = Category::query()->where('user_group_id', $this->administration()->id)->orderBy('id')->get(['id', 'name'])
+            ->map(static fn (Category $c): array => ['id' => (int) $c->id, 'name' => (string) $c->name]);
+        $tree   = CategoryTree::build($rows);
+        $yaml   = CategoryTree::yaml($tree);
+        $this->addMeta(['untrusted' => ['groups[].name', 'groups[].subcategories[].name', 'groups[].subcategories[].full_name', 'yaml']]);
+
+        if ('yaml' === $format) {
+            return $this->ok(['app' => CategoryTree::APP, 'format' => 'yaml', 'counts' => $tree['counts'], 'yaml' => $yaml]);
+        }
+
+        return $this->ok(['app' => CategoryTree::APP, 'counts' => $tree['counts'], 'groups' => $tree['groups'], 'yaml' => $yaml]);
     }
 
     /** GET /categories/{id} — one category with spent, earned and transferred in the range, per currency. */

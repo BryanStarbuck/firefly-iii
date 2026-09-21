@@ -539,7 +539,7 @@ READING THE LEDGER                                          (§9)
                         [--tag T] [--without-category] [--without-budget] [--without-tag] [--type T]
                         [--min A] [--max A] [--currency C] [--search S] [--limit N] [--offset N]
   ffx transactions show <group-id> | export [filters]
-  ffx categories list | show <id|name>
+  ffx categories list | show <id|name> | tree   (tree: the "Group > Sub" YAML document)
   ffx budgets list | show <id|name>
   ffx budget period | gaps | available   [--month M | --start D --end D]
   ffx subscriptions list | status
@@ -726,6 +726,16 @@ The read verbs are thin by construction: parse, call one route, render.
   available and left to spend. **A budget with no limit prints `—`, never `0.00`** — "not budgeted"
   is not "budgeted zero" in every format, and in JSON it is `null`.
 - **`ffx budget gaps`** — budgets with spending and no limit, plus withdrawals with no budget.
+- **`ffx categories tree`** — every category as the two-level tree of the `"Group > Sub"` naming
+  convention (apis.mdx §8.4a: `Food > Groceries` is subcategory Groceries of group Food; a group
+  with `id: null` exists only as a prefix). It prints the **YAML document the server computed**
+  (`GET /categories/tree?format=yaml`, then `data.yaml`) byte for byte — on a TTY **and** when
+  piped, because the document is the product: `ffx categories tree > categories.yaml`. The CLI
+  never assembles the tree from `categories list`. `--format json` prints the whole envelope
+  instead (the structured `groups[]` and the same `yaml`).
+
+  Handles: printing the server's category tree.
+  Code: `~/BGit/Bryan_git/firefly-iii/cli/code/src/commands/ledger.ts` — `categoriesTree`
 - **`ffx search "<query>"`** — Firefly's own search language, verbatim (apis.mdx §13). The CLI prints
   the operators the server parsed on stderr, so a misspelt operator is visible.
 - **`ffx api get <path>`** — any upstream `/api/v1` `GET`, through the plane's read-only mirror. The

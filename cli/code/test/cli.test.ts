@@ -77,6 +77,26 @@ describe('reads', () => {
     assert.equal(call?.query.end, '2026-09-30');
   });
 
+  it('categories tree prints the server\'s YAML document as sent — even when piped — and --format json the envelope', async () => {
+    const yaml = 'app: firefly_iii\ngenerated_at: 2026-09-21T22:00:00Z\ncounts:\n  groups: 1\n  subcategories: 1\ngroups:\n  - name: Food\n    id: "12"\n    subcategories:\n      - name: Groceries\n        full_name: Food > Groceries\n        id: "13"\n';
+    plane.routes.set('GET /categories/tree', (c) =>
+      c.query.format === 'yaml'
+        ? [200, { ok: true, data: { app: 'firefly_iii', format: 'yaml', counts: { groups: 1, subcategories: 1 }, yaml }, meta: {} }]
+        : [200, { ok: true, data: { app: 'firefly_iii', counts: { groups: 1, subcategories: 1 }, groups: [{ name: 'Food', id: '12', subcategories: [{ name: 'Groceries', full_name: 'Food > Groceries', id: '13' }] }], yaml }, meta: {} }],
+    );
+    const r = await runCli(['categories', 'tree'], env());
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout, yaml, 'byte for byte, nothing assembled client-side');
+    assert.equal(plane.calls.at(-1)?.query.format, 'yaml');
+
+    const j = await runCli(['categories', 'tree', '--format', 'json'], env());
+    assert.equal(j.code, 0, j.stderr);
+    const parsed = JSON.parse(j.stdout);
+    assert.equal(parsed.data.groups[0].subcategories[0].full_name, 'Food > Groceries');
+    assert.equal(parsed.data.yaml, yaml);
+    assert.equal(plane.calls.at(-1)?.query.format, 'json');
+  });
+
   it('names become *_name references, ids *_id — the server resolves them', async () => {
     await runCli(['transactions', 'list', '--account', 'Checking', '--account', '7', '--category', 'Groceries'], env());
     const call = plane.calls.at(-1);

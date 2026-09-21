@@ -55,7 +55,7 @@ describe('the built server over stdio', () => {
 
       const list = await s.request('tools/list');
       const tools = (list.result as { tools: Array<{ name: string }> }).tools;
-      assert.equal(tools.length, 77);
+      assert.equal(tools.length, 79);
 
       for (const method of ['prompts/list', 'resources/list', 'resources/templates/list', 'prompts/get']) {
         const r = await s.request(method, method === 'prompts/get' ? { name: 'x' } : {});
@@ -95,7 +95,7 @@ describe('the built server over stdio', () => {
     const s = spawnServer({ ...sb.env, FFMCP_PROMPT_FILE: prompt });
     try {
       const init = await s.request('initialize', INITIALIZE);
-      assert.equal((init.result as Record<string, unknown>).instructions, 'Dev prompt for firefly_iii with 77 tools.\n');
+      assert.equal((init.result as Record<string, unknown>).instructions, 'Dev prompt for firefly_iii with 79 tools.\n');
     } finally {
       await s.close();
     }

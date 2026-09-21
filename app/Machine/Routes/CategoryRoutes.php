@@ -28,7 +28,7 @@ use FireflyIII\Machine\Http\Controllers\CategoryController;
 use FireflyIII\Machine\RouteDef;
 
 /**
- * pm/apis.mdx §8.4 — categories.
+ * pm/apis.mdx §8.4 — categories (and §8.4a, the "Group > Sub" tree).
  *
  * Every route is live — CategoryController.
  */
@@ -40,6 +40,7 @@ final class CategoryRoutes implements RouteFamily
 
         return [
             RouteDef::live('GET', '/categories', 'read', 'Categories (search matches part of the name).', [$c, 'index'], ['phase' => 'P2']),
+            RouteDef::live('GET', '/categories/tree', 'read', 'Every category as the two-level "Group > Sub" tree, with the same tree as a YAML document.', [$c, 'tree'], ['phase' => 'P2']),
             RouteDef::live('GET', '/categories/{id}', 'read', 'One category, with spent and earned in a range, per currency.', [$c, 'show'], ['phase' => 'P2']),
             RouteDef::live('GET', '/categories/{id}/transactions', 'read', 'The category\'s transactions in a range.', [$c, 'transactions'], ['phase' => 'P2']),
             RouteDef::live('POST', '/categories', 'write', 'Create a category.', [$c, 'store'], ['phase' => 'P8']),

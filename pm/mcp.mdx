@@ -132,7 +132,8 @@ nothing to log in to.
    `http://127.0.0.1:7373/machine/v1/*` carrying `X-Firefly-Machine-Key` and `X-Firefly-Client: mcp`.
 6. The plane checks loopback, origin, the key, the tier and the input, binds the configured operator
    and administration, and reaches the ledger through Firefly's own repositories.
-7. The answer comes back as one text content block of pretty-printed JSON (§12).
+7. The answer comes back as one text content block of pretty-printed JSON (§12) — for
+   `ff_get_category_tree`, the plane's YAML document, with the envelope as `structuredContent` (§12.1).
 
 ### What this spec covers
 
@@ -154,7 +155,7 @@ these books without inventing a number, and cannot change them by accident.**
 - _Without inventing a number_ — every figure is computed behind the plane and returned verbatim;
   this server never sums, filters, rounds or converts (§9.4, §10). The ANALYTICS family exists so
   that a total is always a tool call and never a model's addition.
-- _Cannot change them by accident_ — 59 of 77 tools are read-only; the 18 that write require the
+- _Cannot change them by accident_ — 60 of 79 tools are read-only; the 19 that write require the
   server's write tier **and** this server's, **and** `dry_run: false`, **and** a `confirm` token only
   the matching plan produces, under a ceiling that refuses and reports the real count (§9.7).
 
@@ -173,7 +174,7 @@ these books without inventing a number, and cannot change them by accident.**
 | **Authenticates with** | `X-Firefly-Machine-Key`, from `~/.credentials/firefly_iii.json` (0600)                            |
 | **Env prefix**         | `FFMCP_`                                                                                          |
 | **Logs**               | `~/T/_firefly_iii/mcp.info` and `mcp.err` — beside the CLI's `cli.info` / `cli.err`; faults also go to `~/T/firefly/error.err` ([error_err.mdx](./error_err.mdx)) |
-| **Writes?**            | **off by default.** 59 of 77 tools read; the 18 that write need two switches, a dry run and a token |
+| **Writes?**            | **off by default.** 60 of 79 tools read; the 19 that write need two switches, a dry run and a token |
 | **Computes?**          | nothing                                                                                           |
 | **Instructions**       | `ai/mcp_prompt_firefly.md`, generated into `src/instructions.ts` at build time (§8.3)             |
 
@@ -181,7 +182,7 @@ these books without inventing a number, and cannot change them by accident.**
 
 ## 1. What this is, in one paragraph
 
-`firefly_iii` is a stdio MCP server that exposes this install's books to Claude Code as seventy-seven
+`firefly_iii` is a stdio MCP server that exposes this install's books to Claude Code as seventy-nine
 typed tools. It holds no bookkeeping logic, no database connection, and no copy of the ledger: each
 tool validates its arguments, makes one authenticated call to the machine plane described by
 [apis.mdx](./apis.mdx), and returns Firefly's own answer inside a fixed envelope. It shares its
@@ -201,7 +202,7 @@ is the thing worth building. Every one of those is a route in apis.mdx before it
 The agent could run `ffx accounts list --format json`. Five reasons it does not:
 
 1. **A tool description is the only documentation a model reads before choosing.** A shelled command
-   has none; seventy-seven named tools with schemas and four mandatory description clauses (§9.2) is
+   has none; seventy-nine named tools with schemas and four mandatory description clauses (§9.2) is
    a catalogue a model can route on.
 2. **Typed arguments beat a string.** A model composing a shell line invents quoting and flags. A JSON
    Schema rejects those before anything runs.
@@ -266,7 +267,7 @@ and it costs three characters.
 | --- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
 | 1   | Distinct server key `firefly_iii`                                              | registration-level collision                                     |
 | 2   | `serverInfo.name` agreeing with the key                                        | a human seeing two names for one server                          |
-| 3   | `ff_` prefix on all 77 tools                                                   | the model losing the server segment                              |
+| 3   | `ff_` prefix on all 79 tools                                                   | the model losing the server segment                              |
 | 4   | A mandatory description clause naming the server and the app (§9.2)           | a model reading a description and not knowing whose tool it is   |
 | 5   | An `instructions` block with routing FIRST                                     | the model choosing before reading any tool                       |
 | 6   | Refuse-with-redirect on a foreign-shaped argument                              | the model that has already chosen wrong                          |
@@ -634,7 +635,7 @@ apis.mdx first.
 | `ff_list_uncategorized`  | `GET /transactions?without_category=true`    | the commonest real question, one call                                          |
 | `ff_export_transactions` | `GET /transactions/export`                   | the same filters as CSV, from Firefly's exporter                               |
 
-**Budgets and categories (7, read)**
+**Budgets and categories (8, read)**
 
 | Tool                        | Route                      | Answers                                                                                     |
 | --------------------------- | -------------------------- | ------------------------------------------------------------------------------------------- |
@@ -645,6 +646,7 @@ apis.mdx first.
 | `ff_list_available_budgets` | `GET /available-budgets`   | income-to-budget per period                                                                 |
 | `ff_list_categories`        | `GET /categories`          | categories                                                                                  |
 | `ff_get_category`           | `GET /categories/{id}`     | one category with spent and earned in a range, per currency                                |
+| `ff_get_category_tree`      | `GET /categories/tree`     | every category as the "Group > Sub" tree (apis.mdx §8.4a); the text content is the server's YAML document, the envelope rides in `structuredContent` |
 
 **Reference data (7, read)**
 
@@ -723,7 +725,7 @@ provenance.
 These are read-tier on purpose: authoring a rule and reconciling an account are where a program most
 wants to see the consequence first, and neither preview needs writes to be on.
 
-**The write tier (18, off by default)**
+**The write tier (19, off by default)**
 
 | Tool                          | Route                                    | Changes                                                                    |
 | ----------------------------- | ---------------------------------------- | -------------------------------------------------------------------------- |
@@ -733,6 +735,7 @@ wants to see the consequence first, and neither preview needs writes to be on.
 | `ff_add_transaction`          | `POST /transactions`                     | one withdrawal, deposit or transfer, splits allowed; rules applied         |
 | `ff_update_transaction`       | `PUT /transactions/{group_id}`           | one group's fields, including its splits                                   |
 | `ff_categorize_transactions`  | `POST /transactions/categorize`          | a category on named journals or a filter, under a ceiling                  |
+| `ff_categorize_imported_transactions` | `POST /transactions/categorize-by-import` | categories on rows already imported, by account + import id; unknown categories reported, created only with `create_missing` |
 | `ff_set_transaction_budget`   | `POST /transactions/set-budget`          | a budget (or none) on named journals or a filter                           |
 | `ff_convert_transaction`      | `POST /transactions/{group_id}/convert`  | withdrawal ↔ transfer ↔ deposit                                            |
 | `ff_set_budget_limit`         | `PUT /budgets/{id}/limits`               | **sets** one budget's limit for one period                                 |
@@ -767,12 +770,12 @@ action — its description says all three.
 
 | Dimension    | Values                                                                                                                  |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| Tier         | read (59) · write (18) — 77 total. **`admin` is not a value**                                                           |
+| Tier         | read (60) · write (19) — 79 total. **`admin` is not a value**                                                           |
 | Target       | local (default) · remote (read-only, `https:`, `FFMCP_ALLOW_REMOTE=1`)                                                   |
 | Write tier   | plane off (default) · plane on + `FFMCP_ALLOW_WRITE=1`                                                                  |
 | Confirmation | none (read) · `confirm` token echo (write)                                                                              |
 | Ceiling      | `max_changes` (write; default 200; exceeding it refuses and reports the count)                                          |
-| Dry run      | `dry_run: true` **is the default on sixteen of the eighteen write tools**; `ff_undo` and `ff_trigger_recurrence` have none, and their schemas offer none |
+| Dry run      | `dry_run: true` **is the default on seventeen of the nineteen write tools**; `ff_undo` and `ff_trigger_recurrence` have none, and their schemas offer none |
 | Truncation   | `truncated: true` + `limit_applied` whenever a cap bound the result                                                     |
 | Result       | `ok: true` + `data` · `ok: false` + `error` with `isError: true`                                                        |
 
@@ -934,6 +937,15 @@ Every result is **one text content block holding pretty-printed JSON**:
 `administrationName` is on **every** response — a model on the wrong set of books is holding the
 evidence in every reply.
 
+**The one document-shaped exception: `ff_get_category_tree`.** Its answer is meant to be read as a
+document, so on success its **text content block is the YAML document the plane computed**
+(`data.yaml`, apis.mdx §8.4a), preceded by one YAML comment line naming the administration
+(`# firefly_iii · administration: Household (id 1) · asOf …` — a comment, so a YAML reader sees the
+plane's document unchanged). The full envelope above — `data.groups`, `data.counts`, `meta` — rides
+beside it as **`structuredContent`**. The MCP adds nothing to the tree and reorders nothing; it only
+chooses which of the plane's two renderings is the text. A tool opts in with `text` in its
+`tools/*.ts` definition; failures are always the JSON envelope of §12.2.
+
 ### 12.2 Failure
 
 ```json
@@ -1058,7 +1070,7 @@ Code: `~/BGit/Bryan_git/firefly-iii/mcp/src/audit.ts` — `auditLine()`, `const 
 | **no-network canary**      | no host literal but loopback; no `child_process`; exactly one module calls `fetch`                                                                 |
 | **no-fs-write canary**     | no `fs` write API outside the logger, the credential minter and the error file's writer (`vendor/error-file/rolling-file-writer.js`, [error_err.mdx](./error_err.mdx)) — this process writes only its log directory (`logger.js`) and the error file |
 | **Canary/threat parity**   | the §7.0 `Canary` column and `src/canary/` agree, both directions                                                                                  |
-| **Catalogue tests**        | 77 tools; every name `^ff_[a-z_]+$`; every verb in the closed set; all four description clauses; every amount field a pattern-checked **string**; `tools/list` and dispatch agree; every tool maps to one route in apis.mdx |
+| **Catalogue tests**        | 79 tools; every name `^ff_[a-z_]+$`; every verb in the closed set; all four description clauses; every amount field a pattern-checked **string**; `tools/list` and dispatch agree; every tool maps to one route in apis.mdx |
 | **Gate tests**             | each gate denied and allowed; a write with the tier off, on without confirm, with a stale confirm, over the ceiling                               |
 | **Auth negatives**         | no key → refuses to start; `0644` → refuses; wrong key → `unauthorized`; remote without the flag → refuses; remote + write → refuses              |
 | **Routing tests**          | an Actual Budget UUID, a QuickBooks realm id and an invoice number each produce `wrong_server` naming the right neighbour                         |
@@ -1132,10 +1144,10 @@ executes, and the write would still need two switches and a token the string can
 4. A hand-piped `initialize` returns `capabilities.tools` and `instructions` whose first sentence is
    §3.4 layer 5 verbatim.
 5. The built `dist/` has no stdout writes, no host literal but loopback, no `child_process`.
-6. All 77 tools carry the four clauses, match `^ff_[a-z_]+$`, and agree between `tools/list` and
+6. All 79 tools carry the four clauses, match `^ff_[a-z_]+$`, and agree between `tools/list` and
    dispatch; every tool maps to exactly one apis.mdx route.
 7. Every `ff_` name in `ai/mcp_prompt_firefly.md` exists.
-8. With the write tier off, all 18 write tools are **listed**, and every call returns
+8. With the write tier off, all 19 write tools are **listed**, and every call returns
    `write_disabled` naming both switches.
 9. With both switches on: no confirm → `confirm_required`; stale confirm → `conflict`; over the
    ceiling → `too_many_changes` **with the real count**.
@@ -1146,7 +1158,7 @@ executes, and the write would still need two switches and a token the string can
 14. No tool returns raw statement text, a full account number, or a path outside the configured roots.
 15. `mcp.info` after a full session contains no amount, payee, account id or path.
 16. No tool can re-create a transaction the operator deleted.
-17. `ff_undo` and `ff_trigger_recurrence` have no `dry_run`; the other sixteen default it to `true`.
+17. `ff_undo` and `ff_trigger_recurrence` have no `dry_run`; the other seventeen default it to `true`.
 18. The error vocabulary is a strict superset of the plane's nine.
 
 ---

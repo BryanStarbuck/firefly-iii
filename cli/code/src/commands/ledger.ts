@@ -286,6 +286,26 @@ const categoriesShow: VerbDef = {
   },
 };
 
+/**
+ * The "Group > Sub" tree (apis.mdx §8.4a). The SERVER builds the tree and its YAML document; this
+ * verb prints data.yaml as the server sent it — YAML even when piped, because the document is the
+ * product. --format json prints the whole envelope (the structured tree and the YAML) instead.
+ */
+const categoriesTree: VerbDef = {
+  path: ['categories', 'tree'],
+  group: G,
+  summary: 'every category as the "Group > Sub" tree, printed as the server\'s YAML document',
+  route: 'GET /categories/tree',
+  examples: ['ffx categories tree', 'ffx categories tree > categories.yaml', 'ffx categories tree --format json'],
+  async run(ctx) {
+    const asJson = ctx.universal.format === 'json';
+    const env = await get(ctx, '/categories/tree', { format: asJson ? 'json' : 'yaml' });
+    const yaml = getPath(env.data, 'yaml');
+    if (asJson || typeof yaml !== 'string') return objectOutcome(env);
+    return { envelope: env, lines: [yaml.replace(/\n$/, '')], plain: true };
+  },
+};
+
 const budgetsList: VerbDef = {
   path: ['budgets', 'list'],
   group: G,
@@ -622,6 +642,7 @@ export const ledgerVerbs: VerbDef[] = [
   transactionsExport,
   categoriesList,
   categoriesShow,
+  categoriesTree,
   budgetsList,
   budgetsShow,
   budgetPeriod,

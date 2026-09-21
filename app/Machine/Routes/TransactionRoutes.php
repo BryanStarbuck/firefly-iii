@@ -51,6 +51,7 @@ final class TransactionRoutes implements RouteFamily
             RouteDef::live('POST', '/transactions/{group_id}/clone', 'write', 'Clone a group to a new date.', [T::class, 'cloneGroup'], ['phase' => 'P8']),
             RouteDef::live('POST', '/transactions/bulk', 'write', 'Bulk edit — category, budget, tags — over journal ids or a filter.', [T::class, 'bulk'], ['phase' => 'P8']),
             RouteDef::live('POST', '/transactions/categorize', 'write', 'Set the category of many journals (ids or a filter).', [T::class, 'categorize'], ['phase' => 'P8']),
+            RouteDef::live('POST', '/transactions/categorize-by-import', 'write', 'Set the categories of rows already imported, keyed by account + import id (external_id); unknown categories are reported, not created.', [T::class, 'categorizeByImport'], ['phase' => 'P8']),
             RouteDef::live('POST', '/transactions/set-budget', 'write', 'Set or clear the budget of many journals (ids or a filter).', [T::class, 'setBudget'], ['phase' => 'P8']),
             RouteDef::live('POST', '/transaction-links', 'write', 'Link two transactions.', [T::class, 'storeLink'], ['phase' => 'P8']),
             RouteDef::live('DELETE', '/transaction-links/{id}', 'write', 'Remove a link; the transactions survive.', [T::class, 'destroyLink'], ['phase' => 'P8']),

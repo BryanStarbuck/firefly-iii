@@ -10,7 +10,9 @@
  * Every result is ONE text content block of pretty-printed JSON — the envelope
  * `{ ok, tool, data, meta }` or `{ ok: false, tool, error }` with isError —
  * and a tool failure is never a thrown JSON-RPC error: losing one call must
- * not kill the model's loop (§12.2).
+ * not kill the model's loop (§12.2). The one exception (§12.1): a tool with
+ * `text` (ff_get_category_tree) answers success with the plane's document as
+ * the text block and the same envelope as structuredContent.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -53,6 +55,7 @@ export interface Envelope {
 export interface CallResult {
   [key: string]: unknown;
   content: Array<{ type: 'text'; text: string }>;
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
 }
 
@@ -129,7 +132,7 @@ export class McpServerHost {
       const envelope = tool.tier === 'write' ? await this.#serialised(run) : await run();
       const rows = firstArrayLength(envelope.data);
       this.#audit({ name, tier: tool.tier, args: rawArgs, ok: true, started, rows });
-      return this.#respond(envelope);
+      return this.#respond(envelope, tool);
     } catch (err) {
       const te = err instanceof ToolError ? err : undefined;
       if (!te) {
@@ -261,7 +264,15 @@ export class McpServerHost {
     return trial(lo);
   }
 
-  #respond(envelope: Envelope): CallResult {
+  #respond(envelope: Envelope, tool?: ToolDef): CallResult {
+    const doc = envelope.ok && tool?.text ? tool.text(envelope.data) : undefined;
+    if (doc !== undefined) {
+      // §12.1: the plane's document is the text; one YAML comment names the books it came from.
+      const m = envelope.meta ?? {};
+      const oneLine = (v: unknown): string => String(v ?? '?').replace(/[\r\n]+/g, ' ');
+      const header = `# ${SERVER_KEY} · administration: ${oneLine(m.administrationName)} (id ${oneLine(m.administrationId)}) · asOf ${oneLine(m.asOf)}\n`;
+      return { content: [{ type: 'text', text: header + doc }], structuredContent: { ...envelope } };
+    }
     return {
       content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
       ...(envelope.ok ? {} : { isError: true }),

@@ -29,6 +29,7 @@ use Closure;
 use FireflyIII\Machine\Confirm\ConfirmTokens;
 use FireflyIII\Machine\DryRun;
 use FireflyIII\Machine\Envelope;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\Ingest\AccountProvisioner;
 use FireflyIII\Machine\Ingest\Collector;
 use FireflyIII\Machine\Ingest\Csv;
@@ -76,6 +77,8 @@ use Throwable;
  */
 final class IngestController extends MachineController
 {
+    private const string WHERE = 'app/Machine/Http/Controllers/IngestController.php';
+
     private const string ARGS_CACHE = 'machine:ingest:args:';
     private const array KINDS_RULE  = ['checking', 'savings', 'card', 'brokerage', 'loan', 'mortgage'];
 
@@ -955,7 +958,8 @@ final class IngestController extends MachineController
                 try {
                     $code = $e instanceof MachineException ? $e->errorCode : 'internal';
                     RunLog::record($staging, RunLog::newId(), $kind, $started, ['root' => $args['root'], 'outcome' => 'refused: '.$code, 'message' => $e instanceof MachineException ? $e->getMessage() : 'internal error'], ['args' => self::publicArgs($args), 'error' => $e instanceof MachineException ? ['code' => $e->errorCode, 'message' => $e->getMessage(), 'details' => $e->details] : ['code' => 'internal']]);
-                } catch (Throwable) {
+                } catch (Throwable $logFault) {
+                    ErrorFile::for(self::WHERE)->expected('recording a refused ingest run', $logFault);
                     // the refusal itself is what the caller needs to see
                 }
             }
@@ -978,6 +982,7 @@ final class IngestController extends MachineController
                 RunLog::record($staging, $id, $kind, $started, self::runLine($args, $last, 'applied') + ['operation_id' => $data['operation_id'] ?? null], ['args' => self::publicArgs($args), 'accounts' => $last->data['accounts'] ?? $last->data['plan'] ?? [], 'rows' => $last->data['rows'] ?? [], 'changes' => $last->changes, 'operation_id' => $data['operation_id'] ?? null]);
                 $body['data']['run_id'] = $id;
             } catch (Throwable $e) {
+                ErrorFile::for(self::WHERE)->expected('recording an applied ingest run', $e);
                 $body['data']['run_id']      = null;
                 $body['meta']['warnings']    = array_merge((array) ($body['meta']['warnings'] ?? []), [sprintf('applied, but the run could not be logged in %s: %s', Staging::DIR, $e instanceof MachineException ? $e->getMessage() : 'the staging directory is not writable')]);
             }

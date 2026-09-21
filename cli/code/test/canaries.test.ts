@@ -110,3 +110,46 @@ describe('open-source safety (§17)', () => {
     assert.ok(newest(DIST_SRC, '.js') >= newest(SRC, '.ts'), 'code/dist is older than code/src — run just build');
   });
 });
+
+describe('the vendored error file has not drifted (pm/error_err.mdx §5.4)', () => {
+  const REPO = path.resolve(CLI_ROOT, '..');
+  const HEADER = '// GENERATED from errorfile/src — run node scripts/sync-error-file.mjs\n';
+  const FILES = ['index.ts', 'core.ts', 'describe.ts', 'redact.ts', 'fold.ts', 'format.ts', 'node.ts', 'rolling-file-writer.ts'];
+
+  it('the sync script vendors exactly these files into this directory under this header', () => {
+    const script = fs.readFileSync(path.join(REPO, 'scripts', 'sync-error-file.mjs'), 'utf8');
+    for (const file of FILES) assert.ok(script.includes(`'${file}'`), `sync-error-file.mjs does not vendor ${file}`);
+    assert.ok(script.includes("'cli/code/src/vendor/error-file'"), 'sync-error-file.mjs does not target cli/code/src/vendor/error-file');
+    assert.ok(script.includes(HEADER.trimEnd()), 'sync-error-file.mjs writes a different header');
+    const vendored = fs.readdirSync(path.join(SRC, 'vendor', 'error-file')).sort();
+    assert.deepEqual(vendored, [...FILES].sort(), 'cli/code/src/vendor/error-file holds a file the sync does not own');
+  });
+
+  for (const file of FILES) {
+    it(`vendor/error-file/${file} is errorfile/src/${file}, byte for byte after the header`, () => {
+      const copy = path.join(SRC, 'vendor', 'error-file', file);
+      assert.ok(fs.existsSync(copy), `${copy} is missing — run node scripts/sync-error-file.mjs`);
+      const text = fs.readFileSync(copy, 'utf8');
+      assert.ok(text.startsWith(HEADER), `${file} lacks the GENERATED header`);
+      const source = fs.readFileSync(path.join(REPO, 'errorfile', 'src', file), 'utf8');
+      assert.ok(text.slice(HEADER.length) === source, `cli/code/src/vendor/error-file/${file} has drifted — run node scripts/sync-error-file.mjs`);
+    });
+  }
+});
+
+describe('tests never install the error file without an explicit file (pm/error_err.mdx §5.5, R13)', () => {
+  it('every installNodeErrorFile call under cli/code/test/ passes file:', () => {
+    const TEST_DIR = path.join(SRC, '..', 'test');
+    const needle = 'installNodeError' + 'File(';
+    for (const name of fs.readdirSync(TEST_DIR).filter((f) => f.endsWith('.ts'))) {
+      const text = fs.readFileSync(path.join(TEST_DIR, name), 'utf8');
+      let at = text.indexOf(needle);
+      while (at !== -1) {
+        const close = text.indexOf('})', at);
+        const args = text.slice(at + needle.length, close === -1 ? undefined : close);
+        assert.ok(/\bfile\s*[:,]/.test(args), `${name}: installNodeErrorFile without file: — it would resolve process.env and could reach the real file`);
+        at = text.indexOf(needle, at + needle.length);
+      }
+    }
+  });
+});

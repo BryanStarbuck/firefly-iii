@@ -5,12 +5,16 @@
  *   - refuses, before connecting, to send the key anywhere but loopback or https (R3);
  *   - sends the key in X-Firefly-Machine-Key — never in a URL;
  *   - identifies itself with X-Firefly-Client: ffx (advisory, for the server's audit log);
+ *   - mints 8 hex characters per plane call and sends them as X-Firefly-Request-Id, and carries
+ *     the same id on a failed call's CliError, so the [ffx] record in ~/T/firefly/error.err joins
+ *     the plane's own record (pm/error_err.mdx §4.8);
  *   - sends NO Origin and NO Sec-Fetch-* headers. That is why it is built on
  *     node:http rather than fetch(): the plane's origin gate refuses browser-shaped
  *     requests, and fetch implementations add Sec-Fetch-Mode on their own;
  *   - turns every response into the envelope, or a CliError with the right exit code;
  *   - streams NDJSON progress for the long ingest routes into the spinner.
  */
+import crypto from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 
@@ -21,6 +25,14 @@ import { fingerprint } from './credentials.js';
 import { CliError, EXIT, EXIT_FOR_CODE, isPlaneCode } from './errors.js';
 import { log, scrub } from './logger.js';
 import type { Spinner } from './progress.js';
+import { errorFileFor } from './vendor/error-file/index.js';
+
+const errors = errorFileFor('cli/code/src/client.ts');
+
+/** The correlation id for one plane call: 8 hex, below the ≥ 32-hex key scrub (pm/error_err.mdx §4.8). */
+export function mintRid(): string {
+  return crypto.randomBytes(4).toString('hex');
+}
 
 export interface Meta {
   target?: string;
@@ -156,8 +168,12 @@ function transportError(err: NodeJS.ErrnoException, cfg: Config, timeoutMs: numb
     });
   }
   if (err.code === 'ETIMEDOUT') {
+    // The ErrnoException rides along as the cause, so reportError() classifies the timeout as a
+    // transient fault: one folded WARN per 10 minutes (pm/error_err.mdx R7, §5.7). Exit and code
+    // are unchanged, so --json-errors output is too.
     return new CliError(EXIT.FAILED, `no answer from ${cfg.apiUrl} within ${timeoutMs} ms`, {
-      hint: 'raise --timeout, or check the app: ffx logs',
+      hint: 'raise --timeout. The detail is in ~/T/firefly/error.err — ffx logs --errors',
+      cause: err,
     });
   }
   return new CliError(EXIT.UNAVAILABLE, `could not talk to ${cfg.apiUrl}: ${err.message}`);
@@ -173,7 +189,8 @@ export async function probeUp(cfg: Config, timeoutMs = 2000): Promise<boolean> {
       timeoutMs,
     });
     return res.status >= 200 && res.status < 300;
-  } catch {
+  } catch (err) {
+    errors.expected('probing the app health', err); // "not up yet" is the question the probe asks
     return false;
   }
 }
@@ -202,10 +219,21 @@ export class PlaneClient {
         hint: 'use a loopback URL or https:',
       });
     }
+    const rid = mintRid();
+    try {
+      return await this.exchangeEnvelope<T>(method, route, options, rid);
+    } catch (err) {
+      if (err instanceof CliError && err.rid === undefined) err.rid = rid;
+      throw err;
+    }
+  }
+
+  private async exchangeEnvelope<T>(method: string, route: string, options: CallOptions, rid: string): Promise<Envelope<T>> {
     const url = new URL(`${PLANE_PREFIX}${route}${encodeQuery(options.query)}`, this.cfg.apiUrl);
     const headers: Record<string, string> = {
       'X-Firefly-Machine-Key': this.key.key,
       'X-Firefly-Client': 'ffx',
+      'X-Firefly-Request-Id': rid,
       Accept: options.progress ? 'application/x-ndjson, application/json' : 'application/json',
       'User-Agent': 'ffx',
     };
@@ -245,8 +273,8 @@ export class PlaneClient {
     try {
       const parsed = JSON.parse(line) as { progress?: { phase?: string; done?: number; total?: number } };
       if (parsed.progress) spinner.tick(parsed.progress.phase, parsed.progress.done, parsed.progress.total);
-    } catch {
-      /* a non-JSON line is not progress; the final envelope is parsed separately */
+    } catch (err) {
+      errors.expected('reading a progress line', err); // a non-JSON line is not progress; the final envelope is parsed separately
     }
   }
 
@@ -254,7 +282,8 @@ export class PlaneClient {
     let parsed: unknown;
     try {
       parsed = JSON.parse(res.body);
-    } catch {
+    } catch (err) {
+      errors.expected('parsing the app answer', err); // not JSON: classified below as a non-envelope answer
       parsed = undefined;
     }
     if (isEnvelope(parsed)) return parsed;
@@ -263,10 +292,13 @@ export class PlaneClient {
         hint: 'this checkout must be the firefly-iii fork with app/Machine/ — see pm/apis.mdx §3',
       });
     }
+    // An HTML 500 means the app itself broke: note it in the error file (N14). The CliError below
+    // is unchanged, so --json-errors output is too.
+    if (res.status >= 500) errors.warn('reading the app answer', undefined, { status: res.status });
     const snippet = scrub(res.body.slice(0, 200)).replace(/\s+/g, ' ');
     throw new CliError(EXIT.UNAVAILABLE, `the app answered HTTP ${res.status} with something that is not the plane's envelope`, {
       details: snippet ? [`first bytes: ${snippet}`] : [],
-      hint: 'ffx logs --laravel',
+      hint: 'The detail is in ~/T/firefly/error.err — ffx logs --errors',
     });
   }
 

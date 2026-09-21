@@ -18,6 +18,8 @@ export const CLI_ROOT = path.resolve(here, '..', '..', '..');
 
 export interface Sandbox {
   dir: string;
+  /** The error file this sandbox's children write (FIREFLY_ERROR_FILE). */
+  errorFile: string;
   credentialsFile: string;
   stateDir: string;
   env: NodeJS.ProcessEnv;
@@ -41,9 +43,11 @@ export function sandbox(opts: { key?: string | undefined; apiUrl?: string; mode?
     FFX_CREDENTIALS_FILE: credentialsFile,
     FFX_STATE_DIR: stateDir,
     FFX_NO_BRINGUP: '1',
+    // Every child writes its faults to the sandbox, never to ~/T/firefly/ (pm/error_err.mdx R13, §15).
+    FIREFLY_ERROR_FILE: path.join(dir, 'error.err'),
     ...(opts.apiUrl ? { FFX_API_URL: opts.apiUrl } : { FFX_API_URL: 'http://127.0.0.1:1' }),
   };
-  return { dir, credentialsFile, stateDir, env };
+  return { dir, errorFile: path.join(dir, 'error.err'), credentialsFile, stateDir, env };
 }
 
 export interface RunResult {

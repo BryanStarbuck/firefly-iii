@@ -27,6 +27,10 @@ import type { Logger } from './logger.js';
 import { findTool, TOOLS } from './tools/registry.js';
 import type { ToolDef } from './tools/tool.js';
 import { buildRequest } from './wire.js';
+import { errorFileFor, isTransientNetworkError } from './vendor/error-file/index.js';
+
+/** N17 — every tool failure is classified here (pm/error_err.mdx §5.7, §8.6). */
+const errors = errorFileFor('mcp/src/server.ts', { net: 'top' });
 
 export const SERVER_VERSION = '0.1.0';
 
@@ -128,8 +132,18 @@ export class McpServerHost {
       return this.#respond(envelope);
     } catch (err) {
       const te = err instanceof ToolError ? err : undefined;
-      if (!te) this.#o.logger.error(`${name}: ${(err as Error)?.stack ?? String(err)}`);
-      const e = te ?? fail('internal', 'The tool failed unexpectedly.', 'The detail is in ~/T/_firefly_iii/mcp.err; ask the operator to look.');
+      if (!te) {
+        this.#o.logger.error(`${name}: ${(err as Error)?.stack ?? String(err)}`);
+        errors.caught('running an MCP tool', err, { tool: name, gate });
+      } else if (isTransientNetworkError(te.cause)) {
+        // A plane-call timeout: one folded WARN per 10 minutes, exactly as ffx writes it (§5.2, R7).
+        errors.warn('running an MCP tool', te, { tool: name, gate, code: te.code, rid: te.rid });
+      } else if (te.code === 'internal' || te.code === 'upstream_error') {
+        errors.caught('running an MCP tool', te, { tool: name, gate, code: te.code, rid: te.rid });
+      } else {
+        errors.expected('running an MCP tool', te); // an answer (R7)
+      }
+      const e = te ?? fail('internal', 'The tool failed unexpectedly.', 'The detail is in ~/T/firefly/error.err — ffx logs --errors');
       this.#audit({ name, tier: tool.tier, args: rawArgs, ok: false, started, gate, code: e.code });
       return this.#respond({
         ok: false,
@@ -140,8 +154,21 @@ export class McpServerHost {
   }
 
   async #serialised<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.#writeChain.then(fn, fn);
-    this.#writeChain = next.catch(() => undefined);
+    // The chain never rejects (the catch below), so the second arm only keeps a write running after
+    // a previous one failed; that failure already reached its own caller through its own `next`.
+    const next = this.#writeChain.then(fn, (prev: unknown) => {
+      errors.expected('waiting for the previous write', prev);
+      return fn();
+    });
+    this.#writeChain = next.catch((e: unknown) => {
+      // Only keeps the chain alive: the rejection still reaches the caller through `next`, and
+      // handleCallTool() classifies it. This handler runs FIRST, so it records only an answer —
+      // marking a fault here would, under FIREFLY_ERROR_FILE_VERBOSE=1, write it as EXPECTED and
+      // make handleCallTool()'s caught() a WeakSet no-op (pm/error_err.mdx §8.8, R4).
+      if (e instanceof ToolError && e.code !== 'internal' && e.code !== 'upstream_error') {
+        errors.expected('keeping the write chain alive', e);
+      }
+    });
     return next;
   }
 
@@ -181,7 +208,9 @@ export class McpServerHost {
     let hint = err.hint;
     if (code === 'write_disabled' && !(hint ?? '').includes('FFMCP_ALLOW_WRITE')) hint = WRITE_SWITCHES_HINT;
     if (code === 'not_ready' && !hint) hint = 'Tell the operator to run `ffx up` (or `ffx doctor`) and wait — this server never starts the app.';
-    return fail(code, err.message ?? `Firefly III refused the call (${code}).`, hint, err.details);
+    const te = fail(code, err.message ?? `Firefly III refused the call (${code}).`, hint, err.details);
+    te.rid = plane.rid;
+    return te;
   }
 
   #meta(tool: ToolDef, pm: PlaneMeta, clamps: Clamp[], started: number): Record<string, unknown> {
@@ -256,8 +285,9 @@ export class McpServerHost {
         }),
         !a.ok,
       );
-    } catch {
-      /* the audit never takes a call down */
+    } catch (e) {
+      // The audit never takes a call down; the fault is now visible in error.err.
+      errors.caught('writing the audit line', e, { tool: a.name });
     }
   }
 }

@@ -25,6 +25,7 @@ declare(strict_types=1);
 namespace FireflyIII\Machine\Ingest;
 
 use Carbon\CarbonImmutable;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use JsonException;
 
 /**
@@ -52,7 +53,9 @@ final class MapFile
 
         try {
             $doc = json_decode($text, true, 32, JSON_THROW_ON_ERROR);
-        } catch (JsonException) {
+        } catch (JsonException $e) {
+            ErrorFile::for('app/Machine/Ingest/MapFile.php')->expected('reading the staged map file', $e);
+
             return [];
         }
         $entries = is_array($doc) && is_array($doc['entries'] ?? null) ? $doc['entries'] : [];

@@ -27,6 +27,7 @@ namespace FireflyIII\Machine\Http\Controllers;
 use Carbon\Carbon;
 use FireflyIII\Exceptions\FireflyException;
 use FireflyIII\Machine\Envelope;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Models\Account;
 use FireflyIII\Support\Http\Api\AccountFilter;
@@ -67,6 +68,8 @@ use Throwable;
 final class SearchController extends MachineController
 {
     use AccountFilter;
+
+    private const string WHERE = 'app/Machine/Http/Controllers/SearchController.php';
 
     /** Fields a transaction row carries that a third party may have written (§16.3). */
     public const array UNTRUSTED_TRANSACTION_FIELDS = ['description', 'notes', 'internal_reference', 'external_id', 'account_name', 'source_name', 'destination_name', 'tags', 'group_title'];
@@ -351,7 +354,8 @@ final class SearchController extends MachineController
             /** @var QueryParserInterface $parser */
             $parser = app(QueryParserInterface::class);
             $tree   = $parser->parse($query);
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('parsing the query for its value checks', $e);
             return; // the searcher's own parse reports the syntax error
         }
         $problems = self::checkValues($tree);
@@ -406,7 +410,8 @@ final class SearchController extends MachineController
     {
         try {
             return ltrim(OperatorQuerySearch::getRootOperator($operator), '-');
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('resolving a root search operator', $e);
             return $operator;
         }
     }
@@ -442,7 +447,8 @@ final class SearchController extends MachineController
             $parser = app(QueryParserInterface::class);
             $tree   = $parser->parse($query);
             $this->walk($tree, $tree->isProhibited(false), $parsed, $freeText, $excluded);
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('parsing the query for its explanation', $e);
             // the searcher parsed it already; fall back to what it kept
             $freeText = array_values(array_map('strval', $searcher->getWords()));
             $excluded = array_values(array_map('strval', $searcher->getExcludedWords()));
@@ -476,7 +482,8 @@ final class SearchController extends MachineController
 
             try {
                 $root = ltrim(OperatorQuerySearch::getRootOperator($operator), '-');
-            } catch (Throwable) {
+            } catch (Throwable $e) {
+                ErrorFile::for(self::WHERE)->expected('resolving a root search operator', $e);
                 $root = $operator;
             }
             $parsed[] = [
@@ -530,7 +537,7 @@ final class SearchController extends MachineController
 
             throw $e;
         } catch (FireflyException $e) {
-            throw MachineException::upstream('Firefly\'s search failed.', 'Narrow the query, or check it against GET /machine/v1/search/operators', ['reason' => Envelope::scrub($e->getMessage())]);
+            throw MachineException::upstream('Firefly\'s search failed.', 'Narrow the query, or check it against GET /machine/v1/search/operators', ['reason' => Envelope::scrub($e->getMessage())], $e);
         } finally {
             $reset();
         }
@@ -594,7 +601,8 @@ final class SearchController extends MachineController
                 return static function () use ($connection): void {
                     try {
                         $connection->statement('SET statement_timeout = DEFAULT');
-                    } catch (Throwable) {
+                    } catch (Throwable $e) {
+                        ErrorFile::for(self::WHERE)->expected('resetting the statement timeout', $e);
                         // the connection is per request; a stuck setting dies with it
                     }
                 };
@@ -605,12 +613,14 @@ final class SearchController extends MachineController
                 return static function () use ($connection): void {
                     try {
                         $connection->statement('SET SESSION max_execution_time = DEFAULT');
-                    } catch (Throwable) {
+                    } catch (Throwable $e) {
+                        ErrorFile::for(self::WHERE)->expected('resetting the execution time limit', $e);
                         // as above
                     }
                 };
             }
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('setting the search time limit', $e);
             // a driver that refuses the setting is a driver without the guard, not a failed search
         }
 

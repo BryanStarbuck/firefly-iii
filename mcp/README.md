@@ -67,6 +67,10 @@ the refusal reports the real count. `ff_undo` and `ff_trigger_recurrence` have n
 | `FFMCP_PROMPT_FILE`      | —                                 | dev override for the instructions prose (same substitution) |
 | `FFMCP_LOG_LEVEL`        | `info`                            | `error` · `warn` · `info` · `debug`                      |
 | `FFMCP_LOG_DIR`          | `~/T/_firefly_iii`                | where `mcp.info` and `mcp.err` go (mode `0600`, rotated at 8 MB) |
+| `FIREFLY_ERROR_FILE`     | `~/T/firefly/error.err`           | every fault from every runtime (pm/error_err.mdx); one variable shared with PHP and `ffx`, no `FFMCP_` twin |
+| `FIREFLY_ERROR_FILE_VERBOSE` | `0` | `1` also writes EXPECTED records to the error file (pm/error_err.mdx §4.11); shared with PHP and `ffx` |
+| `FIREFLY_ERROR_FILE_CANARY`  | `0` | `1` enables the `__canary` branches; refused unless `FIREFLY_ERROR_FILE` is non-empty (pm/error_err.mdx §4.11) |
+| `FIREFLY_ERROR_FILE_ECHO`    | —   | ignored by `mcp`; in PHP and `ffx`, `1` echoes each written record to stderr |
 
 ## What an operator asks, and the tools that answer
 
@@ -105,6 +109,8 @@ mcp/
 ├── src/client.ts                   the ONE socket module: node:http, loopback-or-https, no Origin/Sec-Fetch
 ├── src/credentials.ts              the CLI's module, byte for byte below the imports
 ├── src/logger.ts, src/audit.ts     mcp.info / mcp.err; hashed-argument audit line, no amounts
+├── src/vendor/error-file/          the error-file library, copied from errorfile/src by scripts/sync-error-file.mjs
+│                                   (never edited here); faults go to ~/T/firefly/error.err as [mcp]
 ├── src/tools/*.ts                  const TOOLS — the one array (tools/list and dispatch)
 ├── src/canary/*.canary.ts          one per name in the §7.0 Canary column
 └── test/*.test.ts                  node:test against a fake plane (node:http) and the built dist/

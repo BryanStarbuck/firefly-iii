@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 
 import { editDistance, parseArgs, resolveVerb } from '../src/args.js';
 import { encodeQuery, isEnvelope } from '../src/client.js';
@@ -31,6 +31,16 @@ import { amountInputProblem, compareDecimal, displayAmount, formatAmount, trimTo
 import { REGISTRY, assertUniquePaths } from '../src/registry.js';
 import { cellText, renderCsv, renderTable } from '../src/render.js';
 import { UNIVERSAL_FLAGS, verbName } from '../src/verbs.js';
+import { installNodeErrorFile, resetNodeErrorFileForTests } from '../src/vendor/error-file/node.js';
+
+// In-process modules report into a sandbox file, never the environment's (pm/error_err.mdx §5.5, R13).
+const errorFileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ffx-unit-errorfile-'));
+before(() => {
+  installNodeErrorFile({ app: 'ffx', where: 'cli/code/test/unit.test.ts', file: path.join(errorFileDir, 'error.err'), handleProcessErrors: false });
+});
+after(() => {
+  resetNodeErrorFileForTests();
+});
 
 // ----------------------------------------------------------------- money ---
 

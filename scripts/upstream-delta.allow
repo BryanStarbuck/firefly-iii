@@ -1,0 +1,17 @@
+# scripts/upstream-delta.allow — the class-A upstream delta (pm/error_err.mdx §17.1).
+#
+# One repo-relative path per line: an UPSTREAM file this fork is allowed to modify.
+# `just check-delta` (scripts/upstream-delta.mjs) fails when any other upstream path differs
+# from `git merge-base HEAD upstream/develop`. Keep this list as short as the spec says.
+# Blank lines and lines starting with # are ignored.
+
+# The machine plane's one provider line (pm/apis.mdx; unchanged by pm/error_err.mdx).
+bootstrap/providers.php
+
+# Predates pm/error_err.mdx: ignores .phpunit.cache/, which the tests/Machine runs create.
+.gitignore
+
+# Step 11 (pm/error_err.mdx §16.2, §17.1): the two boot import lines, one line each, marked
+# `// fork: pm/error_err.mdx`. A conflict resolves as "take upstream, then re-add the one marker line".
+resources/assets/v3/js/boot/bootstrap.js
+resources/assets/v3/js/boot/blank-bootstrap.js

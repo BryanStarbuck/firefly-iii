@@ -25,6 +25,7 @@ declare(strict_types=1);
 namespace FireflyIII\Machine;
 
 use FireflyIII\Machine\Credentials\CredentialsFile;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\Http\MachineExceptionHandler;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Support\Facades\Log;
@@ -44,8 +45,11 @@ use Throwable;
  */
 final class MachinePlaneServiceProvider extends ServiceProvider
 {
+    private const string WHERE = 'app/Machine/MachinePlaneServiceProvider.php';
+
     public function register(): void
     {
+        $this->app->register(\FireflyIII\Machine\ErrorFile\ErrorFileServiceProvider::class);   // FIRST statement (pm/error_err.mdx §4.9)
         $this->app->singleton(ExceptionHandler::class, MachineExceptionHandler::class);
     }
 
@@ -84,11 +88,16 @@ final class MachinePlaneServiceProvider extends ServiceProvider
             }
             $line = null === $key ? self::unarmedLine() : self::armedLine($key->fingerprint());
             Log::info($line);
+            if (null === $key) {
+                // a plane that stays unarmed is a fault the operator must see: CredentialsRefused
+                // promises "the reason goes to the error file with its fix" (pm/error_err.mdx §8.1)
+                ErrorFile::for('app/Machine/MachinePlaneServiceProvider.php')->warn('arming the machine plane', null, ['problem' => CredentialsFile::problem()]);
+            }
             if ('cli-server' === PHP_SAPI) {
                 @file_put_contents('php://stderr', $line."\n");
             }
         } catch (Throwable $e) {
-            Log::warning(sprintf('Machine plane: could not arm: %s', Envelope::scrub($e->getMessage())));
+            ErrorFile::for('app/Machine/MachinePlaneServiceProvider.php')->caught('arming the machine plane', $e);
         }
     }
 
@@ -98,8 +107,10 @@ final class MachinePlaneServiceProvider extends ServiceProvider
             [$user, $group] = Operator::resolve();
             $who            = sprintf('operator %s, administration %d', $user->email, $group->id);
         } catch (MachineException $e) {
+            ErrorFile::for(self::WHERE)->expected('resolving the operator for the armed line', $e);
             $who = sprintf('operator UNRESOLVED — %s', $e->getMessage());
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('resolving the operator for the armed line', $e);
             $who = 'operator UNRESOLVED — the database is not reachable';
         }
 

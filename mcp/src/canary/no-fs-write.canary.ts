@@ -1,20 +1,21 @@
 /**
  * T6 — filesystem escape. This process writes only its log directory
- * (logger.js) and, in the CLI's shared module, the one-time credentials mint
- * (credentials.js — which the MCP never calls). Every other module is
- * read-only on disk; statements staging is the PLANE's, never ours.
+ * (logger.js), the error file (vendor/error-file/rolling-file-writer.js —
+ * pm/error_err.mdx §5.6) and, in the CLI's shared module, the one-time
+ * credentials mint (credentials.js — which the MCP never calls). Every other
+ * module is read-only on disk; statements staging is the PLANE's, never ours.
  */
 import type { Canary } from './canary.js';
 import { builtFiles } from './canary.js';
 
 const WRITE_API =
   /\b(writeFile|writeFileSync|appendFile|appendFileSync|writeSync|createWriteStream|rename|renameSync|unlink|unlinkSync|rm|rmSync|rmdir|rmdirSync|mkdir|mkdirSync|chmod|chmodSync|chown|chownSync|copyFile|copyFileSync|symlink|symlinkSync|truncate|truncateSync|utimes|utimesSync|cp|cpSync)\s*\(/;
-const ALLOWED = new Set(['logger.js', 'credentials.js']);
+const ALLOWED = new Set(['logger.js', 'credentials.js', 'vendor/error-file/rolling-file-writer.js']);
 
 export const canary: Canary = {
   name: 'no-fs-write',
   threats: ['T6'],
-  summary: 'fs write APIs appear only in logger.js and credentials.js',
+  summary: 'fs write APIs appear only in logger.js, credentials.js and vendor/error-file/rolling-file-writer.js',
   check(ctx) {
     const problems: string[] = [];
     for (const f of builtFiles(ctx.distDir)) {

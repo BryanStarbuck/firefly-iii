@@ -27,6 +27,7 @@ namespace FireflyIII\Machine\Http\Controllers;
 use FireflyIII\Machine\Credentials\CredentialsFile;
 use FireflyIII\Machine\Credentials\ResolvedKey;
 use FireflyIII\Machine\Envelope;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Operator;
 use FireflyIII\Machine\RouteTable;
@@ -45,6 +46,8 @@ use Throwable;
  */
 final class PlaneController extends MachineController
 {
+    private const string WHERE = 'app/Machine/Http/Controllers/PlaneController.php';
+
     /** GET /ping — the plane is mounted and the key is right. */
     public function ping(Request $request): JsonResponse
     {
@@ -229,6 +232,7 @@ final class PlaneController extends MachineController
             DB::select('select 1');
             $out['reachable'] = true;
         } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('probing the database connection', $e);
             $out['error'] = Envelope::scrub($e->getMessage());
 
             return $out;
@@ -245,6 +249,7 @@ final class PlaneController extends MachineController
                 $out['migrated']           = $out['migrated'] && 0 === $pending;
             }
         } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('checking the database migrations', $e);
             $out['migrated'] = false;
             $out['error']    = Envelope::scrub($e->getMessage());
         }
@@ -278,7 +283,8 @@ final class PlaneController extends MachineController
     {
         try {
             return $count();
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('counting a health figure', $e);
             return null;
         }
     }

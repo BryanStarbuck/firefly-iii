@@ -59,7 +59,12 @@ describe('credentials.ts is the CLI\'s module, byte for byte below the import bl
       if (/^import\b.*;\s*$/.test(l)) last = i;
     });
     assert.ok(last > 0, `${file}: no import block`);
-    return lines.slice(last + 1).join('\n');
+    // The error-file handle names the file's OWN repo-relative path (pm/error_err.mdx R14), so that
+    // one literal is the only permitted difference; everything else stays byte for byte.
+    return lines
+      .slice(last + 1)
+      .join('\n')
+      .replace(/errorFileFor\('(?:cli\/code\/src|mcp\/src)\/credentials\.ts'\)/, "errorFileFor('<this file>')");
   };
 
   it('is identical', () => {
@@ -109,5 +114,47 @@ describe('the instructions pipeline', () => {
     assert.doesNotMatch(INSTRUCTIONS, /\b[0-9a-f]{32,}\b/i);
     assert.match(INSTRUCTIONS, /There are 77 of them: 59 read and 18 write\./);
     assert.match(INSTRUCTIONS, /~\/\.credentials\/firefly_iii\.json/);
+  });
+});
+
+describe('the vendored error file has not drifted (pm/error_err.mdx §5.4)', () => {
+  const HEADER = '// GENERATED from errorfile/src — run node scripts/sync-error-file.mjs\n';
+  const FILES = ['index.ts', 'core.ts', 'describe.ts', 'redact.ts', 'fold.ts', 'format.ts', 'node.ts', 'rolling-file-writer.ts'];
+  const VENDOR = path.join(MCP_ROOT, 'src', 'vendor', 'error-file');
+
+  it('the sync script vendors exactly these files into this directory under this header', () => {
+    const script = fs.readFileSync(path.join(REPO_ROOT, 'scripts', 'sync-error-file.mjs'), 'utf8');
+    for (const file of FILES) assert.ok(script.includes(`'${file}'`), `sync-error-file.mjs does not vendor ${file}`);
+    assert.ok(script.includes("'mcp/src/vendor/error-file'"), 'sync-error-file.mjs does not target mcp/src/vendor/error-file');
+    assert.ok(script.includes(HEADER.trimEnd()), 'sync-error-file.mjs writes a different header');
+    assert.deepEqual(fs.readdirSync(VENDOR).sort(), [...FILES].sort(), 'mcp/src/vendor/error-file holds a file the sync does not own');
+  });
+
+  for (const file of FILES) {
+    it(`vendor/error-file/${file} is errorfile/src/${file}, byte for byte after the header`, () => {
+      const copy = path.join(VENDOR, file);
+      assert.ok(fs.existsSync(copy), `${copy} is missing — run node scripts/sync-error-file.mjs`);
+      const text = fs.readFileSync(copy, 'utf8');
+      assert.ok(text.startsWith(HEADER), `${file} lacks the GENERATED header`);
+      const source = fs.readFileSync(path.join(REPO_ROOT, 'errorfile', 'src', file), 'utf8');
+      assert.ok(text.slice(HEADER.length) === source, `mcp/src/vendor/error-file/${file} has drifted — run node scripts/sync-error-file.mjs`);
+    });
+  }
+});
+
+describe('tests never install the error file without an explicit file (pm/error_err.mdx §5.5, R13)', () => {
+  it('every installNodeErrorFile call under mcp/test/ passes file:', () => {
+    const TEST_DIR = path.join(MCP_ROOT, 'test');
+    const needle = 'installNodeError' + 'File(';
+    for (const name of fs.readdirSync(TEST_DIR).filter((f) => f.endsWith('.ts'))) {
+      const text = fs.readFileSync(path.join(TEST_DIR, name), 'utf8');
+      let at = text.indexOf(needle);
+      while (at !== -1) {
+        const close = text.indexOf('})', at);
+        const args = text.slice(at + needle.length, close === -1 ? undefined : close);
+        assert.ok(/\bfile\s*[:,]/.test(args), `${name}: installNodeErrorFile without file: — it would resolve process.env and could reach the real file`);
+        at = text.indexOf(needle, at + needle.length);
+      }
+    }
   });
 });

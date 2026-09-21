@@ -26,9 +26,13 @@ import { CliError, EXIT } from '../errors.js';
 import { catalogue, verbHelp } from '../help.js';
 import { resolveVerb } from '../args.js';
 import type { Outcome, Row } from '../render.js';
-import { out } from '../render.js';
+import { out, stripControls } from '../render.js';
 import type { Ctx, VerbDef } from '../verbs.js';
 import { C, objectOutcome } from './shared.js';
+import { resolveErrorFilePath } from '../vendor/error-file/node.js';
+import { errorFileFor } from '../vendor/error-file/index.js';
+
+const errors = errorFileFor('cli/code/src/commands/orientation.ts');
 
 const G = 'Orientation';
 
@@ -65,9 +69,15 @@ async function peek(cfg: Config): Promise<PlanePeek> {
       const who = await client.call('GET', '/whoami');
       result.whoami = (who.data ?? {}) as Record<string, unknown>;
     } catch (err) {
+      // A plane answer is shown in the report (R7); anything that is not a CliError is a fault.
+      if (err instanceof CliError) errors.expected('asking the plane who we are', err);
+      else errors.caught('asking the plane who we are', err);
       result.planeDetail = (err as Error).message;
     }
   } catch (err) {
+    // The ping IS the question: its answer becomes the report's plane row (R7).
+    if (err instanceof CliError) errors.expected('pinging the machine plane', err);
+    else errors.caught('pinging the machine plane', err);
     const e = err as CliError;
     result.plane = e.exit === EXIT.AUTH ? 'unauthorized' : /not mounted/.test(e.message) ? 'not-mounted' : 'error';
     result.planeDetail = e.message;
@@ -95,7 +105,10 @@ async function count(client: PlaneClient | undefined, route: string, query: Reco
   try {
     const env = await client.call('GET', route, { query, timeoutMs: 5000 });
     return pick((env.data ?? {}) as Record<string, unknown>);
-  } catch {
+  } catch (err) {
+    // The orientation facts are optional: a plane answer leaves the fact blank (R7).
+    if (err instanceof CliError) errors.expected('counting for the orientation report', err);
+    else errors.caught('counting for the orientation report', err);
     return undefined;
   }
 }
@@ -208,8 +221,8 @@ function readDotEnv(file: string): Record<string, string> {
       const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
       if (m?.[1]) out[m[1]] = (m[2] ?? '').replace(/^["']|["']$/g, '');
     }
-  } catch {
-    /* no .env */
+  } catch (err) {
+    errors.expected('reading the app env file', err); // no .env
   }
   return out;
 }
@@ -218,10 +231,153 @@ function findSqliteInside(dir: string): string[] {
   const hits: string[] = [];
   try {
     for (const name of fs.readdirSync(dir)) if (/\.sqlite$/.test(name)) hits.push(path.join(dir, name));
-  } catch {
-    /* no dir */
+  } catch (err) {
+    errors.expected('listing the SQLite files in a directory', err); // no dir
   }
   return hits;
+}
+
+const RECORD_HEADER = /^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\] \[(?:WARN|ERROR|FATAL|EXPECTED)\] /;
+
+/** Records (header lines) in the error file whose timestamp is within the last 24 hours. */
+export function recentRecordCount(file: string, nowMs = Date.now()): number {
+  let text: string;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    errors.expected('counting the recent error file records', err); // no error file yet: no records
+    return 0;
+  }
+  const since = nowMs - 24 * 60 * 60 * 1000;
+  let n = 0;
+  for (const line of text.split('\n')) {
+    const m = RECORD_HEADER.exec(line);
+    if (m?.[1] && Date.parse(m[1]) >= since) n++;
+  }
+  return n;
+}
+
+/** The nearest directory at or above `p` that exists, or undefined. */
+function nearestExisting(p: string): string | undefined {
+  let dir = p;
+  for (;;) {
+    if (fs.existsSync(dir)) return dir;
+    const up = path.dirname(dir);
+    if (up === dir) return undefined;
+    dir = up;
+  }
+}
+
+/**
+ * The `error file` doctor row — pm/error_err.mdx §5.7. PASS when the path is writable (or can be
+ * created) and the file is 0600. WARN when the mode is wider, or when .env's FIREFLY_ERROR_FILE
+ * points PHP at a different file than this process writes. Read-only: it never creates the file
+ * or its directory.
+ */
+export function errorFileCheck(env: NodeJS.ProcessEnv, dotEnv: Record<string, string>, home: string, nowMs = Date.now()): Check {
+  const file = resolveErrorFilePath(env);
+  const problems: string[] = [];
+  const fixes: string[] = [];
+  let writable = false;
+  let mode: number | undefined;
+  if (fs.existsSync(file)) {
+    try {
+      fs.accessSync(file, fs.constants.W_OK);
+      writable = true;
+    } catch (err) {
+      errors.expected('checking the error file is writable', err); // a doctor row, not a fault
+      writable = false;
+    }
+    try {
+      mode = fs.statSync(file).mode & 0o777;
+    } catch (err) {
+      errors.expected('reading the error file mode', err); // removed since existsSync
+      mode = undefined;
+    }
+  } else {
+    const dir = nearestExisting(path.dirname(file));
+    if (dir) {
+      try {
+        fs.accessSync(dir, fs.constants.W_OK);
+        writable = fs.statSync(dir).isDirectory();
+      } catch (err) {
+        errors.expected('checking the error file directory is writable', err); // a doctor row, not a fault
+        writable = false;
+      }
+    }
+  }
+  if (!writable) {
+    problems.push('not writable');
+    fixes.push(`make ${tildify(path.dirname(file), home)} writable, or set FIREFLY_ERROR_FILE`);
+  }
+  if (mode !== undefined && mode !== 0o600) {
+    problems.push(`mode ${mode.toString(8).padStart(4, '0')} is wider than 0600`);
+    fixes.push(`chmod 600 ${tildify(file, home)}`);
+  }
+  const fromDotEnv = dotEnv.FIREFLY_ERROR_FILE;
+  if (fromDotEnv) {
+    // PHP reads .env when the shell does not export the variable; a server started from another
+    // shell reads it regardless. Either way a .env value that resolves elsewhere splits the trail.
+    if (resolveErrorFilePath({ ...env, FIREFLY_ERROR_FILE: fromDotEnv }) !== file) {
+      problems.push(`.env's FIREFLY_ERROR_FILE (${fromDotEnv}) differs from this shell's`);
+      fixes.push('set FIREFLY_ERROR_FILE in the shell, not only in .env, so ffx and PHP write one file');
+    }
+  }
+  const recent = recentRecordCount(file, nowMs);
+  const where = `${tildify(file, home)}${mode !== undefined ? ` ${mode.toString(8).padStart(4, '0')}` : ' (not created yet)'}`;
+  return {
+    check: 'error file',
+    required: false,
+    ok: problems.length === 0,
+    detail: `${where}, ${recent} record${recent === 1 ? '' : 's'} in the last 24 h${problems.length ? ` — ${problems.join('; ')}` : ''}`,
+    fix: fixes.join('; '),
+  };
+}
+
+/** The newest mtime of any file under `dir`, recursively; 0 when there is none. */
+function newestMtime(dir: string): number {
+  let latest = 0;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    errors.expected('listing the browser module sources', err); // no dir: nothing newer
+    return latest;
+  }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    try {
+      latest = Math.max(latest, e.isDirectory() ? newestMtime(full) : fs.statSync(full).mtimeMs);
+    } catch (err) {
+      errors.expected('reading a browser module source mtime', err); // gone between readdir and stat
+    }
+  }
+  return latest;
+}
+
+/**
+ * The `web bundle` doctor row — pm/error_err.mdx §5.7: PASS when public/build/manifest.json is newer
+ * than every file under resources/assets/v3/js/support/, so the browser error net is in the bundle.
+ */
+export function webBundleCheck(repoRoot: string): Check {
+  const manifest = path.join(repoRoot, 'public', 'build', 'manifest.json');
+  const fix = 'the browser error net is not in the built bundle — just build-web';
+  let built: number;
+  try {
+    built = fs.statSync(manifest).mtimeMs;
+  } catch (err) {
+    errors.expected('reading the web bundle manifest', err); // not built: a doctor WARN row
+    return { check: 'web bundle', required: false, ok: false, detail: 'public/build/manifest.json missing', fix };
+  }
+  const latest = newestMtime(path.join(repoRoot, 'resources', 'assets', 'v3', 'js', 'support'));
+  const ok = built >= latest;
+  return {
+    check: 'web bundle',
+    required: false,
+    ok,
+    detail: ok ? 'public/build is newer than resources/assets/v3/js/support/' : 'public/build is older than resources/assets/v3/js/support/',
+    fix,
+  };
 }
 
 const doctor: VerbDef = {
@@ -263,7 +419,8 @@ const doctor: VerbDef = {
       fs.mkdirSync(cfg.stateDir, { recursive: true, mode: 0o700 });
       fs.accessSync(cfg.stateDir, fs.constants.W_OK);
       stateOk = true;
-    } catch {
+    } catch (err) {
+      errors.expected('checking the state dir is writable', err); // reported as a FAIL row
       stateOk = false;
     }
     add({ check: 'state dir writable', required: true, ok: stateOk, detail: tildify(cfg.stateDir, cfg.home), fix: `mkdir -p ${tildify(cfg.stateDir, cfg.home)}` });
@@ -293,11 +450,15 @@ const doctor: VerbDef = {
       try {
         fs.accessSync(root, fs.constants.R_OK);
         rootOk = true;
-      } catch {
+      } catch (err) {
+        errors.expected('checking the statements root is readable', err); // reported as a WARN row
         rootOk = false;
       }
     }
     add({ check: 'statements root configured + readable', required: false, ok: rootOk, detail: root ? tildify(root, cfg.home) : 'not configured', fix: 'set firefly_iii.statements.root in the credentials file' });
+
+    add(errorFileCheck(process.env, env, cfg.home));
+    add(webBundleCheck(cfg.repoRoot));
 
     const onPathFfx = onPath('ffx');
     const ours = path.join(cfg.repoRoot, 'cli', 'ffx');
@@ -353,30 +514,110 @@ const stop: VerbDef = {
 
 // ------------------------------------------------------------------ logs ---
 
+/**
+ * Laravel's own daily log that actually exists: the newest storage/logs/ff3-*.log by mtime
+ * (ff3-cli-server-YYYY-MM-DD.log for the web process, ff3-cli-… for artisan), not the `single`
+ * channel's file, which this install never writes (pm/error_err.mdx §5.7, §18.1 H11).
+ */
+export function newestLaravelLog(repoRoot: string): string | undefined {
+  const dir = path.join(repoRoot, 'storage', 'logs');
+  let best: { file: string; mtime: number } | undefined;
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch (err) {
+    errors.expected('listing the Laravel daily logs', err); // no storage/logs yet
+    return undefined;
+  }
+  for (const name of names) {
+    if (!/^ff3-.*\.log$/.test(name)) continue;
+    const file = path.join(dir, name);
+    try {
+      const mtime = fs.statSync(file).mtimeMs;
+      if (!best || mtime > best.mtime) best = { file, mtime };
+    } catch (err) {
+      errors.expected('reading a Laravel daily log mtime', err); // rotated away between readdir and stat
+    }
+  }
+  return best?.file;
+}
+
+/**
+ * The owed burst counts in the fold sidecar (error.fold, next to the error file — pm/error_err.mdx
+ * §3.5): one `owed: ×N <where> <doing>` line per open key. PHP rewrites the sidecar in place, so this
+ * read takes no lock and tolerates a half-written file: empty or invalid JSON prints
+ * `owed counts unavailable`. It never retries, never repairs and never writes. A missing sidecar
+ * owes nothing.
+ */
+export function owedCounts(errorFile: string): string[] {
+  const fold = path.join(path.dirname(errorFile), 'error.fold');
+  let text: string;
+  try {
+    text = fs.readFileSync(fold, 'utf8');
+  } catch (err) {
+    errors.expected('reading the fold sidecar', err); // a missing sidecar owes nothing
+    return [];
+  }
+  let state: unknown;
+  try {
+    state = JSON.parse(text);
+  } catch (err) {
+    errors.expected('parsing the fold sidecar', err); // half-written by PHP: printed as unavailable
+    return ['owed counts unavailable'];
+  }
+  const keys = (state as { v?: unknown; k?: unknown } | null)?.k;
+  if ((state as { v?: unknown } | null)?.v !== 1 || keys === null || typeof keys !== 'object' || Array.isArray(keys)) {
+    return ['owed counts unavailable'];
+  }
+  const lines: string[] = [];
+  for (const entry of Object.values(keys as Record<string, unknown>)) {
+    const e = entry as { n?: unknown; W?: unknown; d?: unknown } | null;
+    const n = e?.n;
+    if (typeof n !== 'number' || !(n > 0)) continue;
+    lines.push(stripControls(`owed: ×${n} ${String(e?.W ?? '')} ${String(e?.d ?? '')}`));
+  }
+  return lines;
+}
+
 const logs: VerbDef = {
   path: ['logs'],
   group: G,
-  summary: 'tail ~/T/_firefly_iii/server.log (or Laravel\'s own log)',
+  summary: 'tail ~/T/_firefly_iii/server.log, or the error file with --errors',
   flags: {
     follow: { help: 'keep printing new lines (Ctrl-C to stop)' },
     lines: { value: 'int', help: 'how many lines (default 40)' },
-    laravel: { help: 'storage/logs/laravel.log instead of the server log' },
+    errors: { help: 'the fault trail ~/T/firefly/error.err (FIREFLY_ERROR_FILE), then any owed burst counts' },
+    laravel: { help: 'the newest Laravel daily log (storage/logs/ff3-*.log)' },
     cli: { help: 'the CLI\'s own cli.err' },
   },
   async run(ctx) {
-    const file = ctx.bool('laravel')
-      ? path.join(ctx.cfg.repoRoot, 'storage', 'logs', 'laravel.log')
-      : ctx.bool('cli')
-        ? path.join(ctx.cfg.stateDir, 'cli.err')
-        : serverLogPath(ctx.cfg);
+    const errorsView = ctx.bool('errors');
+    let file: string;
+    if (errorsView) {
+      file = resolveErrorFilePath(process.env);
+    } else if (ctx.bool('laravel')) {
+      const newest = newestLaravelLog(ctx.cfg.repoRoot);
+      if (!newest) {
+        throw new CliError(EXIT.NOT_FOUND, `no Laravel daily log (storage/logs/ff3-*.log) in ${tildify(ctx.cfg.repoRoot, ctx.cfg.home)} yet`);
+      }
+      file = newest;
+    } else if (ctx.bool('cli')) {
+      file = path.join(ctx.cfg.stateDir, 'cli.err');
+    } else {
+      file = serverLogPath(ctx.cfg);
+    }
     ctx.note(`==> ${tildify(file, ctx.cfg.home)}`);
     const n = parseInt(ctx.str('lines') ?? '40', 10);
     const lines = tailFile(file, n);
+    const owed = errorsView ? owedCounts(file) : [];
     if (!ctx.bool('follow')) {
-      if (!fs.existsSync(file)) throw new CliError(EXIT.NOT_FOUND, `${tildify(file, ctx.cfg.home)} does not exist yet`);
-      return { lines, plain: true };
+      if (!fs.existsSync(file)) {
+        if (owed.length) return { lines: owed, plain: true };
+        throw new CliError(EXIT.NOT_FOUND, `${tildify(file, ctx.cfg.home)} does not exist yet`);
+      }
+      return { lines: [...lines, ...owed], plain: true };
     }
-    if (lines.length) out(lines.join('\n'));
+    if (lines.length || owed.length) out([...lines, ...owed].join('\n'));
     let offset = fs.existsSync(file) ? fs.statSync(file).size : 0;
     await new Promise<void>((resolve) => {
       const onSig = (): void => {

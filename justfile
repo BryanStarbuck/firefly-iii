@@ -8,11 +8,12 @@
 #
 #   `just build`  compiles the CLI + MCP server and registers the MCP server with Claude Code.
 #   `just run`    builds, starts the web app detached (terminal returns), prints the URL.
-#   `just dev`    foreground server (Ctrl-C stops).   `just stop` / `just status` / `just logs`.
+#   `just dev`    foreground server (Ctrl-C stops).   `just stop` / `just status` / `just logs` / `just errors`.
 #
 #   Private data never lives in this repo: the SQLite database, the logs and the
-#   pid file live under ~/T/_firefly_iii/, and the machine key in
-#   ~/.credentials/firefly_iii.json (minted by the web app on its first run).
+#   pid file live under ~/T/_firefly_iii/, the machine key in
+#   ~/.credentials/firefly_iii.json (minted by the web app on its first run),
+#   and the error file is ~/T/firefly/error.err (pm/error_err.mdx).
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -65,6 +66,7 @@ setup:
       npm install --no-audit --no-fund
       (cd resources/assets/v3 && npm run build)
     fi
+    php artisan firefly-machine:json-translations
     (cd cli && npm install --no-audit --no-fund)
     [ -d mcp ] && [ -f mcp/package.json ] && (cd mcp && npm install --no-audit --no-fund) || true
     [ "$fresh_env" = 1 ] && echo "wrote .env — set FIREFLY_MACHINE_OPERATOR there if this install has more than one user" || true
@@ -72,7 +74,12 @@ setup:
 
 # After this, `firefly_iii` (ff_* tools) is usable from Claude Code — restart Claude Code, or /mcp, to pick it up.
 # Build the CLI and the MCP server, then register the MCP server with Claude Code.
-build: build-cli build-mcp mcp-register
+build: sync-error-file build-cli build-mcp build-i18n build-web mcp-register
+
+# The v3 web UI's i18next strings (public/v3/i18n/*.json, git-ignored upstream). Without them every
+# chart fails with "firefly.could_not_load_chart RangeError: … unescaped latin alphabet character `n`".
+build-i18n:
+    cd "{{root}}" && php artisan firefly-machine:json-translations >/dev/null && echo "  i18n         public/v3/i18n/*.json generated"
 
 # Compile the CLI (cli/code/src → cli/code/dist). The CLI must never be stale relative to the app.
 build-cli:
@@ -81,6 +88,19 @@ build-cli:
 # Compile the MCP server (mcp/src → mcp/dist, instructions from ai/mcp_prompt_firefly.md).
 build-mcp:
     if [ -f "{{root}}/mcp/package.json" ]; then cd "{{root}}/mcp" && npm run --silent build; fi
+
+# Copy errorfile/src into cli/code/src/vendor/error-file and mcp/src/vendor/error-file (pm/error_err.mdx §5.4).
+# Writes a file only when it differs. Runs from `just build` and by hand — never from `just test`.
+sync-error-file:
+    node "{{root}}/scripts/sync-error-file.mjs"
+
+# Fail (exit 1) when a committed vendored error-file copy differs from errorfile/src. Writes nothing.
+sync-error-file-check:
+    node "{{root}}/scripts/sync-error-file.mjs" --check
+
+# Compile the error-file library and its tests (errorfile/src + test → errorfile/.build) with the CLI's tsc.
+build-errorfile:
+    cd "{{root}}" && cli/node_modules/.bin/tsc -p errorfile/tsconfig.json
 
 # Read-only by default. For writes: just mcp-register 1  (the app's .env needs FIREFLY_MACHINE_ALLOW_WRITE=1 too).
 # Register the MCP server with Claude Code (user scope) if not registered yet. Idempotent.
@@ -112,7 +132,7 @@ mcp-register write="0":
 mcp-unregister:
     claude mcp remove --scope user {{mcp_name}} 2>/dev/null || claude mcp remove {{mcp_name}}
 
-# Web UI + /api/v1 + /machine/v1 all on one port. Logs → ~/T/_firefly_iii/server.log. Same code path as `ffx up`.
+# Web UI + /api/v1 + /machine/v1 all on one port. Logs → ~/T/_firefly_iii/server.log; faults → ~/T/firefly/error.err. Same code path as `ffx up`.
 # Build everything, start the web app DETACHED (the terminal comes back), print the URL.
 run: build
     #!/usr/bin/env bash
@@ -146,6 +166,7 @@ url:
     echo "  machine API   http://{{host}}:{{port}}/machine/v1   (loopback + key only)"
     echo "  MCP server    {{mcp_name}}  $mcp in Claude Code   (ff_* tools)"
     echo "  log           ~/T/_firefly_iii/server.log"
+    echo "  errors        ~/T/firefly/error.err"
     echo "  stop          just stop        status  just status        open  just open"
     echo "  ============================================================"
     echo
@@ -173,11 +194,71 @@ doctor:
 logs:
     "{{root}}/cli/ffx" logs --follow
 
-# The CLI's tests and canaries; the machine plane's PHPUnit suite when it exists.
-test: build-cli build-mcp
-    cd "{{root}}/cli" && node --test code/dist/test/
-    if [ -d "{{root}}/tests/Machine" ] && [ -x "{{root}}/vendor/bin/phpunit" ]; then cd "{{root}}" && php vendor/bin/phpunit -c phpunit.machine.xml; fi
-    if [ -f "{{root}}/mcp/package.json" ]; then cd "{{root}}/mcp" && npm test --silent; fi
+# Follow the fault trail ~/T/firefly/error.err (pm/error_err.mdx), then any owed burst counts.
+errors:
+    "{{root}}/cli/ffx" logs --errors --follow
+
+# Upstream-merge guard (pm/error_err.mdx §17): fail when an upstream file outside scripts/upstream-delta.allow
+# differs from `git merge-base HEAD upstream/develop`; added files print as class B. No `upstream` remote → a note, exit 0.
+check-delta:
+    node "{{root}}/scripts/upstream-delta.mjs"
+
+# pm/error_err.mdx §13: the PHP catch sites (php-parser), the TS/JS catch sites and the upstream v3 ceiling (the
+# TypeScript compiler API), the wired runtimes, and the R17 hint check (§18); upstream PHP's silent catches print as
+# informational with their delta. The report goes to error_file_coverage.json next to the error file, never into
+# the repo. `--canary` rebuilds the CLI and the MCP server, then runs C1–C15 against a temp error file.
+# Error-file coverage gate: every catch reports, every runtime is wired (--canary: prove every net fires; --quiet)
+check-errors *FLAGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd "{{root}}"
+    flags=" {{FLAGS}} "
+    quiet=""; [[ "$flags" == *" --quiet "* ]] && quiet="--quiet"
+    status=0
+    php scripts/error-file-coverage.php $quiet || status=1
+    echo
+    node scripts/error-file-coverage.mjs $quiet || status=1
+    echo
+    # R17 (§18): the canonical hint H in every file of a hint row that carries it, at least once per row.
+    hint='The detail is in ~/T/firefly/error.err — ffx logs --errors'
+    r17=0
+    for row in app/Machine/MachineException.php:1 app/Machine/Envelope.php:1 app/Machine/Http/Controllers/AdminController.php:2 \
+               cli/code/src/client.ts:2 cli/code/src/main.ts:1 mcp/src/client.ts:3 mcp/src/server.ts:1; do
+      file="${row%%:*}"; want="${row##*:}"
+      have="$(rg -F -c -- "$hint" "$file" 2>/dev/null || echo 0)"
+      if [ "$have" -lt "$want" ]; then echo "    VIOLATING  $file  R17 — the hint appears $have time(s), its §18 rows need $want"; r17=1; fi
+    done
+    if [ "$r17" -eq 0 ]; then echo "R17 hint check (pm/error_err.mdx §18): every hint row names ~/T/firefly/error.err"; else echo "R17 hint check: FAILED"; status=1; fi
+    if [[ "$flags" == *" --canary "* ]]; then
+      echo
+      just --justfile "{{justfile()}}" build-cli build-mcp >/dev/null || status=1
+      node scripts/error-file-canary.mjs || status=1
+    fi
+    exit $status
+
+# The v3 Vite bundle (public/build, git-ignored) — rebuilt only when resources/assets/v3/{js,sass} is newer
+# than public/build/manifest.json, so the browser error net (pm/error_err.mdx §6.6) ships and `just build` stays fast.
+build-web:
+    cd "{{root}}" && (node scripts/web-bundle-fresh.mjs || (cd resources/assets/v3 && npm run build))
+
+# The error-file library's suite, the CLI's tests and canaries, the machine plane's PHPUnit suite, the MCP suite.
+# pm/error_err.mdx §5.4, §15: the vendored error-file copies are CHECKED first (never rewritten here), then built;
+# every line runs with FIREFLY_ERROR_FILE on a fresh canary path, and the run fails if anything wrote there (AC 11).
+test: sync-error-file-check build-cli build-mcp build-errorfile
+    #!/usr/bin/env bash
+    set -euo pipefail
+    canary_root="$(mktemp -d "${TMPDIR:-/tmp}/firefly-test-canary.XXXXXX")"
+    trap 'rm -rf "$canary_root"' EXIT
+    export FIREFLY_ERROR_FILE="$canary_root/firefly-test-canary/error.err"
+    cd "{{root}}"
+    node --test errorfile/.build/test/ errorfile/test/browser-core.test.mjs
+    (cd cli && node --test code/dist/test/)
+    if [ -d tests/Machine ] && [ -x vendor/bin/phpunit ]; then php vendor/bin/phpunit -c phpunit.machine.xml; fi
+    if [ -f mcp/package.json ]; then (cd mcp && npm test --silent); fi
+    if [ -e "$FIREFLY_ERROR_FILE" ]; then
+      echo "FAIL: a test process wrote $FIREFLY_ERROR_FILE — the environment's error file, not its sandbox (pm/error_err.mdx §15, AC 11)" >&2
+      exit 1
+    fi
 
 # Print the PATH line for ~/.zshrc (never edits your profile).
 install-cli:

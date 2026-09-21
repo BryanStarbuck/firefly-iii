@@ -1,0 +1,22 @@
+{
+  "//": "pm/error_err.mdx §5.1: compiles src/ + test/ into .build/ with ../cli/node_modules/.bin/tsc; the same flags as cli/code/tsconfig.json.",
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rootDir": ".",
+    "outDir": ".build",
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "declaration": false,
+    "sourceMap": false,
+    "skipLibCheck": true,
+    "typeRoots": ["../cli/node_modules/@types"],
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": [".build", "fixtures"]
+}

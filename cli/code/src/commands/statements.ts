@@ -21,6 +21,9 @@ import type { Column, Outcome, Row, View } from '../render.js';
 import { getPath, inferColumns } from '../render.js';
 import type { Ctx, FlagDef, VerbDef } from '../verbs.js';
 import { applyCommand, C, changeNotes, get, rangeOf, RANGE_FLAGS, ref, rowsOf, send, shellQuote } from './shared.js';
+import { errorFileFor } from '../vendor/error-file/index.js';
+
+const errors = errorFileFor('cli/code/src/commands/statements.ts');
 
 const G = 'The statements pipeline';
 
@@ -50,7 +53,8 @@ export function realOrSelf(p: string): string {
     try {
       const real = fs.realpathSync(cur);
       return tail.length ? path.join(real, ...tail.reverse()) : real;
-    } catch {
+    } catch (err) {
+      errors.expected('resolving a real path', err); // does not exist yet: walk up to an existing ancestor
       const parent = path.dirname(cur);
       if (parent === cur) return abs;
       tail.push(path.basename(cur));

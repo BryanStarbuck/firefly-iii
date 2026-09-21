@@ -26,6 +26,7 @@ namespace FireflyIII\Console\Commands\Machine;
 
 use FireflyIII\Machine\Credentials\CredentialsFile;
 use FireflyIII\Machine\Credentials\CredentialsRefused;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use Illuminate\Console\Command;
 
 /**
@@ -86,6 +87,7 @@ final class MachineKey extends Command
                 return self::SUCCESS;
             }
         } catch (CredentialsRefused $e) {
+            ErrorFile::for('app/Console/Commands/Machine/MachineKey.php')->expected('managing the machine key', $e);
             $this->error($e->getMessage());
             if ('' !== $e->fix) {
                 $this->line('fix: '.$e->fix);

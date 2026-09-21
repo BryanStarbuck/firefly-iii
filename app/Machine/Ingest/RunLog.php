@@ -25,6 +25,7 @@ declare(strict_types=1);
 namespace FireflyIII\Machine\Ingest;
 
 use Carbon\CarbonImmutable;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use JsonException;
 
@@ -35,6 +36,8 @@ use JsonException;
  */
 final class RunLog
 {
+    private const string WHERE = 'app/Machine/Ingest/RunLog.php';
+
     public const string FILE = '_run.log';
 
     public static function newId(): string
@@ -73,7 +76,8 @@ final class RunLog
 
             try {
                 $row = json_decode($line, true, 16, JSON_THROW_ON_ERROR);
-            } catch (JsonException) {
+            } catch (JsonException $e) {
+                ErrorFile::for(self::WHERE)->expected('reading a run log line', $e);
                 continue;
             }
             if (is_array($row) && isset($row['id'])) {
@@ -97,7 +101,8 @@ final class RunLog
 
         try {
             $doc = json_decode($text, true, 64, JSON_THROW_ON_ERROR);
-        } catch (JsonException) {
+        } catch (JsonException $e) {
+            ErrorFile::for(self::WHERE)->expected('reading a run record', $e);
             return null;
         }
 

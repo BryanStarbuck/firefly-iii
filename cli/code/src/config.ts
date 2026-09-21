@@ -8,6 +8,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { errorFileFor } from './vendor/error-file/index.js';
+
+const errors = errorFileFor('cli/code/src/config.ts');
+
 export const DEFAULT_HOST = '127.0.0.1';
 export const DEFAULT_PORT = 7373;
 export const DEFAULT_API = `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
@@ -81,7 +85,8 @@ export function unsafeTargetReason(apiUrl: string): string | undefined {
   let url: URL;
   try {
     url = new URL(apiUrl);
-  } catch {
+  } catch (err) {
+    errors.expected('parsing the API URL', err); // the refusal reason is the answer (R7)
     return `not a URL: ${apiUrl}`;
   }
   if (url.protocol === 'https:') return undefined;

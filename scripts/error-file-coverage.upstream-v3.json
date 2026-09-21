@@ -1,0 +1,22 @@
+{
+    "resources/assets/v3/js/boot/bootstrap.js": 1,
+    "resources/assets/v3/js/pages/administrations/edit.js": 1,
+    "resources/assets/v3/js/pages/dashboard/boxes.js": 1,
+    "resources/assets/v3/js/pages/exchange-rates/rates.js": 1,
+    "resources/assets/v3/js/pages/profile/oauth.js": 2,
+    "resources/assets/v3/js/pages/recurring/shared/respond-to-first-date-change.js": 1,
+    "resources/assets/v3/js/pages/transactions/create.js": 1,
+    "resources/assets/v3/js/pages/transactions/edit.js": 1,
+    "resources/assets/v3/js/pages/transactions/shared/process-attachments.js": 2,
+    "resources/assets/v3/js/pages/transactions/shared/process-transaction-links.js": 2,
+    "resources/assets/v3/js/pages/webhooks/create.js": 1,
+    "resources/assets/v3/js/pages/webhooks/edit.js": 2,
+    "resources/assets/v3/js/pages/webhooks/shared/load-deliveries.js": 1,
+    "resources/assets/v3/js/pages/webhooks/shared/load-responses.js": 1,
+    "resources/assets/v3/js/pages/webhooks/shared/load-triggers.js": 1,
+    "resources/assets/v3/js/pages/webhooks/show.js": 1,
+    "resources/assets/v3/js/shared/draw-chart.js": 3,
+    "resources/assets/v3/js/store/get-fresh-variable.js": 1,
+    "resources/assets/v3/js/store/get-variable.js": 1,
+    "resources/assets/v3/js/store/get-variables.js": 1
+}

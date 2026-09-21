@@ -112,7 +112,8 @@ Upstream code worth knowing when working on the plane:
   PHP 8.5 and Composer on the host (`brew install php composer`). Docker is not supported for the
   machine plane: requests arrive from the bridge IP, so the loopback gate fails closed.
 * Root `justfile` (ours; upstream has none): `just setup`, `just build`, `just run`, `just dev`, `just url`,
-  `just open`, `just stop`, `just status`, `just doctor`, `just logs`, `just test`, `just mcp-register`.
+  `just open`, `just stop`, `just status`, `just doctor`, `just logs`, `just errors`, `just test`,
+  `just check-errors`, `just mcp-register`.
   * `just build` compiles the CLI and the MCP server AND registers the MCP server with Claude Code
     (user scope, read-only, idempotent). `just mcp-register 1` re-registers it with writes on.
   * `just run` builds, starts the web app DETACHED via `ffx up` (the terminal comes back), and prints
@@ -130,7 +131,9 @@ Upstream code worth knowing when working on the plane:
   (add `"env": {"FFMCP_ALLOW_WRITE": "1"}` to let it write; the app's `.env` needs
   `FIREFLY_MACHINE_ALLOW_WRITE=1` too).
 * State and logs: `~/T/_firefly_iii/` — `server.log`, `server.pid`, `cli.info`, `cli.err`,
-  `mcp.info`, `mcp.err`, `machine.audit`. Laravel's own log stays at `storage/logs/laravel.log`.
+  `mcp.info`, `mcp.err`, `machine.audit`. **Every fault from every runtime: `~/T/firefly/error.err`**
+  (pm/error_err.mdx; `ffx logs --errors`, `just errors`). Laravel's own daily log is
+  `storage/logs/ff3-cli-server-YYYY-MM-DD.log`.
 * Database: SQLite **outside the repo** at `~/T/_firefly_iii/db/firefly.sqlite`, set as `DB_DATABASE`
   in the git-ignored `.env`. Never use upstream's default `storage/database/database.sqlite`, which is
   inside this public repo's tree.

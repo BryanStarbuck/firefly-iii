@@ -26,6 +26,9 @@ import { portOf, tildify } from './config.js';
 import { CliError, EXIT } from './errors.js';
 import { log } from './logger.js';
 import type { Spinner } from './progress.js';
+import { errorFileFor } from './vendor/error-file/index.js';
+
+const errors = errorFileFor('cli/code/src/bringup.ts');
 
 export const MIN_PHP = [8, 5] as const;
 const HEALTH_WAIT_MS = 60_000;
@@ -60,8 +63,8 @@ export function onPath(cmd: string): string | undefined {
     try {
       fs.accessSync(full, fs.constants.X_OK);
       return full;
-    } catch {
-      /* keep looking */
+    } catch (err) {
+      errors.expected('looking for a command on the PATH', err); // not in this dir: keep looking
     }
   }
   return undefined;
@@ -71,7 +74,8 @@ export function readPid(cfg: Config): number | undefined {
   try {
     const n = parseInt(fs.readFileSync(pidFilePath(cfg), 'utf8').trim(), 10);
     return n > 0 ? n : undefined;
-  } catch {
+  } catch (err) {
+    errors.expected('reading the server pid file', err); // no pid file: ffx did not start it
     return undefined;
   }
 }
@@ -81,6 +85,7 @@ export function isAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (err) {
+    errors.expected('probing whether a pid is alive', err); // ESRCH is the answer "not alive"
     return (err as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
@@ -144,17 +149,27 @@ export function tailFile(file: string, lines = 20): string[] {
     const all = text.split('\n');
     if (all[all.length - 1] === '') all.pop();
     return all.slice(-lines);
-  } catch {
+  } catch (err) {
+    errors.expected('reading the tail of a log file', err); // no log yet: nothing to show
     return [];
   }
 }
 
-function failWithLogTail(cfg: Config, message: string, hint?: string): CliError {
+/**
+ * The web app would not come up: the one exit-5 CliError that IS a fault (pm/error_err.mdx R7,
+ * §5.7, N14), so it is written here; reportError()'s later expected() for the same object is a
+ * no-op. The server.log tail goes to the terminal only and is NEVER copied into the record: it may
+ * hold a password-reset link. The hint stays `ffx logs` (§18.1 H9): a boot failure lives in
+ * server.log.
+ */
+function failWithLogTail(cfg: Config, message: string, hint?: string, waitedMs?: number): CliError {
   const tail = tailFile(serverLogPath(cfg));
-  return new CliError(EXIT.UNAVAILABLE, message, {
+  const err = new CliError(EXIT.UNAVAILABLE, message, {
     details: tail.length ? [`last lines of ${tildify(serverLogPath(cfg), cfg.home)}:`, ...tail.map((l) => `  ${l}`)] : [],
     hint: hint ?? 'ffx logs',
   });
+  errors.caught('bringing up the web app', err, { exit: EXIT.UNAVAILABLE, waited_ms: waitedMs });
+  return err;
 }
 
 /** Refusals that do not depend on the port — checked before anything is started. */
@@ -213,8 +228,8 @@ async function withBringupLock<T>(cfg: Config, fn: () => Promise<T>): Promise<T>
         const holder = parseInt(fs.readFileSync(lock, 'utf8').trim(), 10);
         const age = Date.now() - fs.statSync(lock).mtimeMs;
         if (!(holder > 0 && isAlive(holder)) || age > BRINGUP_LOCK_STALE_MS) fs.rmSync(lock, { force: true });
-      } catch {
-        /* released while we looked */
+      } catch (e) {
+        errors.expected('checking the bring-up lock', e); // released while we looked
       }
       if (Date.now() > deadline) throw new CliError(EXIT.UNAVAILABLE, `another ffx is bringing Firefly III up (${lock})`, { hint: 'wait for it, or ffx status' });
       await sleep(250);
@@ -279,7 +294,8 @@ async function spawnAndWait(cfg: Config, spinner: Spinner): Promise<number> {
   log.info(`bring-up: started php artisan serve pid=${child.pid} port=${port}`);
 
   spinner.start(`Starting Firefly III on ${cfg.apiUrl}…`);
-  const deadline = Date.now() + HEALTH_WAIT_MS;
+  const waitStarted = Date.now();
+  const deadline = waitStarted + HEALTH_WAIT_MS;
   while (Date.now() < deadline) {
     if (await probeUp(cfg, 2000)) {
       spinner.stop();
@@ -287,13 +303,13 @@ async function spawnAndWait(cfg: Config, spinner: Spinner): Promise<number> {
     }
     if (exited !== null) {
       spinner.stop();
-      throw failWithLogTail(cfg, `php artisan serve exited (code ${exited}) before /up answered`);
+      throw failWithLogTail(cfg, `php artisan serve exited (code ${exited}) before /up answered`, undefined, Date.now() - waitStarted);
     }
     spinner.tick('Waiting for Firefly III to answer /up…');
     await sleep(500);
   }
   spinner.stop();
-  throw failWithLogTail(cfg, `Firefly III did not answer /up within ${HEALTH_WAIT_MS / 1000}s`);
+  throw failWithLogTail(cfg, `Firefly III did not answer /up within ${HEALTH_WAIT_MS / 1000}s`, undefined, Date.now() - waitStarted);
 }
 
 export interface EnsureOptions {
@@ -338,11 +354,12 @@ export async function stopOurs(cfg: Config): Promise<StopResult> {
   }
   try {
     process.kill(-pid, 'SIGTERM');
-  } catch {
+  } catch (err) {
+    errors.expected('signalling the server process group', err); // not a group leader: signal the pid
     try {
       process.kill(pid, 'SIGTERM');
-    } catch {
-      /* raced with exit */
+    } catch (e) {
+      errors.expected('signalling the server process', e); // raced with exit
     }
   }
   const deadline = Date.now() + 5000;
@@ -350,8 +367,8 @@ export async function stopOurs(cfg: Config): Promise<StopResult> {
   if (isAlive(pid)) {
     try {
       process.kill(-pid, 'SIGKILL');
-    } catch {
-      /* gone */
+    } catch (err) {
+      errors.expected('killing the server process group', err); // gone
     }
   }
   fs.rmSync(pidFilePath(cfg), { force: true });

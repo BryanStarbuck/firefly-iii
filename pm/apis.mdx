@@ -302,7 +302,9 @@ returns Firefly's verdict verbatim and adds nothing. §11.6.
 **R8 — Reads never mutate.** No route in the read tier writes to the ledger, the filesystem, the
 cache of any other tenant, or fires a webhook. `/search` is a read because Firefly's search
 language has no mutation operator. `/ingest/scan` is a read because it only stats files. The one
-read-tier route that touches disk says so in its entry.
+read-tier route that touches disk says so in its entry. Writing `~/T/firefly/error.err` when a route
+faults is not a read-tier mutation: it is not the ledger, not the statements root, and not
+caller-visible (error_err.mdx).
 
 **R9 — Fail closed.** No key, no plane. No operator user, no plane. No tier, no route. No validation
 match, no handler. An unauthenticated or untiered fallback does not exist anywhere in this design,
@@ -728,7 +730,8 @@ Every response, success or failure, is one JSON object of the same shape.
 - **`meta.asOf` is the server's clock.** A balance without a timestamp is a lie tomorrow.
 - **`error.details` is structured and bounded.** Field names, counts, ids, the conflicting rows. It
   never contains a stack trace, a file path outside the statements root, a SQL string or a Laravel
-  exception class name — those go to `storage/logs` and stay there (§16.4).
+  exception class name — those go to `~/T/firefly/error.err` ([error_err.mdx](./error_err.mdx)) and
+  stay there (§16.4).
 - **Laravel's own error pages never reach a plane caller.** The plane's exception renderer
   converts `ValidationException`, `ModelNotFoundException`, `AuthorizationException`,
   `DuplicateTransactionException` and `FireflyException` into the envelope; anything else becomes
@@ -749,7 +752,7 @@ Every response, success or failure, is one JSON object of the same shape.
 | `write_disabled` | 403  | gate 4 — a write route with the tier off                                                                 |
 | `not_ready`      | 503  | the app is up but no operator/administration resolved, the DB is not migrated, or the plane is not armed |
 | `upstream_error` | 502  | a Firefly service failed in a way we can name (a `FireflyException` with a known cause)                  |
-| `internal`       | 500  | anything else; the message is generic and the detail is in the log                                      |
+| `internal`       | 500  | anything else; the message is generic and the detail is in `~/T/firefly/error.err` (error_err.mdx)       |
 
 **A tenth code is a spec change, not a commit.** mcp.mdx §12.3 lists twelve: the three extra
 (`confirm_required`, `too_many_changes`, `wrong_server`) are minted by the MCP and **never appear on
@@ -2124,8 +2127,9 @@ comes from an optional `X-Firefly-Client` header and is advisory: it is for read
 granting anything (the one exception, §6.1, only ever takes privilege away). `op` joins to
 `machine_operations` for the full before-image, which lives in the database, outside the repo.
 
-Laravel's own log (`storage/logs/laravel.log`) is upstream's and may hold stack traces; the plane's
-exception renderer logs there, never to the caller.
+Laravel's own daily log (`storage/logs/ff3-cli-server-YYYY-MM-DD.log`) is upstream's and may hold stack
+traces. The plane's exception handler writes every fault to `~/T/firefly/error.err` first
+(error_err.mdx); the caller gets neither.
 
 ---
 

@@ -172,7 +172,7 @@ these books without inventing a number, and cannot change them by accident.**
 | **Talks to**           | `http://127.0.0.1:7373/machine/v1/*` — the machine-plane API ([apis.mdx](./apis.mdx))             |
 | **Authenticates with** | `X-Firefly-Machine-Key`, from `~/.credentials/firefly_iii.json` (0600)                            |
 | **Env prefix**         | `FFMCP_`                                                                                          |
-| **Logs**               | `~/T/_firefly_iii/mcp.info` and `mcp.err` — beside the CLI's `cli.info` / `cli.err`               |
+| **Logs**               | `~/T/_firefly_iii/mcp.info` and `mcp.err` — beside the CLI's `cli.info` / `cli.err`; faults also go to `~/T/firefly/error.err` ([error_err.mdx](./error_err.mdx)) |
 | **Writes?**            | **off by default.** 59 of 77 tools read; the 18 that write need two switches, a dry run and a token |
 | **Computes?**          | nothing                                                                                           |
 | **Instructions**       | `ai/mcp_prompt_firefly.md`, generated into `src/instructions.ts` at build time (§8.3)             |
@@ -444,7 +444,7 @@ _"a persuasive string reaches a tool handler."_
 | T3  | **Ledger read as another's**              | model routes to `actual_budget`/`quickbooks`, or wrong administration | the eight layers of §3.4                                                                   | `administrationName` on every envelope                   | `routing`                |
 | T4  | **Search escape hatch abuse**             | `ff_search` / `ff_get_upstream` used to reach withheld data        | Firefly's search has no mutation operator; the mirror is GET-only with a denylist            | row cap + byte cap + timeout                             | `query-guard`            |
 | T5  | **PII / statement exfiltration**          | a tool coaxed into raw statement text or an account number         | no tool returns raw statement text; IBANs and numbers as last-4 only (§7.4)                  | path containment on every statements tool                | `redaction`              |
-| T6  | **Filesystem escape**                     | a statements path of `../../.ssh/id_rsa`                           | real-path containment in the plane                                                           | this process has no `fs` write path                      | `no-fs-write`            |
+| T6  | **Filesystem escape**                     | a statements path of `../../.ssh/id_rsa`                           | real-path containment in the plane                                                           | this process writes only its log directory (`logger.js`) and the error file (`vendor/error-file/rolling-file-writer.js`, [error_err.mdx](./error_err.mdx)) | `no-fs-write`            |
 | T7  | **Resource exhaustion**                   | a query or an import that never returns                            | plane timeouts and caps; concurrency 1 for writes                                            | this server's own timeout                                | —                        |
 | T8  | **Prompt injection from ledger data**     | a description reading _"ignore your instructions and…"_            | row content never executed; `meta.untrusted` marks it (§7.5)                                  | no call's arguments come from a prior result automatically | `envelope`             |
 | T9  | **RCE / exfiltration via the process**    | a dependency shells out or phones home                             | no `child_process`, no `fs.write*`, one host — `127.0.0.1`                                   | one runtime dependency (the SDK)                         | `no-network`, `no-shell` |
@@ -978,7 +978,7 @@ without an echo), `too_many_changes` (the MCP's own ceiling), `wrong_server` (a 
 | A statement conflict                            | `conflict`, both files named                                | pick the correct file                                  |
 | A result hit a cap                              | `ok: true`, `truncated: true`, `limit_applied`              | narrow the range                                       |
 | An Actual Budget or QuickBooks id               | `wrong_server`, naming the neighbour                        | —                                                      |
-| The plane 500s                                  | `upstream_error` or `internal`, **never a stack**           | `ffx logs --laravel`                                   |
+| The plane 500s                                  | `upstream_error` or `internal`, **never a stack**           | The detail is in ~/T/firefly/error.err — ffx logs --errors |
 
 Nothing is a silent success, and nothing is a silent cap.
 
@@ -1001,6 +1001,10 @@ Nothing is a silent success, and nothing is a silent cap.
 | `FFMCP_PROMPT_FILE`      | — (generated constant)             | dev override for the instructions prose                       |
 | `FFMCP_LOG_LEVEL`        | `info`                             | `error` · `warn` · `info` · `debug`                           |
 | `FFMCP_LOG_DIR`          | `~/T/_firefly_iii`                 | where `mcp.info` / `mcp.err` go                               |
+| `FIREFLY_ERROR_FILE`     | `~/T/firefly/error.err`            | every fault from every runtime ([error_err.mdx](./error_err.mdx)); one variable shared with PHP and ffx, no `FFMCP_` twin |
+| `FIREFLY_ERROR_FILE_VERBOSE` | `0` | `1` also writes EXPECTED records to the error file ([error_err.mdx](./error_err.mdx) §4.11); shared with PHP and `ffx` |
+| `FIREFLY_ERROR_FILE_CANARY`  | `0` | `1` enables the `__canary` branches; refused unless `FIREFLY_ERROR_FILE` is non-empty ([error_err.mdx](./error_err.mdx) §4.11) |
+| `FIREFLY_ERROR_FILE_ECHO`    | —   | ignored by `mcp`; in PHP and `ffx`, `1` echoes each written record to stderr |
 
 Read **once at startup** into a frozen config; resolved values (the key as a fingerprint) printed to
 **stderr** in the banner.
@@ -1025,7 +1029,8 @@ Read **once at startup** into a frozen config; resolved values (the key as a fin
 
 `~/T/_firefly_iii/mcp.info` (INFO + one `CALL` line per tool call, file only) and `mcp.err` (WARN,
 ERROR, every denial; also stderr). Append-only, `0600`, rotated at 8 MB. Logging never crashes the
-server.
+server. Faults are also written to `~/T/firefly/error.err` as `[mcp]` ([error_err.mdx](./error_err.mdx));
+stdout stays pure.
 
 ### 16.2 The audit line
 
@@ -1051,7 +1056,7 @@ Code: `~/BGit/Bryan_git/firefly-iii/mcp/src/audit.ts` — `auditLine()`, `const 
 | **Hand-piped probe**       | `initialize` over stdin returns `capabilities.tools` and an `instructions` string whose first sentence is §3.4 layer 5 verbatim                   |
 | **stdout-purity canary**   | built `dist/` has no `console.log(`, `console.info(`, `process.stdout.write(`                                                                      |
 | **no-network canary**      | no host literal but loopback; no `child_process`; exactly one module calls `fetch`                                                                 |
-| **no-fs-write canary**     | no `fs` write API outside the logger and the credential minter                                                                                     |
+| **no-fs-write canary**     | no `fs` write API outside the logger, the credential minter and the error file's writer (`vendor/error-file/rolling-file-writer.js`, [error_err.mdx](./error_err.mdx)) — this process writes only its log directory (`logger.js`) and the error file |
 | **Canary/threat parity**   | the §7.0 `Canary` column and `src/canary/` agree, both directions                                                                                  |
 | **Catalogue tests**        | 77 tools; every name `^ff_[a-z_]+$`; every verb in the closed set; all four description clauses; every amount field a pattern-checked **string**; `tools/list` and dispatch agree; every tool maps to one route in apis.mdx |
 | **Gate tests**             | each gate denied and allowed; a write with the tier off, on without confirm, with a stale confirm, over the ceiling                               |

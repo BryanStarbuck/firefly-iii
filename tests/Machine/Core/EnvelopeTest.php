@@ -60,7 +60,8 @@ final class EnvelopeTest extends MachineTestCase
         foreach (['/Users/', 'Secret.php', 'Illuminate\\', 'SQLSTATE', 'select * from', 'RuntimeException', '#0 ', 'stack'] as $needle) {
             $this->assertStringNotContainsString($needle, $body);
         }
-        $this->assertStringContainsString('laravel.log', $env['error']['hint']);
+        $this->assertStringContainsString('~/T/firefly/error.err', $env['error']['hint']);
+        $this->assertSame('The detail is in ~/T/firefly/error.err — ffx logs --errors', $env['error']['hint'], 'the canonical hint H (pm/error_err.mdx R17)');
     }
 
     public function testLaravelAndFireflyExceptionsMapOntoTheNineCodes(): void

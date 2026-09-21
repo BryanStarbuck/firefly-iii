@@ -10,15 +10,23 @@
  *   - sends NO Origin and NO Sec-Fetch-* headers. That is why it is built on
  *     node:http rather than fetch(): the plane's origin gate 404s anything
  *     browser-shaped, and fetch implementations add Sec-Fetch-Mode themselves;
+ *   - mints 8 hex characters per call and sends them as X-Firefly-Request-Id,
+ *     carrying the same id on the envelope and on a thrown ToolError, so the
+ *     [mcp] record in ~/T/firefly/error.err joins the plane's own record
+ *     (pm/error_err.mdx §4.8);
  *   - resolves every exchange into the plane's envelope, or throws a ToolError
  *     in the closed vocabulary. It never retries: one tool call, one request.
  */
+import crypto from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 
 import { isLoopbackHost, PLANE_PREFIX } from './config.js';
 import type { McpConfig } from './config.js';
-import { fail, isPlaneCode } from './errors.js';
+import { fail, isPlaneCode, ToolError } from './errors.js';
+import { errorFileFor } from './vendor/error-file/index.js';
+
+const errors = errorFileFor('mcp/src/client.ts');
 
 export interface PlaneMeta {
   target?: string;
@@ -46,6 +54,16 @@ export interface PlaneEnvelope {
   data?: unknown;
   meta?: PlaneMeta;
   error?: PlaneError;
+  /**
+   * The correlation id this client sent (pm/error_err.mdx §4.8). Set by PlaneClient, never read
+   * from the wire, and never forwarded to the model: the server builds its own envelope.
+   */
+  rid?: string;
+}
+
+/** The correlation id for one plane call: 8 hex, below the ≥ 32-hex key scrub (pm/error_err.mdx §4.8). */
+export function mintRid(): string {
+  return crypto.randomBytes(4).toString('hex');
 }
 
 export type QueryValue = string | number | boolean | undefined | null | Array<string | number>;
@@ -95,7 +113,9 @@ export function unsafeTargetReason(apiUrl: string): string | undefined {
   let url: URL;
   try {
     url = new URL(apiUrl);
-  } catch {
+  } catch (err) {
+    // A bad URL is a refusal with a reason, not a fault (R7).
+    errors.expected('parsing the plane URL', err);
     return `not a URL: ${apiUrl}`;
   }
   if (url.protocol === 'https:') return undefined;
@@ -116,12 +136,25 @@ export class PlaneClient implements Transport {
   }
 
   async call(spec: CallSpec): Promise<PlaneEnvelope> {
+    const rid = mintRid();
+    try {
+      const envelope = await this.#call(spec, rid);
+      envelope.rid = rid;
+      return envelope;
+    } catch (err) {
+      if (err instanceof ToolError && err.rid === undefined) err.rid = rid;
+      throw err;
+    }
+  }
+
+  async #call(spec: CallSpec, rid: string): Promise<PlaneEnvelope> {
     const reason = unsafeTargetReason(this.#cfg.apiUrl);
     if (reason) throw fail('forbidden', `refused to send the machine key: ${reason}`, 'use a loopback URL, or https: with FFMCP_ALLOW_REMOTE=1');
     const url = new URL(`${PLANE_PREFIX}${spec.route}${encodeQuery(spec.query)}`, this.#cfg.apiUrl);
     const headers: Record<string, string> = {
       'X-Firefly-Machine-Key': this.#key,
       'X-Firefly-Client': 'mcp',
+      'X-Firefly-Request-Id': rid,
       Accept: 'application/json',
       'User-Agent': 'firefly_iii-mcp',
     };
@@ -143,7 +176,15 @@ export class PlaneClient implements Transport {
 
   #transportError(err: NodeJS.ErrnoException, timeoutMs: number | null) {
     if (err.code === 'ETIMEDOUT') {
-      return fail('upstream_error', `Firefly III did not answer within ${timeoutMs} ms.`, 'narrow the request (a shorter date range, a lower limit), or ask the operator to check `ffx logs --laravel`');
+      // The ErrnoException rides along as the cause, so the server classifies the timeout exactly as
+      // ffx does: one folded WARN per 10 minutes (pm/error_err.mdx R7, §5.7, §18.1 H13).
+      return fail(
+        'upstream_error',
+        `Firefly III did not answer within ${timeoutMs} ms.`,
+        'narrow the request (a shorter date range, a lower limit). The detail is in ~/T/firefly/error.err — ffx logs --errors',
+        undefined,
+        err,
+      );
     }
     if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND' || err.code === 'EHOSTUNREACH' || err.code === 'ECONNRESET' || err.code === 'EADDRNOTAVAIL') {
       return fail(
@@ -159,7 +200,9 @@ export class PlaneClient implements Transport {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw.body);
-    } catch {
+    } catch (err) {
+      // Not JSON: classified below as a non-envelope answer (not_ready or upstream_error).
+      errors.expected('parsing the plane answer', err);
       parsed = undefined;
     }
     if (isEnvelope(parsed)) {
@@ -173,7 +216,7 @@ export class PlaneClient implements Transport {
           );
         }
         if (!isPlaneCode(code)) {
-          throw fail('internal', parsed.error?.message ?? 'The plane answered with an unknown error code.', 'ask the operator to check `ffx logs --laravel`');
+          throw fail('internal', parsed.error?.message ?? 'The plane answered with an unknown error code.', 'The detail is in ~/T/firefly/error.err — ffx logs --errors');
         }
       }
       return parsed;
@@ -185,7 +228,7 @@ export class PlaneClient implements Transport {
         'The running app must be this fork of Firefly III (the one with app/Machine/), not upstream — tell the operator.',
       );
     }
-    throw fail('upstream_error', `Firefly III answered HTTP ${raw.status} with something that is not the plane's envelope.`, 'ask the operator to check `ffx logs --laravel`');
+    throw fail('upstream_error', `Firefly III answered HTTP ${raw.status} with something that is not the plane's envelope.`, 'The detail is in ~/T/firefly/error.err — ffx logs --errors');
   }
 }
 

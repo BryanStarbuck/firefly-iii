@@ -27,6 +27,7 @@ namespace FireflyIII\Machine\Credentials;
 use Closure;
 use DateTimeImmutable;
 use DateTimeZone;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use Illuminate\Support\Env;
 use JsonException;
 use stdClass;
@@ -56,6 +57,8 @@ use stdClass;
  */
 final class CredentialsFile
 {
+    private const string WHERE = 'app/Machine/Credentials/CredentialsFile.php';
+
     public const string APP_KEY    = 'firefly_iii';
     public const string CREATED_BY = 'firefly-web';
 
@@ -160,7 +163,8 @@ final class CredentialsFile
 
         try {
             $file->init(self::CREATED_BY, false);
-        } catch (CredentialsRefused) {
+        } catch (CredentialsRefused $e) {
+            ErrorFile::for(self::WHERE)->expected('minting the machine key', $e);
             // fall through: state() below reports why
         }
         self::forget();
@@ -229,6 +233,7 @@ final class CredentialsFile
                 }
                 $key = trim(self::readChecked($path));
             } catch (CredentialsRefused $e) {
+                ErrorFile::for(self::WHERE)->expected('reading the machine key file', $e);
                 return self::unarmed('refused', $e->getMessage(), $e->fix);
             }
             if (!self::isWellFormedKey($key)) {
@@ -246,6 +251,7 @@ final class CredentialsFile
         try {
             $doc = $file->read();
         } catch (CredentialsRefused $e) {
+            ErrorFile::for(self::WHERE)->expected('reading the credentials file', $e);
             return self::unarmed('refused', $e->getMessage(), $e->fix);
         }
         $machine = self::machineBlock($doc);
@@ -302,7 +308,8 @@ final class CredentialsFile
     {
         try {
             $doc = $this->read();
-        } catch (CredentialsRefused) {
+        } catch (CredentialsRefused $e) {
+            ErrorFile::for(self::WHERE)->expected('reading the statements root', $e);
             return null;
         }
         $product = null === $doc ? null : ($doc->{self::APP_KEY} ?? null);
@@ -592,6 +599,7 @@ final class CredentialsFile
                 $out['statements_root'] = $root;
             }
         } catch (CredentialsRefused $e) {
+            ErrorFile::for(self::WHERE)->expected('describing the credentials file', $e);
             $out['problem'] = $e->getMessage();
             $out['fix']     = $e->fix;
         }

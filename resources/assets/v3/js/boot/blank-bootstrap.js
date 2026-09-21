@@ -18,6 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import "../support/error-file.js"; // fork: pm/error_err.mdx
 // JS
 import "bootstrap";
 import "admin-lte";

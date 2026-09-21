@@ -1,0 +1,140 @@
+{
+    "sid": "bcdefghe",
+    "events": [
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "WARN",
+            "where": "/transactions/create",
+            "doing": "bootstrapping the page",
+            "error": "Error: the page did not finish booting",
+            "cause": "",
+            "stack": "",
+            "data": {
+                "net": "watchdog"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "ERROR",
+            "where": "/transactions/create",
+            "doing": "calling POST api/v1/transactions",
+            "error": "AxiosError: Request failed with status code 500 (code=ERR_BAD_RESPONSE)",
+            "cause": "",
+            "stack": "at build/assets/create-Bq3xT9aa.js:1:2044",
+            "data": {
+                "status": 500,
+                "net": "axios"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "ERROR",
+            "where": "/tags/show/{x}",
+            "doing": "calling GET api/v1/tags/{x}",
+            "error": "AxiosError: Network Error (code=ERR_NETWORK)",
+            "cause": "",
+            "stack": "at build/assets/create-Bq3xT9aa.js:1:2044",
+            "data": {
+                "net": "axios"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "WARN",
+            "where": "/transactions/create",
+            "doing": "calling PUT api/v1/preferences/{x}",
+            "error": "AxiosError: Request failed with status code 403 (code=ERR_BAD_REQUEST)",
+            "cause": "",
+            "stack": "at build/assets/create-Bq3xT9aa.js:1:2044",
+            "data": {
+                "status": 403,
+                "net": "axios"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "ERROR",
+            "where": "/transactions/create",
+            "doing": "evaluating an Alpine expression",
+            "error": "TypeError: Cannot read properties of undefined (reading 'toUpperCase')",
+            "cause": "",
+            "stack": "at build/assets/create-Bq3xT9aa.js:1:9001",
+            "data": {
+                "expression": "splits[index].currency_code.toUpperCase()",
+                "element_id": "form-currency",
+                "net": "alpine"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "ERROR",
+            "where": "/transactions/create",
+            "doing": "calling GET chart/account/{x}",
+            "error": "AjaxError: Request failed with status code 500",
+            "cause": "",
+            "stack": "",
+            "data": {
+                "status": 500,
+                "net": "ajax"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "ERROR",
+            "where": "/transactions/create",
+            "doing": "settling a promise",
+            "error": "TypeError: Cannot read properties of undefined (reading 'viewRange')",
+            "cause": " | cause: RangeError: Synthetic range failure | cause: Error: Synthetic root cause (code=E_SYNTH)",
+            "stack": "at build/assets/dates-DabDFySV.js:1:61\nat /tags/show/{x}:12:5",
+            "data": {
+                "net": "rejection"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "ERROR",
+            "where": "/transactions/create",
+            "doing": "settling a promise",
+            "error": "Thrown string: Synthetic rejection text",
+            "cause": "",
+            "stack": "",
+            "data": {
+                "net": "rejection"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "ERROR",
+            "where": "resources/assets/v3/js/support/error-file-app.js",
+            "doing": "attaching the jQuery net",
+            "error": "TypeError: $(...).ajaxError is not a function",
+            "cause": "",
+            "stack": "at build/assets/dates-DabDFySV.js:1:77",
+            "data": {
+                "phase": "ready"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "ERROR",
+            "where": "/accounts/show/{x}",
+            "doing": "running page script",
+            "error": "RangeError: Synthetic invalid time value",
+            "cause": "",
+            "stack": "at formatDate (build/assets/format-money-Bf2Difk_.js:1:310)",
+            "data": {
+                "net": "window"
+            }
+        },
+        {
+            "ts": "2026-09-21T18:46:28.270Z",
+            "level": "WARN",
+            "where": "/transactions/create",
+            "doing": "sending error reports",
+            "error": "dropped 1 browser reports over the page budget of 30 per 60s",
+            "cause": "",
+            "stack": "",
+            "data": {}
+        }
+    ]
+}

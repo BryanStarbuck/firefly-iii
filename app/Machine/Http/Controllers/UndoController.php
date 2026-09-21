@@ -25,6 +25,7 @@ declare(strict_types=1);
 namespace FireflyIII\Machine\Http\Controllers;
 
 use FireflyIII\Machine\Audit;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\RouteTable;
 use FireflyIII\Machine\Undo\OperationLog;
@@ -278,7 +279,8 @@ final class UndoController extends MachineController
             }
 
             return array_values(array_filter(array_unique($accounts), static fn (int $id): bool => $id > 0));
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for('app/Machine/Http/Controllers/UndoController.php')->expected('listing the accounts an operation touched', $e);
             return [];
         }
     }

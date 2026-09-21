@@ -66,6 +66,10 @@ export interface CliErrorOptions {
   code?: string | undefined;
   /** Structured details from the server envelope, shown under --verbose and in --json-errors. */
   serverDetails?: unknown;
+  /** The underlying error (a plane-call timeout's ErrnoException) — pm/error_err.mdx §5.7. */
+  cause?: unknown;
+  /** The correlation id of the plane call that failed — pm/error_err.mdx §4.8. */
+  rid?: string | undefined;
 }
 
 export class CliError extends Error {
@@ -74,15 +78,22 @@ export class CliError extends Error {
   readonly details: string[];
   readonly code: string | undefined;
   readonly serverDetails: unknown;
+  /**
+   * The X-Firefly-Request-Id this CLI sent on the plane call that failed, so the [ffx] record in
+   * ~/T/firefly/error.err joins the plane's own record (pm/error_err.mdx §4.8). Never serialised
+   * into --json-errors output or any envelope.
+   */
+  rid: string | undefined;
 
   constructor(exit: ExitCode, message: string, options: CliErrorOptions = {}) {
-    super(message);
+    super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = 'CliError';
     this.exit = exit;
     this.hint = options.hint;
     this.details = options.details ?? [];
     this.code = options.code;
     this.serverDetails = options.serverDetails;
+    this.rid = options.rid;
   }
 }
 

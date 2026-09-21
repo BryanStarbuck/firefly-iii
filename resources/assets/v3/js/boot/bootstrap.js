@@ -18,6 +18,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+import "../support/error-file-app.js"; // fork: pm/error_err.mdx
 // JS
 // Supports weights 100-900
 import "@fontsource/roboto/300.css";

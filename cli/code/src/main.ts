@@ -20,10 +20,29 @@ import type { Format } from './render.js';
 import { note, out, render, stripControls } from './render.js';
 import type { Ctx, FlagValue } from './verbs.js';
 import { verbName } from './verbs.js';
+import { errorFileFor, isTransientNetworkError } from './vendor/error-file/index.js';
 
-function reportError(err: unknown, jsonErrors: boolean, verbose: boolean): number {
+/** N13 — every verb failure is classified here (pm/error_err.mdx §5.7, §8.6). */
+const errors = errorFileFor('cli/code/src/main.ts', { net: 'top' });
+
+/**
+ * Print a failure and return its exit code. cli.err keeps its line; ~/T/firefly/error.err gets
+ * the FAULTS only — an answer (a usage error, a not-found, a conflict, a doctor FAIL) writes
+ * nothing there (R7). `verb` is the verb's name when it was parsed.
+ */
+export function reportError(err: unknown, jsonErrors: boolean, verbose: boolean, verb?: string): number {
   if (err instanceof CliError) {
     log.error(`${err.code ?? 'cli'} exit=${err.exit} ${err.message}`);
+    if (isTransientNetworkError(err.cause)) {
+      // A plane-call timeout: not an answer, not an ERROR — one folded WARN per 10 minutes (§5.2).
+      errors.warn('running an ffx verb', err, { verb, exit: err.exit });
+    } else if (err.code === 'internal' || err.code === 'upstream_error') {
+      // The code identifies a server fault; the exit number does not (a doctor FAIL is exit 1 too).
+      errors.caught('running an ffx verb', err, { verb, exit: err.exit, code: err.code, rid: err.rid });
+    } else {
+      // An answer. A bring-up failure was already written by bringup.ts, so this is a no-op for it.
+      errors.expected('running an ffx verb', err);
+    }
     if (jsonErrors) {
       process.stderr.write(
         JSON.stringify({ ok: false, exit: err.exit, error: { code: err.code ?? 'cli', message: err.message, hint: err.hint ?? null, details: err.serverDetails ?? null } }) + '\n',
@@ -38,13 +57,21 @@ function reportError(err: unknown, jsonErrors: boolean, verbose: boolean): numbe
   }
   const e = err as Error;
   log.error(`uncaught: ${e?.stack ?? String(err)}`);
+  errors.caught('running an ffx verb', err, { verb, exit: EXIT.FAILED });
   if (jsonErrors) {
     process.stderr.write(JSON.stringify({ ok: false, exit: 1, error: { code: 'internal', message: e?.message ?? String(err) } }) + '\n');
   } else {
-    process.stderr.write(`ffx: internal error: ${e?.message ?? String(err)}\n  the stack is in ~/T/_firefly_iii/cli.err\n`);
+    process.stderr.write(`ffx: internal error: ${e?.message ?? String(err)}\n  The detail is in ~/T/firefly/error.err — ffx logs --errors\n`);
   }
   return EXIT.FAILED;
 }
+
+/**
+ * main()'s two catches reach the classifier through this handle, so each site is a visible report
+ * to scripts/error-file-coverage.mjs (it accepts a call on a name ending in `Errors`, §13.2) while
+ * reportError() stays the ONE classifier (§5.7, N13) and still classifies each failure exactly once.
+ */
+const verbErrors = { report: reportError };
 
 export async function main(argv: readonly string[]): Promise<number> {
   const early = {
@@ -57,7 +84,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   try {
     parsed = parseArgs(argv, REGISTRY);
   } catch (err) {
-    return reportError(err, early.jsonErrors, early.verbose);
+    return verbErrors.report(err, early.jsonErrors, early.verbose);
   }
   const { verb, positionals, flags, universal } = parsed;
   const cfg = loadConfig(process.env, universal.api);
@@ -119,6 +146,6 @@ export async function main(argv: readonly string[]): Promise<number> {
     return outcome.exit ?? EXIT.OK;
   } catch (err) {
     spinner.stop();
-    return reportError(err, universal.jsonErrors, universal.verbose);
+    return verbErrors.report(err, universal.jsonErrors, universal.verbose, verbName(verb));
   }
 }

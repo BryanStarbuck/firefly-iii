@@ -12,6 +12,10 @@
  */
 import crypto from 'node:crypto';
 
+import { errorFileFor } from './vendor/error-file/index.js';
+
+const errors = errorFileFor('mcp/src/audit.ts');
+
 /** The only argument names whose values may appear in the log. */
 export const LOGGABLE_SCALARS = ['month', 'start', 'end', 'interval', 'limit', 'offset', 'type', 'dry_run', 'format', 'top_n'] as const;
 
@@ -40,7 +44,9 @@ export function hashArgs(args: unknown): string {
   let text: string;
   try {
     text = JSON.stringify(canonical(args ?? {})) ?? 'null';
-  } catch {
+  } catch (err) {
+    // The designed fallback: the audit line says `unserialisable` and the call goes on.
+    errors.expected('hashing the tool arguments', err);
     text = 'unserialisable';
   }
   return `sha256:${crypto.createHash('sha256').update(text).digest('hex').slice(0, 12)}`;

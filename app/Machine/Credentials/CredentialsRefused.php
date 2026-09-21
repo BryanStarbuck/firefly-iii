@@ -29,7 +29,8 @@ use RuntimeException;
 /**
  * The credentials file (or key file) was refused: a symlink, not a regular file, readable by
  * others, owned by someone else, not valid JSON, or holding a malformed key (apis.mdx §4.3).
- * The plane stays unarmed (404 for everything) and the reason goes to the log with its fix.
+ * The plane stays unarmed (404 for everything) and the reason goes to ~/T/firefly/error.err (one
+ * WARN per announce) with its fix.
  */
 final class CredentialsRefused extends RuntimeException
 {

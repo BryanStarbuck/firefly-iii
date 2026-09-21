@@ -26,6 +26,8 @@ namespace FireflyIII\Machine\Http\Controllers;
 
 use FireflyIII\Events\Model\TransactionGroup\TransactionGroupEventFlags;
 use FireflyIII\Events\Model\TransactionGroup\UserRequestedBatchProcessing;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
+use FireflyIII\Machine\ErrorFile\RequestState;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\RouteTable;
 use FireflyIII\Machine\WriteResult;
@@ -285,9 +287,9 @@ final class BatchController extends MachineController
         try {
             $response = MirrorController::dispatchInternal($request, $spec[0], '/machine/v1'.$path, [], $body, ['X-Firefly-Batch' => '1']);
         } catch (MachineException $e) {
-            throw self::failed($i, $op, $e->errorCode, $e->getMessage(), $e->hint, $e->details);
+            throw self::failed($i, $op, $e->errorCode, $e->getMessage(), $e->hint, $e->details, $e);
         } catch (Throwable $e) {
-            throw self::failed($i, $op, 'internal', 'The operation failed.', null, []);
+            throw self::failed($i, $op, 'internal', 'The operation failed.', null, [], $e);
         }
         $decoded = json_decode((string) $response->getContent(), true);
         if (!is_array($decoded) || true !== ($decoded['ok'] ?? null)) {
@@ -304,7 +306,14 @@ final class BatchController extends MachineController
                 $details = ['duplicate_of_operation' => $twin] + array_diff_key($details, ['duplicate_of' => true]);
             }
 
-            throw self::failed($i, $op, (string) ($error['code'] ?? 'internal'), $message, $hint, $details);
+            $failed  = self::failed($i, $op, (string) ($error['code'] ?? 'internal'), $message, $hint, $details);
+            // the op's own fault was already admitted by the sub-request's pipeline: this cause-less
+            // envelope echo must not be written a second time (pm/error_err.mdx §4.5 step 1)
+            if (in_array($failed->errorCode, ['internal', 'upstream_error'], true) && RequestState::lastDispatchCovered()) {
+                ErrorFile::markEcho($failed);
+            }
+
+            throw $failed;
         }
         if (count(self::$frame['results'] ?? []) !== $before + 1) {
             throw self::failed($i, $op, 'internal', 'The operation did not report a write.', null, []);
@@ -336,7 +345,7 @@ final class BatchController extends MachineController
     }
 
     /** @param array<string, mixed> $details */
-    private static function failed(int $i, string $op, string $code, string $message, ?string $hint, array $details): MachineException
+    private static function failed(int $i, string $op, string $code, string $message, ?string $hint, array $details, ?Throwable $previous = null): MachineException
     {
         $message = sprintf('Operation %d ("%s") failed: %s Nothing in the batch was written.', $i, $op, rtrim($message));
         $hint  ??= 'Fix that operation and send the whole batch again';
@@ -348,8 +357,8 @@ final class BatchController extends MachineController
             'forbidden'      => MachineException::forbidden($message, $hint, $details),
             'write_disabled' => MachineException::forbidden($message, $hint, $details),
             'not_ready'      => MachineException::notReady($message, $hint, $details),
-            'upstream_error' => MachineException::upstream($message, $hint, $details),
-            'internal'       => MachineException::internal($message, $hint, $details),
+            'upstream_error' => MachineException::upstream($message, $hint, $details, $previous),
+            'internal'       => MachineException::internal($message, $hint, $details, $previous),
             default          => MachineException::invalid($message, $hint, $details),
         };
     }

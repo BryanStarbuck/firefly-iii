@@ -19,6 +19,8 @@ import { Logger } from '../src/logger.js';
 import { PlaneClient } from '../src/client.js';
 import { McpServerHost } from '../src/server.js';
 import { INSTRUCTIONS } from '../src/instructions.js';
+import { flushErrorFile } from '../src/vendor/error-file/index.js';
+import { installNodeErrorFile, resetNodeErrorFileForTests } from '../src/vendor/error-file/node.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 /** .test-build/test → mcp/ */
@@ -146,6 +148,8 @@ export async function startFakePlane(opts: { key?: string } = {}): Promise<FakeP
 
 export interface Sandbox {
   dir: string;
+  /** The error file this sandbox writes (FIREFLY_ERROR_FILE for children; `file:` in process). */
+  errorFile: string;
   credentialsFile: string;
   logDir: string;
   env: NodeJS.ProcessEnv;
@@ -169,18 +173,39 @@ export function sandbox(opts: { key?: string | null; mode?: number; apiUrl?: str
     FFMCP_CREDENTIALS_FILE: credentialsFile,
     FFMCP_LOG_DIR: logDir,
     FFMCP_API_URL: opts.apiUrl ?? 'http://127.0.0.1:1',
+    // Every child writes its faults to the sandbox, never to ~/T/firefly/ (pm/error_err.mdx R13, §15).
+    FIREFLY_ERROR_FILE: path.join(dir, 'error.err'),
     ...(opts.env ?? {}),
   };
-  return { dir, credentialsFile, logDir, env };
+  return { dir, errorFile: path.join(dir, 'error.err'), credentialsFile, logDir, env };
+}
+
+/**
+ * Point this process's error file at a sandbox file (pm/error_err.mdx §5.5): the in-process host
+ * never imports error-file-install.ts, so without this its records would sit in the pre-install
+ * queue. Re-installs on every call, so each host() writes its own sandbox; a suite that uses it
+ * calls resetNodeErrorFileForTests() in after().
+ */
+export function installSandboxErrorFile(sb: Sandbox): void {
+  resetNodeErrorFileForTests();
+  installNodeErrorFile({ app: 'mcp', where: 'mcp/test/helpers.ts', file: sb.errorFile, handleProcessErrors: false });
+}
+
+/** The record header lines in an error file, after flushing this process's buffer. */
+export function errorRecords(file: string): string[] {
+  flushErrorFile();
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.startsWith('['));
 }
 
 /** An in-process host over a real PlaneClient pointed at the fake plane. */
-export function host(plane: FakePlane, env: NodeJS.ProcessEnv = {}, stderr: string[] = []): { host: McpServerHost; config: McpConfig; logDir: string } {
+export function host(plane: FakePlane, env: NodeJS.ProcessEnv = {}, stderr: string[] = []): { host: McpServerHost; config: McpConfig; logDir: string; errorFile: string } {
   const sb = sandbox({ apiUrl: plane.url, env });
+  installSandboxErrorFile(sb);
   const config = loadConfig(sb.env);
   const logger = new Logger({ dir: sb.logDir, level: 'debug', stderr: (l) => stderr.push(l) });
   const h = new McpServerHost({ config, transport: new PlaneClient(config, TEST_KEY, '0123…/sha256:test'), logger, keyFingerprint: '0123…/sha256:test', instructions: INSTRUCTIONS });
-  return { host: h, config, logDir: sb.logDir };
+  return { host: h, config, logDir: sb.logDir, errorFile: sb.errorFile };
 }
 
 export interface ToolReply {

@@ -29,6 +29,7 @@ use Closure;
 use FireflyIII\Exceptions\FireflyException;
 use FireflyIII\Helpers\Collector\GroupCollectorInterface;
 use FireflyIII\Machine\DryRun;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Money;
 use FireflyIII\Machine\WriteResult;
@@ -66,6 +67,8 @@ use Illuminate\Support\Facades\Validator;
  */
 final class RuleController extends MachineController
 {
+    private const string WHERE = 'app/Machine/Http/Controllers/RuleController.php';
+
     public const array MOMENTS = ['store-journal', 'update-journal', 'manual-activation'];
 
     /** The fields of a rule a caller may send (Firefly's own rule shape, apis.mdx §8.7). */
@@ -1051,6 +1054,7 @@ final class RuleController extends MachineController
                 try {
                     $this->findGroup($title); // exact title, then case-insensitive; ambiguity is an error
                 } catch (MachineException $e) {
+                    ErrorFile::for(self::WHERE)->expected('resolving the rule group title', $e);
                     $v->errors()->add($field, trim(sprintf('%s %s', $e->getMessage(), (string) $e->hint)));
                 }
             }
@@ -1182,7 +1186,8 @@ final class RuleController extends MachineController
 
         try {
             $row = $transformer->transform($rule);
-        } catch (FireflyException) {
+        } catch (FireflyException $e) {
+            ErrorFile::for(self::WHERE)->expected('rendering a rule', $e);
             // a rule without a trigger moment: Firefly refuses to render it; say so rather than fail the list
             $row = ['id' => (string) $rule->id, 'rule_group_id' => (string) $rule->rule_group_id, 'rule_group_title' => (string) $rule->ruleGroup?->title, 'title' => $rule->title, 'description' => $rule->description, 'order' => $rule->order, 'active' => $rule->active, 'strict' => $rule->strict, 'stop_processing' => $rule->stop_processing, 'trigger' => null, 'triggers' => [], 'actions' => [], 'problem' => 'This rule has no trigger moment; edit it in Firefly III to fix it'];
         }

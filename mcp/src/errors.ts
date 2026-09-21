@@ -38,9 +38,16 @@ export class ToolError extends Error {
   readonly code: ErrorCode;
   readonly hint: string | undefined;
   readonly details: unknown;
+  /**
+   * The X-Firefly-Request-Id this server sent on the plane call that failed, so the [mcp] record in
+   * ~/T/firefly/error.err joins the plane's own record (pm/error_err.mdx §4.8). Never serialised
+   * into an envelope.
+   */
+  rid: string | undefined;
 
-  constructor(code: ErrorCode, message: string, hint?: string, details?: unknown) {
-    super(message);
+  constructor(code: ErrorCode, message: string, hint?: string, details?: unknown, cause?: unknown) {
+    super(message, cause !== undefined ? { cause } : undefined);
+    this.rid = undefined;
     this.name = 'ToolError';
     this.code = code;
     this.hint = hint;
@@ -48,8 +55,8 @@ export class ToolError extends Error {
   }
 }
 
-export function fail(code: ErrorCode, message: string, hint?: string, details?: unknown): ToolError {
-  return new ToolError(code, message, hint, details);
+export function fail(code: ErrorCode, message: string, hint?: string, details?: unknown, cause?: unknown): ToolError {
+  return new ToolError(code, message, hint, details, cause);
 }
 
 /** Both switches, named — the only honest answer to "why can't it write" (§9.7). */

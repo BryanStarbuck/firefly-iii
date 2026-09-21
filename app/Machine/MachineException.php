@@ -26,6 +26,7 @@ namespace FireflyIII\Machine;
 
 use InvalidArgumentException;
 use RuntimeException;
+use Throwable;
 
 /**
  * The one error type of the plane — apis.mdx §5.2. Anything thrown inside /machine/v1 is
@@ -59,11 +60,13 @@ final class MachineException extends RuntimeException
         public readonly ?string $hint = null,
         public readonly array $details = [],
         ?int $status = null,
+        ?Throwable $previous = null,
     ) {
         if (!array_key_exists($errorCode, self::CODES)) {
             throw new InvalidArgumentException(sprintf('"%s" is not one of the nine machine-plane error codes', $errorCode));
         }
-        parent::__construct($message, $status ?? self::CODES[$errorCode]);
+        // the previous throwable is kept for the error file (pm/error_err.mdx §4.5); the code stays the status
+        parent::__construct($message, $status ?? self::CODES[$errorCode], $previous);
     }
 
     /** The HTTP status (the Exception code). */
@@ -119,14 +122,14 @@ final class MachineException extends RuntimeException
     }
 
     /** @param array<string, mixed> $details */
-    public static function upstream(string $message, ?string $hint = null, array $details = []): self
+    public static function upstream(string $message, ?string $hint = null, array $details = [], ?Throwable $previous = null): self
     {
-        return new self('upstream_error', $message, $hint, $details);
+        return new self('upstream_error', $message, $hint, $details, null, $previous);
     }
 
     /** @param array<string, mixed> $details */
-    public static function internal(string $message = 'Internal error in the machine plane.', ?string $hint = null, array $details = []): self
+    public static function internal(string $message = 'Internal error in the machine plane.', ?string $hint = null, array $details = [], ?Throwable $previous = null): self
     {
-        return new self('internal', $message, $hint ?? 'The detail is in the app\'s own log (storage/logs/laravel.log) — ffx logs', $details);
+        return new self('internal', $message, $hint ?? 'The detail is in ~/T/firefly/error.err — ffx logs --errors', $details, null, $previous);
     }
 }

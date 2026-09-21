@@ -25,6 +25,7 @@ declare(strict_types=1);
 namespace FireflyIII\Machine;
 
 use Closure;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Support\Singleton\PreferencesSingleton;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Bus;
@@ -57,6 +58,8 @@ use Throwable;
  */
 final class DryRun
 {
+    private const string WHERE = 'app/Machine/DryRun.php';
+
     /**
      * @template T
      *
@@ -108,7 +111,9 @@ final class DryRun
     {
         try {
             return DB::table('webhook_messages')->count();
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('counting webhook messages', $e);
+
             return 0;
         }
     }
@@ -137,7 +142,9 @@ final class DryRun
 
         try {
             return $read->call($fake);
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('counting faked jobs', $e);
+
             return 0;
         }
     }
@@ -148,7 +155,9 @@ final class DryRun
 
         try {
             return $read->call($fake);
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('counting faked mails', $e);
+
             return 0;
         }
     }
@@ -171,7 +180,9 @@ final class DryRun
 
         try {
             return $read->call($fake);
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('counting faked notifications', $e);
+
             return 0;
         }
     }

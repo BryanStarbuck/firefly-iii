@@ -24,8 +24,8 @@ declare(strict_types=1);
 
 namespace FireflyIII\Machine;
 
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Log;
 use Throwable;
 
 /**
@@ -108,7 +108,7 @@ final class Audit
             file_put_contents($path, implode('  ', $parts)."\n", FILE_APPEND | LOCK_EX);
             umask($old);
         } catch (Throwable $e) {
-            Log::warning(sprintf('Machine plane: could not append to the audit log: %s', $e->getMessage()));
+            ErrorFile::for('app/Machine/Audit.php')->caught('appending to the plane audit log', $e);
         }
     }
 

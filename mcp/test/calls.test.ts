@@ -12,14 +12,21 @@ import { ERROR_CODES, PLANE_CODES } from '../src/errors.js';
 import { findUnredacted } from '../src/canary/redaction.canary.js';
 import { envelopeProblems } from '../src/canary/envelope.canary.js';
 import { TOOLS } from '../src/tools/registry.js';
-import { REPO_ROOT, TEST_TOKEN, call, errorOf, failure, host, ok, startFakePlane, writeRoute } from './helpers.js';
+import { Logger } from '../src/logger.js';
+import { McpServerHost } from '../src/server.js';
+import { loadConfig } from '../src/config.js';
+import { resetNodeErrorFileForTests } from '../src/vendor/error-file/node.js';
+import { REPO_ROOT, TEST_TOKEN, call, errorOf, errorRecords, failure, host, installSandboxErrorFile, ok, sandbox, startFakePlane, writeRoute } from './helpers.js';
 import type { FakePlane } from './helpers.js';
 
 let plane: FakePlane;
 before(async () => {
   plane = await startFakePlane();
 });
-after(async () => plane.close());
+after(async () => {
+  resetNodeErrorFileForTests();
+  await plane.close();
+});
 beforeEach(() => {
   plane.routes.clear();
   plane.calls.length = 0;
@@ -453,5 +460,52 @@ describe('§16.2 — the audit line', () => {
     assert.match(err, /CALL ff_set_budget_limit .* ok=false gate=input code=invalid_input/);
     const mode = fs.statSync(path.join(logDir, 'mcp.info')).mode & 0o777;
     assert.equal(mode, 0o600);
+  });
+});
+
+describe('the error file (pm/error_err.mdx §5.7, R17)', () => {
+  const H = 'The detail is in ~/T/firefly/error.err — ffx logs --errors';
+
+  it('a transport that throws new Error(\'boom\') → an internal envelope whose hint is H, and one [ERROR] [mcp] record in the sandbox', async () => {
+    const sb = sandbox();
+    installSandboxErrorFile(sb);
+    const config = loadConfig(sb.env);
+    const stderr: string[] = [];
+    const h = new McpServerHost({
+      config,
+      transport: { call: async () => { throw new Error('boom'); } },
+      logger: new Logger({ dir: sb.logDir, level: 'error', stderr: (l) => stderr.push(l) }),
+      keyFingerprint: 'fp',
+      instructions: 'x',
+    });
+    const r = await call(h, 'ff_list_accounts', {});
+    assert.equal(r.isError, true);
+    assert.equal(errorOf(r).code, 'internal');
+    assert.equal(errorOf(r).hint, H);
+    const lines = errorRecords(sb.errorFile);
+    assert.equal(lines.length, 1, lines.join('\n'));
+    assert.match(lines[0] as string, /^\[[^\]]+Z\] \[ERROR\] \[mcp\] \[mcp\/src\/server\.ts\] running an MCP tool — Error: boom \{tool=ff_list_accounts gate=plane net=top pid=\d+\}$/);
+    assert.equal(fs.statSync(sb.errorFile).mode & 0o777, 0o600);
+  });
+
+  it('a plane internal carries the rid the plane received; a conflict writes nothing', async () => {
+    plane.routes.set('GET /accounts', () => failure(500, 'internal', 'Firefly III failed on the server.', H));
+    const { host: h, errorFile } = host(plane);
+    const r = await call(h, 'ff_list_accounts', {});
+    assert.equal(errorOf(r).code, 'internal');
+    assert.equal(errorOf(r).hint, H);
+    assert.ok(!r.raw.includes('rid'), 'the rid reached the envelope');
+    const rid = String(plane.calls.at(-1)?.headers['x-firefly-request-id']);
+    assert.match(rid, /^[0-9a-f]{8}$/);
+    const lines = errorRecords(errorFile);
+    assert.equal(lines.length, 1, lines.join('\n'));
+    assert.match(lines[0] as string, new RegExp(`\\[ERROR\\] \\[mcp\\] \\[mcp/src/server\\.ts\\] running an MCP tool — ToolError: Firefly III failed on the server\\. \\(code=internal\\) \\{tool=ff_list_accounts gate=plane code=internal rid=${rid} net=top pid=\\d+\\}$`));
+
+    plane.routes.set('GET /accounts', () => failure(409, 'conflict', 'A synthetic conflict.'));
+    const second = host(plane);
+    const c = await call(second.host, 'ff_list_accounts', {});
+    assert.equal(errorOf(c).code, 'conflict');
+    assert.deepEqual(errorRecords(second.errorFile), []);
+    assert.equal(fs.existsSync(second.errorFile), false);
   });
 });

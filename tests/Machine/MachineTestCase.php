@@ -25,6 +25,7 @@ declare(strict_types=1);
 namespace Tests\Machine;
 
 use FireflyIII\Machine\Credentials\CredentialsFile;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\RouteTable;
 use FireflyIII\User;
 use Illuminate\Testing\TestResponse;
@@ -81,6 +82,8 @@ abstract class MachineTestCase extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        // pm/error_err.mdx §15: every test starts with no error-file path (R13) and clean statics
+        ErrorFile::resetForTests();
         $this->sandbox = sprintf('%s/ffmachine-%s', sys_get_temp_dir(), bin2hex(random_bytes(6)));
         mkdir($this->sandbox, 0o700, true);
         config([

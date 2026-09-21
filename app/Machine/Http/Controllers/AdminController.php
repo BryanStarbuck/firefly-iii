@@ -30,6 +30,7 @@ use FireflyIII\Machine\Audit;
 use FireflyIII\Machine\Credentials\CredentialsFile;
 use FireflyIII\Machine\Credentials\CredentialsRefused;
 use FireflyIII\Machine\Envelope;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Operator;
 use FireflyIII\Machine\WriteResult;
@@ -363,7 +364,8 @@ final class AdminController extends MachineController
                     Cache::forget(sprintf('ff3-config-%s_%d', $job, (int) $id));
                 }
             }
-        } catch (\Throwable) {
+        } catch (\Throwable $e) {
+            ErrorFile::for('app/Machine/Http/Controllers/AdminController.php')->expected('forgetting the cron job stamps', $e);
             // best effort
         }
     }
@@ -465,7 +467,7 @@ final class AdminController extends MachineController
             throw MachineException::forbidden('Firefly refused the operator the configuration.', 'The operator needs the owner (full) role in Firefly III — or set FIREFLY_MACHINE_OPERATOR to the owner (GET /machine/v1/admin/users lists roles)', ['upstream_status' => $status]);
         }
         if ($status >= 400 || !is_array($decoded)) {
-            throw MachineException::upstream('Firefly could not read its configuration.', 'Check storage/logs/laravel.log', ['upstream_status' => $status]);
+            throw MachineException::upstream('Firefly could not read its configuration.', 'The detail is in ~/T/firefly/error.err — ffx logs --errors', ['upstream_status' => $status]);
         }
         $rows     = array_is_list($decoded) ? $decoded : (array) ($decoded['data'] ?? []);
         $values   = [];
@@ -592,7 +594,7 @@ final class AdminController extends MachineController
         throw match (true) {
             401 === $status, 403 === $status => MachineException::forbidden('Firefly refused: '.$message, 'The operator needs the owner (full) role in this administration', ['upstream_status' => $status]),
             422 === $status, 400 === $status => MachineException::invalid('Firefly rejected the arguments: '.$message, 'Check objects against the accepted list', ['upstream_status' => $status]),
-            default                          => MachineException::upstream('Firefly failed: '.$message, 'Nothing was written; see storage/logs/laravel.log', ['upstream_status' => $status]),
+            default                          => MachineException::upstream('Firefly failed: '.$message, 'Nothing was written. The detail is in ~/T/firefly/error.err — ffx logs --errors', ['upstream_status' => $status]),
         };
     }
 

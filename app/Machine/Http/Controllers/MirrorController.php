@@ -26,6 +26,8 @@ namespace FireflyIII\Machine\Http\Controllers;
 
 use Closure;
 use FireflyIII\Machine\Envelope;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
+use FireflyIII\Machine\ErrorFile\RequestState;
 use FireflyIII\Machine\MachineException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -57,6 +59,8 @@ use Throwable;
  */
 final class MirrorController extends MachineController
 {
+    private const string WHERE = 'app/Machine/Http/Controllers/MirrorController.php';
+
     /**
      * Upstream route templates (relative to api/v1/) the mirror refuses, with the hint that names
      * the typed route. A template matches itself and everything under it.
@@ -165,9 +169,14 @@ final class MirrorController extends MachineController
         $container->instance('request', $sub);
         Facade::clearResolvedInstance('request');
 
+        // the error file's nested-dispatch bracket (pm/error_err.mdx §4.5 step 1): a fault the
+        // sub-request's pipeline admits covers this dispatch, so the batch echo is not written twice
+        RequestState::enterNested();
+
         try {
             return $router->dispatch($sub);
         } finally {
+            RequestState::leaveNested();
             $container->instance('request', $parent);
             Facade::clearResolvedInstance('request');
             if (null !== $outerRoute) {
@@ -373,7 +382,8 @@ final class MirrorController extends MachineController
 
         try {
             return $read($router);
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('reading the router state', $e);
             return ['current' => null, 'currentRequest' => null];
         }
     }
@@ -388,7 +398,8 @@ final class MirrorController extends MachineController
 
         try {
             $write($router, $state);
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for(self::WHERE)->expected('restoring the router state', $e);
             // best effort: the caller's own request object is what the plane reads
         }
     }

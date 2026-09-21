@@ -33,6 +33,20 @@ ffx help <verb>
 
 Output is a table on a terminal and the plane's JSON envelope when piped (`--format json|table|csv`
 to choose). Only the answer goes to stdout; progress, hints and provenance go to stderr.
+Faults go to `~/T/firefly/error.err` (pm/error_err.mdx); read them with `ffx logs --errors`.
+
+## The error file
+
+Every fault from every runtime (PHP, `ffx`, `mcp`, the browser) goes to one file, read with
+`ffx logs --errors`. These variables are shared with the web app and `mcp`; there are no `FFX_`
+twins, and they are not in upstream's `.env.example` (pm/error_err.mdx §4.11).
+
+| Variable                       | Default                  | Meaning                                                                                   |
+| ------------------------------ | ------------------------ | ----------------------------------------------------------------------------------------- |
+| `FIREFLY_ERROR_FILE`           | `~/T/firefly/error.err`  | full path override; `''` means unset. Set it in the shell                                 |
+| `FIREFLY_ERROR_FILE_VERBOSE=1` | off                      | also write EXPECTED records (and, in PHP, `Log::warning`/`notice` records)                |
+| `FIREFLY_ERROR_FILE_ECHO=1`    | off                      | echo each written record to stderr (PHP and `ffx`; `mcp` ignores it)                      |
+| `FIREFLY_ERROR_FILE_CANARY=1`  | off                      | enables the canary routes, command and `__canary` branches; refused unless `FIREFLY_ERROR_FILE` is non-empty |
 
 ## The key
 

@@ -24,6 +24,7 @@ declare(strict_types=1);
 
 namespace FireflyIII\Machine;
 
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Models\GroupMembership;
 use FireflyIII\Models\TransactionCurrency;
 use FireflyIII\Models\UserGroup;
@@ -87,6 +88,7 @@ final class Operator
 
             return null;
         } catch (MachineException $e) {
+            ErrorFile::for('app/Machine/Operator.php')->expected('binding the operator', $e);
             $request->attributes->set(self::ATTR_REFUSE, $e);
 
             return $e;

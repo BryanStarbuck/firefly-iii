@@ -29,6 +29,11 @@
         <env name="DB_DATABASE" value=""/>
         <env name="APP_LOG_LEVEL" value="notice"/>
         <env name="AUDIT_LOG_LEVEL" value="emergency" />
+        <!-- pm/error_err.mdx R13: a shell export can never route a test's faults into the real error file. -->
+        <env name="FIREFLY_ERROR_FILE" value="" force="true"/>
+        <server name="FIREFLY_ERROR_FILE" value="" force="true"/>
+        <env name="FIREFLY_ERROR_FILE_TEST_PATH" value="" force="true"/>
+        <server name="FIREFLY_ERROR_FILE_TEST_PATH" value="" force="true"/>
         <ini name="memory_limit" value="2G"/>
 
 

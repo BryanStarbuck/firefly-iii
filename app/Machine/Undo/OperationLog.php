@@ -28,6 +28,7 @@ use Carbon\Carbon;
 use FireflyIII\Machine\Audit;
 use FireflyIII\Machine\Credentials\CredentialsFile;
 use FireflyIII\Machine\Envelope;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Operator;
 use FireflyIII\Machine\WriteResult;
@@ -191,7 +192,8 @@ final class OperationLog
 
         try {
             return DB::table(self::TABLE)->where('created_at', '<', Carbon::now()->subDays($days))->delete();
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for('app/Machine/Undo/OperationLog.php')->expected('pruning old operation rows', $e);
             return 0;
         }
     }

@@ -24,6 +24,7 @@ declare(strict_types=1);
 
 namespace FireflyIII\Machine\Ingest;
 
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use JsonException;
 
@@ -281,7 +282,8 @@ final class Manifest
                 if (!is_dir($abs)) {
                     $warnings[] = sprintf('row %d: the account directory %s does not exist', $line, $path);
                 }
-            } catch (MachineException) {
+            } catch (MachineException $e) {
+                ErrorFile::for('app/Machine/Ingest/Manifest.php')->expected('containing a manifest account path', $e);
                 $warnings[] = sprintf('row %d: path %s is outside the statements root — refused', $line, $path);
                 $abs        = null;
             }

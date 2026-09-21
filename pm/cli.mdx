@@ -172,7 +172,7 @@ Four properties make that goal real rather than decorative:
 | **Stack**              | TypeScript on Node ≥ 22, ESM, zero runtime dependencies beyond Node's standard library                                  |
 | **Talks to**           | `http://127.0.0.1:7373/machine/v1/*` — the machine plane inside the Firefly app ([apis.mdx](./apis.mdx))                |
 | **Authenticates with** | `X-Firefly-Machine-Key`, 64 hex chars, from `~/.credentials/firefly_iii.json` (0600)                                    |
-| **State / logs**       | `~/T/_firefly_iii/` — `cli.info`, `cli.err`, `server.log`, `server.pid`                                                 |
+| **State / logs**       | `~/T/_firefly_iii/` — `cli.info`, `cli.err`, `server.log`, `server.pid` · faults: `~/T/firefly/error.err` ([error_err.mdx](./error_err.mdx)) |
 | **Env prefix**         | `FFX_`                                                                                                                  |
 | **Never**              | computes a balance, parses a float, reimplements Firefly's duplicate check, writes a source PDF, or sends the key off loopback |
 | **Is not**             | the Firefly III Data Importer, `php artisan`, or a Personal Access Token client of `/api/v1` — see §1                  |
@@ -331,7 +331,8 @@ Every `ffx` invocation that needs the machine plane begins with a liveness prefl
      `PHP_CLI_SERVER_WORKERS=4`, stdout and stderr appended to `~/T/_firefly_iii/server.log`, pid to
      `server.pid`;
    - **wait** for `/up`, bounded at 60 s, spinner running.
-3. **If bring-up fails**, print the failure and the last 20 lines of `server.log`, and exit **`5`**.
+3. **If bring-up fails**, print the failure and the last 20 lines of `server.log`, and record the
+   failure in `~/T/firefly/error.err`, never copying the tail into it; then exit **`5`**.
    Never fall back to computing the answer locally — there is no local compute path (§5.4).
 
 `--no-bringup` (or `FFX_NO_BRINGUP=1`) disables step 2: if the app is down, exit `5` at once.
@@ -525,7 +526,7 @@ ORIENTATION
   ffx status                            web, pid, /up, plane ping, key fingerprint, operator, tiers
   ffx doctor                            is this environment sane? (§12.1)
   ffx up | stop                         bring the app up / take it down (§3.3)
-  ffx logs [--follow] [--lines N] [--laravel | --cli]
+  ffx logs [--follow] [--lines N] [--errors | --laravel | --cli]
   ffx key init | show | rotate --yes    the machine key (§4)
   ffx whoami                            operator, administration, primary currency, tiers
   ffx capabilities [--planned]          what this server build can do
@@ -954,11 +955,16 @@ Prints a report and exits `1` if any REQUIRED check failed:
 | Operator + administration resolved                    | no        | `FIREFLY_MACHINE_OPERATOR` needed on a multi-user install                  |
 | Statements root configured and readable               | no        | informational; only the `statements` family needs it                       |
 | `ffx` on PATH points at this checkout                 | no        | catches the second-checkout confusion                                      |
+| **error file** — writable or creatable, mode `0600`   | no        | WARN when the mode is wider; WARN when `.env`'s `FIREFLY_ERROR_FILE` differs from the process env; shows records in the last 24 h ([error_err.mdx](./error_err.mdx) §5.7) |
+| **web bundle** — `public/build/manifest.json` newer than every file under `resources/assets/v3/js/support/` | no | WARN "the browser error net is not in the built bundle — `just build-web`" |
 
 ### 12.2 `ffx logs`
 
-Tails `~/T/_firefly_iii/server.log` (and, with `--laravel`, `storage/logs/laravel.log`). `--follow`
-for `tail -f`, `--lines N` for the size. It prints paths first.
+Tails `~/T/_firefly_iii/server.log` by default. `--errors` tails the fault trail,
+`~/T/firefly/error.err` (or `FIREFLY_ERROR_FILE`), then prints the owed burst counts from `error.fold`
+([error_err.mdx](./error_err.mdx) §5.7). `--laravel` tails the newest Laravel daily log,
+`storage/logs/ff3-*.log` by mtime. `--cli` tails `~/T/_firefly_iii/cli.err`. `--follow` for
+`tail -f`, `--lines N` for the size. It prints paths first.
 
 ### 12.3 `ffx key`
 
@@ -1034,12 +1040,14 @@ stream NDJSON progress (apis.mdx §15) and the spinner shows it.
 - **`~/T/_firefly_iii/cli.info`** — INFO and `API_CALL` lines: verb, target, route, status, duration,
   counts. **File only.**
 - **`~/T/_firefly_iii/cli.err`** — WARN and ERROR lines, **and** stderr.
+- Every WARN, ERROR and uncaught exception is **also** written to `~/T/firefly/error.err` as `[ffx]`
+  ([error_err.mdx](./error_err.mdx)); `cli.info`/`cli.err` keep their jobs.
 
 The machine key is never in either, only its fingerprint. **No financial data in the logs** — a
 count of rows, yes; a payee, an amount, an account number, no. Logging can never crash the CLI; every
 filesystem fault in the logger is swallowed. Files are `0600`, append-only, rotated at 8 MB. An
-uncaught exception is caught at top level, logged with its stack to `cli.err`, printed as one sentence
-plus the remediation, and exits `1`.
+uncaught exception is caught at top level, logged with its stack to `cli.err` and to
+`~/T/firefly/error.err`, printed as one sentence plus the remediation, and exits `1`.
 
 ---
 

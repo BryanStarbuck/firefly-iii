@@ -24,6 +24,7 @@ declare(strict_types=1);
 
 namespace FireflyIII\Machine\Ingest;
 
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\Ingest\Parsers\CamtParser;
 use FireflyIII\Machine\Ingest\Parsers\CsvStatementParser;
 use FireflyIII\Machine\Ingest\Parsers\OfxParser;
@@ -243,7 +244,8 @@ final class StatementReader
                 return $cached;
             }
             $text   = $result->output();
-        } catch (Throwable) {
+        } catch (Throwable $e) {
+            ErrorFile::for('app/Machine/Ingest/StatementReader.php')->expected('extracting text from a PDF statement', $e);
             return $cached;
         }
         $staging->write('_text/'.$sha.'.txt', $text);

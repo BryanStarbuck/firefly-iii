@@ -5,11 +5,15 @@
  * - WARN and ERROR go to cli.err (and the caller prints them on stderr).
  * - The machine key is never logged; only its fingerprint.
  * - No financial data: counts yes; payees, amounts, account numbers no.
- * - Logging can never crash the CLI: every filesystem fault is swallowed.
+ * - Logging can never crash the CLI: a filesystem fault is written to ~/T/firefly/error.err, never thrown.
  * - 0600, append-only, rotated at 8 MB, five generations.
  */
 import fs from 'node:fs';
 import path from 'node:path';
+
+import { errorFileFor } from './vendor/error-file/index.js';
+
+const errors = errorFileFor('cli/code/src/logger.ts');
 
 const MAX_BYTES = 8 * 1024 * 1024;
 const GENERATIONS = 5;
@@ -31,8 +35,10 @@ function rotate(file: string): void {
       if (fs.existsSync(from)) fs.renameSync(from, `${file}.${i + 1}`);
     }
     fs.renameSync(file, `${file}.1`);
-  } catch {
-    /* missing file or a race — nothing to rotate */
+  } catch (err) {
+    // A missing file or a race is nothing to rotate; any other fs fault is visible, never thrown.
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') errors.expected('rotating the CLI log', err);
+    else errors.caught('rotating the CLI log', err);
   }
 }
 
@@ -49,8 +55,9 @@ function write(level: Level, message: string): void {
     rotate(file);
     const line = `${new Date().toISOString()} [${level}] ${scrub(message).replace(/\n/g, ' | ')}\n`;
     fs.appendFileSync(file, line, { mode: 0o600 });
-  } catch {
-    /* logging must never crash the CLI */
+  } catch (err) {
+    // Still never crashes the CLI; the fault is now visible (pm/error_err.mdx §8.7, N14).
+    errors.caught('appending to the CLI log', err);
   }
 }
 

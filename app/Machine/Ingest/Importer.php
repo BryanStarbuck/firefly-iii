@@ -29,6 +29,7 @@ use FireflyIII\Events\Model\TransactionGroup\TransactionGroupEventFlags;
 use FireflyIII\Events\Model\TransactionGroup\TransactionGroupEventObjects;
 use FireflyIII\Exceptions\DuplicateTransactionException;
 use FireflyIII\Exceptions\FireflyException;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Money;
 use FireflyIII\Machine\Transactions\Snapshot;
@@ -65,6 +66,8 @@ use Illuminate\Support\Facades\DB;
  */
 final class Importer
 {
+    private const string WHERE = 'app/Machine/Ingest/Importer.php';
+
     /**
      * @param list<array{summary: array<string, mixed>, account_id: null|int, rows: list<array<string, mixed>>}> $accounts
      *                                                                                                                  rows: RowBuilder rows (status ok are stored)
@@ -112,6 +115,7 @@ final class Importer
                 try {
                     $canonical = CanonicalRow::fromStatementRow($row, $accountId, (string) $target['currency_code'], (int) $target['currency_places']);
                 } catch (MachineException $e) {
+                    ErrorFile::for(self::WHERE)->expected('canonicalising a statement row', $e);
                     ++$summary['errors'];
                     $result->count('errors');
                     $verdict += ['verdict' => 'error', 'reason' => $e->getMessage()];
@@ -139,6 +143,7 @@ final class Importer
                     $newIds[]             = $row['external_id'];
                     $verdict += ['verdict' => 'new', 'group_id' => (int) $group->id];
                 } catch (DuplicateTransactionException $e) {
+                    ErrorFile::for(self::WHERE)->expected('storing a statement row that is a duplicate', $e);
                     $of      = 1 === preg_match('/#(\d+)/', $e->getMessage(), $m) ? (int) $m[1] : null;
                     $inBatch = null !== $of && isset($created[$of]);
                     ++$summary['already_present'];
@@ -153,6 +158,7 @@ final class Importer
                         default  => ['verdict' => 'duplicate', 'duplicate_of' => $of, 'reason' => sprintf('Firefly\'s duplicate hash matches #%d', (int) $of)],
                     };
                 } catch (FireflyException $e) {
+                    ErrorFile::for(self::WHERE)->expected('storing a statement row', $e);
                     ++$summary['errors'];
                     $result->count('errors');
                     $verdict += ['verdict' => 'error', 'reason' => $e->getMessage()];

@@ -174,7 +174,7 @@ final class Envelope
             return MachineException::notFound('Not found.', 'GET /machine/v1/capabilities lists every route');
         }
         if ($e instanceof FireflyException) {
-            return MachineException::upstream(self::scrub($e->getMessage()), 'Firefly III refused the operation — the detail is in storage/logs/laravel.log (ffx logs)');
+            return MachineException::upstream(self::scrub($e->getMessage()), 'Firefly III refused the operation. The detail is in ~/T/firefly/error.err — ffx logs --errors', [], $e);
         }
         if ($e instanceof HttpExceptionInterface) {
             $status = $e->getStatusCode();

@@ -1,0 +1,233 @@
+{
+    "_doc": "pm/error_err.mdx §3.4, R16. Synthetic records only. For kind=record: error and cause go through the text scrubs (Redactor::text / scrubText, including the SQL cut), data through the data redaction (Redactor::data / redactData), then the line formatter (LineFormat::record / formatRecord). cause carries its own \" | cause: \" separators; stack is a list of frame texts without the four-space indent. For kind=summary: LineFormat::summary(level, app, where, doing, count, first_ms, headline, now_ms, window_s). golden-lines.txt is the concatenation of every output, in order, byte for byte.",
+    "records": [
+        {
+            "name": "php-api error with one frame",
+            "kind": "record",
+            "ts": "2026-09-21T18:42:10.004Z",
+            "level": "ERROR",
+            "app": "php-api",
+            "where": "app/Support/Steam.php:612",
+            "doing": "handling GET /api/v1/accounts/{account}",
+            "error": "TypeError: FireflyIII\\Support\\Steam::finalAccountBalance(): Argument #2 ($date) must be of type Carbon\\Carbon, null given",
+            "cause": "",
+            "stack": [
+                "at FireflyIII\\Support\\Steam->finalAccountBalance (app/Support/Steam.php:612)"
+            ],
+            "data": {
+                "net": "report",
+                "route": "api.v1.accounts.show",
+                "rid": "9b1e44f0",
+                "took_ms": 12,
+                "pid": 4242
+            }
+        },
+        {
+            "name": "php-machine error with two frames",
+            "kind": "record",
+            "ts": "2026-09-21T18:43:00.500Z",
+            "level": "ERROR",
+            "app": "php-machine",
+            "where": "app/Machine/Http/Controllers/TransactionController.php:204",
+            "doing": "handling POST /machine/v1/transactions",
+            "error": "RuntimeException: Synthetic failure while storing op 3",
+            "cause": "",
+            "stack": [
+                "at FireflyIII\\Machine\\Http\\Controllers\\TransactionController->store (app/Machine/Http/Controllers/TransactionController.php:204)",
+                "at FireflyIII\\Machine\\Http\\Controllers\\MirrorController::dispatchInternal (app/Machine/Http/Controllers/MirrorController.php:170)"
+            ],
+            "data": {
+                "net": "report",
+                "caller": "ffx",
+                "rid": "7f3a9c01",
+                "took_ms": 41,
+                "pid": 4242
+            }
+        },
+        {
+            "name": "ffx error, no stack",
+            "kind": "record",
+            "ts": "2026-09-21T18:43:00.561Z",
+            "level": "ERROR",
+            "app": "ffx",
+            "where": "cli/code/src/main.ts",
+            "doing": "running an ffx verb",
+            "error": "CliError: Firefly III failed on the server.",
+            "cause": "",
+            "stack": [],
+            "data": {
+                "verb": "batch",
+                "exit": 1,
+                "code": "internal",
+                "rid": "7f3a9c01",
+                "net": "top",
+                "pid": 5301
+            }
+        },
+        {
+            "name": "T3 warn from the log net",
+            "kind": "record",
+            "ts": "2026-09-21T18:44:10.004Z",
+            "level": "WARN",
+            "app": "php-artisan",
+            "where": "app/Console/Commands/Correction/CorrectsAmounts.php:455",
+            "doing": "running artisan correction:amounts",
+            "error": "Log::error: Could not find source OR destination for journal #101 .",
+            "cause": "",
+            "stack": [],
+            "data": {
+                "net": "log",
+                "pid": 5120
+            }
+        },
+        {
+            "name": "fatal out of memory",
+            "kind": "record",
+            "ts": "2026-09-21T18:48:00.511Z",
+            "level": "FATAL",
+            "app": "php-web",
+            "where": "app/Support/Steam.php:612",
+            "doing": "handling GET /accounts/show/{account}",
+            "error": "Symfony\\Component\\ErrorHandler\\Error\\FatalError: Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes)",
+            "cause": "",
+            "stack": [],
+            "data": {
+                "net": "shutdown",
+                "route": "accounts.show",
+                "rid": "3c9d0a1e",
+                "pid": 4242
+            }
+        },
+        {
+            "name": "expected under verbose, home path shortened",
+            "kind": "record",
+            "ts": "2026-09-21T18:44:30.000Z",
+            "level": "EXPECTED",
+            "app": "php-machine",
+            "where": "app/Machine/Credentials/CredentialsFile.php",
+            "doing": "probing the credentials file",
+            "error": "ErrorException: file_get_contents(/home/someone/.credentials/synthetic.json): Failed to open stream: No such file or directory",
+            "cause": "",
+            "stack": [],
+            "data": {
+                "pid": 4242
+            }
+        },
+        {
+            "name": "warn with an empty error",
+            "kind": "record",
+            "ts": "2026-09-21T18:45:01.250Z",
+            "level": "WARN",
+            "app": "php-artisan",
+            "where": "app/Machine/Audit.php",
+            "doing": "appending to the plane audit log",
+            "error": "",
+            "cause": "",
+            "stack": [],
+            "data": {
+                "state": "missing",
+                "pid": 5120
+            }
+        },
+        {
+            "name": "every redaction class",
+            "kind": "record",
+            "ts": "2026-09-21T18:46:00.000Z",
+            "level": "ERROR",
+            "app": "php-machine",
+            "where": "app/Machine/Ingest/Importer.php",
+            "doing": "importing a statement row",
+            "error": "RuntimeException: Synthetic transfer of 4211.08 to GB82WEST12345698765432 for someone@example.test failed in 6.1.20",
+            "cause": " | cause: RuntimeException: key 0000000000000000000000000000000000000000000000000000000000000000 refused by http://127.0.0.1:7373/x?token=abc123&page=2 | cause: RuntimeException: account 123456789012 token 00000000000000000000000000000000",
+            "stack": [],
+            "data": {
+                "amount": 4211.08,
+                "notes": null,
+                "secret_token": "abc",
+                "rows": 3,
+                "detail": "paid 4211.08 twice",
+                "ok": false
+            }
+        },
+        {
+            "name": "hostile control characters",
+            "kind": "record",
+            "ts": "2026-09-21T18:47:00.000Z",
+            "level": "ERROR",
+            "app": "php-web",
+            "where": "app/Machine/Http/Controllers/MachineController.php:88",
+            "doing": "handling GET /machine/v1/about",
+            "error": "RuntimeException: x\n[2026-09-21T00:00:00.000Z] [ERROR] [php-web] forged\rline\u0007bell\u2028sep\u2029end",
+            "cause": " | cause: LogicException: tab\there",
+            "stack": [
+                "at Evil->frame (app/Evil.php:1)\n[2026-09-21T00:00:00.000Z] [FATAL] [php-web] forged frame"
+            ],
+            "data": {
+                "k\ney": "v\nal",
+                "net": "report"
+            }
+        },
+        {
+            "name": "over-cap stack cut at a frame boundary",
+            "kind": "record",
+            "ts": "2026-09-21T18:47:30.000Z",
+            "level": "ERROR",
+            "app": "php-artisan",
+            "where": "app/Support/Synthetic/Deep01.php:101",
+            "doing": "running artisan firefly-iii:synthetic",
+            "error": "RuntimeException: Synthetic deep failure",
+            "cause": "",
+            "stack": [
+                "at FireflyIII\\Support\\Synthetic\\Deep01->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep01.php:101)",
+                "at FireflyIII\\Support\\Synthetic\\Deep02->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep02.php:102)",
+                "at FireflyIII\\Support\\Synthetic\\Deep03->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep03.php:103)",
+                "at FireflyIII\\Support\\Synthetic\\Deep04->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep04.php:104)",
+                "at FireflyIII\\Support\\Synthetic\\Deep05->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep05.php:105)",
+                "at FireflyIII\\Support\\Synthetic\\Deep06->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep06.php:106)",
+                "at FireflyIII\\Support\\Synthetic\\Deep07->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep07.php:107)",
+                "at FireflyIII\\Support\\Synthetic\\Deep08->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep08.php:108)",
+                "at FireflyIII\\Support\\Synthetic\\Deep09->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep09.php:109)",
+                "at FireflyIII\\Support\\Synthetic\\Deep10->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep10.php:110)",
+                "at FireflyIII\\Support\\Synthetic\\Deep11->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep11.php:111)",
+                "at FireflyIII\\Support\\Synthetic\\Deep12->stepNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNestedNested (app/Support/Synthetic/Deep12.php:112)"
+            ],
+            "data": {
+                "net": "report",
+                "pid": 5188
+            }
+        },
+        {
+            "name": "folded summary",
+            "kind": "summary",
+            "now_ms": 1790016543004,
+            "level": "ERROR",
+            "app": "php-machine",
+            "where": "app/Machine/Ingest/Importer.php",
+            "doing": "importing a statement row",
+            "count": 37,
+            "first_ms": 1790016062118,
+            "headline": "RuntimeException: Synthetic row failure",
+            "window_s": 60
+        },
+        {
+            "name": "quoted data values and the SQL cut",
+            "kind": "record",
+            "ts": "2026-09-21T18:49:40.001Z",
+            "level": "ERROR",
+            "app": "php-artisan",
+            "where": "app/Repositories/Account/AccountRepository.php:212",
+            "doing": "running artisan firefly-iii:cron",
+            "error": "Illuminate\\Database\\QueryException: SQLSTATE[HY000]: General error: 5 database is locked (Connection: sqlite, Database: /home/someone/synthetic.sqlite, SQL: select * from accounts where id = ? and name = ?) (code=HY000)",
+            "cause": " | cause: PDOException: SQLSTATE[HY000]: General error: 5 database is locked (code=HY000)",
+            "stack": [],
+            "data": {
+                "during": "running artisan firefly-iii:cron",
+                "quote": "say \"hi\"",
+                "pair": "a=b",
+                "brace": "{x}",
+                "empty": "",
+                "pid": 5190
+            }
+        }
+    ]
+}

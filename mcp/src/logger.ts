@@ -7,12 +7,16 @@
  * - mcp.err: WARN, ERROR and every denial — file AND stderr.
  * - 0600, append-only, rotated at 8 MB (five generations).
  * - Anything shaped like a 64-hex key is masked before it can reach a file.
- * - Logging never crashes the server: every filesystem fault is swallowed.
+ * - Logging never crashes the server: every filesystem fault is caught — and
+ *   written to ~/T/firefly/error.err (pm/error_err.mdx §16.3 P3), never rethrown.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 
 import type { LogLevel } from './config.js';
+import { errorFileFor } from './vendor/error-file/index.js';
+
+const errors = errorFileFor('mcp/src/logger.ts');
 
 const MAX_BYTES = 8 * 1024 * 1024;
 const GENERATIONS = 5;
@@ -58,8 +62,10 @@ export class Logger {
         if (fs.existsSync(from)) fs.renameSync(from, `${file}.${i + 1}`);
       }
       fs.renameSync(file, `${file}.1`);
-    } catch {
-      /* missing file or a race — nothing to rotate */
+    } catch (err) {
+      // A missing file (the first write) or a race is nothing to rotate; any other fault is one.
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') errors.expected('rotating the MCP log', err);
+      else errors.caught('rotating the MCP log', err, { file: path.basename(file) });
     }
   }
 
@@ -68,8 +74,9 @@ export class Logger {
       fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
       this.#rotate(file);
       fs.appendFileSync(file, line, { mode: 0o600 });
-    } catch {
-      /* logging must never crash the server */
+    } catch (err) {
+      // Logging must never crash the server; the fault is now visible in error.err.
+      errors.caught('appending to the MCP log', err, { file: path.basename(file) });
     }
   }
 
@@ -80,8 +87,9 @@ export class Logger {
   #toStderr(message: string): void {
     try {
       this.#stderr(`${SERVER_TAG}: ${scrub(message).replace(/\r?\n/g, ' | ')}\n`);
-    } catch {
-      /* a closed stderr must not take the server down */
+    } catch (err) {
+      // A closed stderr must not take the server down.
+      errors.caught('writing to stderr', err);
     }
   }
 

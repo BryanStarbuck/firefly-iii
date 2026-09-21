@@ -26,9 +26,11 @@ namespace FireflyIII\Machine\Http;
 
 use FireflyIII\Exceptions\Handler;
 use FireflyIII\Machine\Envelope;
+use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use Illuminate\Http\Request;
 use Override;
+use Symfony\Component\ErrorHandler\Error\FatalError;
 use Symfony\Component\HttpFoundation\Response;
 use Throwable;
 
@@ -39,7 +41,15 @@ use Throwable;
  * mode) — becomes the JSON envelope. Never HTML, never a stack, never a class name.
  *
  * A MachineException is a refusal the plane meant to give, so it is not reported (no error mail,
- * no stack in the log); anything else is reported through Firefly's handler as usual.
+ * no stack in the log); anything else is written to ~/T/firefly/error.err first (pm/error_err.mdx)
+ * and then reported through Firefly's handler as usual. An `internal` or `upstream_error`
+ * MachineException is written there too, with its original cause.
+ *
+ * report() is also the error file's handler net (pm/error_err.mdx §4.5, N1–N3): every reported
+ * throwable in every PHP runtime passes through it, and ErrorFile::handlerReport() writes the record
+ * BEFORE parent::report(), so it survives a MailError job that throws and an APP_LOG_LEVEL above
+ * error. An out-of-memory FatalError first raises the memory limit — the first statement, before
+ * the error-file library is even autoloaded (R9, §4.7).
  */
 final class MachineExceptionHandler extends Handler
 {
@@ -56,6 +66,10 @@ final class MachineExceptionHandler extends Handler
     #[Override]
     public function report(Throwable $e): void
     {
+        if ($e instanceof FatalError && str_starts_with($e->getMessage(), 'Allowed memory size')) {
+            @ini_set('memory_limit', (string) (memory_get_usage(true) + 16 * 1048576));   // FIRST (pm/error_err.mdx §4.7)
+        }
+        ErrorFile::handlerReport($e, $this);   // total; writes BEFORE parent::report()
         if ($e instanceof MachineException) {
             return;
         }

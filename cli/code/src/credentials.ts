@@ -21,6 +21,9 @@ import path from 'node:path';
 import type { Config } from './config.js';
 import { tildify } from './config.js';
 import { CliError, EXIT } from './errors.js';
+import { errorFileFor } from './vendor/error-file/index.js';
+
+const errors = errorFileFor('cli/code/src/credentials.ts');
 
 export const APP_KEY = 'firefly_iii';
 const KEY_SHAPE = /^[0-9a-f]{64}$/;
@@ -207,7 +210,11 @@ export function tryLoadMachineKey(cfg: Config): { key?: MachineKey; problem?: Cl
   try {
     return { key: loadMachineKey(cfg) };
   } catch (err) {
-    if (err instanceof CliError) return { problem: err };
+    if (err instanceof CliError) {
+      errors.expected('loading the machine key for a report', err); // a refusal is a report line (R7)
+      return { problem: err };
+    }
+    errors.caught('loading the machine key for a report', err);
     // An unreadable file (EACCES, EISDIR…) is a report line for bare `ffx`/status/doctor, never a crash.
     return { problem: new CliError(EXIT.USAGE, `cannot read the machine key: ${(err as Error).message}`) };
   }
@@ -238,8 +245,8 @@ function withLock<T>(file: string, fn: () => T): T {
           const now = fs.lstatSync(lock);
           if (now.ino === seen.ino && now.dev === seen.dev) fs.unlinkSync(lock);
         }
-      } catch {
-        /* raced with the holder releasing it */
+      } catch (e) {
+        errors.expected('checking the credentials lock', e); // raced with the holder releasing it
       }
       if (Date.now() > deadline) {
         throw new CliError(EXIT.CONFLICT, `could not lock ${lock} — another process is writing the credentials file`);
@@ -255,8 +262,8 @@ function withLock<T>(file: string, fn: () => T): T {
     try {
       const st = fs.lstatSync(lock);
       if (st.ino === mine.ino && st.dev === mine.dev) fs.unlinkSync(lock);
-    } catch {
-      /* already gone */
+    } catch (err) {
+      errors.expected('releasing the credentials lock', err); // already gone
     }
   }
 }
@@ -383,6 +390,9 @@ export function describeKey(cfg: Config): KeyDescription {
     const root = statementsRootFromDoc(doc);
     if (root) out.statements_root = root;
   } catch (err) {
+    // The problem is a report line for bare ffx, status and doctor (R7); a non-CliError is a fault.
+    if (err instanceof CliError) errors.expected('describing the machine key', err);
+    else errors.caught('describing the machine key', err);
     out.problem = (err as Error).message;
   }
   return out;
@@ -394,7 +404,10 @@ export function resolveStatementsRoot(cfg: Config, flag: string | undefined): st
   if (cfg.statementsDir) return cfg.statementsDir;
   try {
     return statementsRootFromDoc(readCredentialsDoc(cfg.credentialsFile, cfg.home));
-  } catch {
+  } catch (err) {
+    // No readable credentials file means no configured root (R7); a non-CliError is a fault.
+    if (err instanceof CliError) errors.expected('resolving the statements root', err);
+    else errors.caught('resolving the statements root', err);
     return undefined;
   }
 }

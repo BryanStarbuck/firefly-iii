@@ -109,6 +109,8 @@ This server never starts Firefly III. If tools return `not_ready` with a hint to
 
 If `not_ready` names `FIREFLY_MACHINE_OPERATOR`, the install has more than one user and the operator must say which one this server acts as. If tools return `unauthorized`, the machine key on disk changed after this server started; the fix is to restart this MCP server. These are different problems with different fixes, which is why they are different codes.
 
+If a tool returns `internal` or `upstream_error`, the detail was written to `~/T/firefly/error.err` on the operator's machine; tell them to run `ffx logs --errors`. You cannot read it.
+
 WHAT COMES BACK, AND HOW TO READ IT
 
 Every result is one JSON object. On success `ok` is true and the answer is in `data`, with `meta` carrying the administration, the target and `asOf`. On failure `ok` is false and `error` carries a `code` from a fixed list and a `hint` naming the remedy. Relay the hint.

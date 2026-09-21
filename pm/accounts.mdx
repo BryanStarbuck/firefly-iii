@@ -367,6 +367,7 @@ Profile: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/ProfileController.ph
 | "419 Page Expired" on submit                                   | Session/CSRF cookie stale, often after switching host names.       | Reload the login page on `127.0.0.1` and try again.                                  |
 | `ffx status` says operator not resolved                        | Two users and no `FIREFLY_MACHINE_OPERATOR`, or operator blocked/renamed. | Set `FIREFLY_MACHINE_OPERATOR` to the exact current email; `just status`.       |
 | Browser and MCP disagree on what exists                        | Logged into a different user or administration than the operator.   | `ffx whoami` vs the profile page; align `FIREFLY_MACHINE_OPERATOR` / `_ADMINISTRATION`. |
+| Something else broke                                           | A fault in the web app, the plane, `ffx` or the MCP.                | `ffx logs --errors` — every fault is in `~/T/firefly/error.err` ([error_err.mdx](./error_err.mdx)). |
 
 ---
 

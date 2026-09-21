@@ -7,7 +7,11 @@
  * misconfiguration is one stderr line and exit 2 — a server absent from the
  * catalogue with a reason — rather than a server that connects and then fails
  * every call. stdout is the JSON-RPC wire and nothing in this file touches it.
+ *
+ * The first import installs the error file (pm/error_err.mdx §5.6, N15); the
+ * catch on Main.run() is N16.
  */
+import './error-file-install.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { PlaneClient } from './client.js';
@@ -18,6 +22,9 @@ import { fingerprint, loadMachineKey } from './credentials.js';
 import { resolveInstructions } from './instructions.js';
 import { Logger } from './logger.js';
 import { McpServerHost, SERVER_VERSION } from './server.js';
+import { errorFileFor } from './vendor/error-file/index.js';
+
+const errors = errorFileFor('mcp/src/index.ts', { net: 'top' });
 
 function refuse(message: string, fix: string): never {
   // One line, stderr. stdout is the wire (§8.1).
@@ -27,6 +34,13 @@ function refuse(message: string, fix: string): never {
 
 export class Main {
   static async run(argv: string[]): Promise<void> {
+    // The runtime canary C14 (pm/error_err.mdx §13.4): a startup crash that the top-level catch (N16)
+    // writes as one FATAL, with stdout left empty. Not a command: not in the usage text or the tool
+    // catalogue. It refuses to act — and falls through to the usage refusal below — unless BOTH
+    // FIREFLY_ERROR_FILE_CANARY=1 and a non-empty FIREFLY_ERROR_FILE are set.
+    if (argv[0] === '__canary' && process.env.FIREFLY_ERROR_FILE_CANARY === '1' && process.env.FIREFLY_ERROR_FILE) {
+      throw new Error('Synthetic canary startup failure');
+    }
     if (argv[0] !== 'serve') {
       process.stderr.write(
         `usage: ${SERVER_KEY} serve\n` +
@@ -42,7 +56,10 @@ export class Main {
     try {
       config = loadConfig();
     } catch (err) {
-      if (err instanceof ConfigError) refuse(err.message, err.fix);
+      if (err instanceof ConfigError) {
+        errors.expected('loading the MCP config', err); // a refusal is an answer (R7)
+        refuse(err.message, err.fix);
+      }
       throw err;
     }
 
@@ -53,6 +70,7 @@ export class Main {
       key = loadMachineKey(credentialsConfig(config)).key;
     } catch (err) {
       if (err instanceof CliError) {
+        errors.expected('resolving the machine key', err); // a refusal is an answer (R7)
         const fix = err.hint ?? 'start Firefly III once (`ffx up`) so the web app mints the key, or run `ffx key init`';
         refuse(mcpWording(err.message), mcpWording(fix));
       }
@@ -92,4 +110,7 @@ export class Main {
   }
 }
 
-await Main.run(process.argv.slice(2));
+await Main.run(process.argv.slice(2)).catch((err: unknown) => {
+  errors.fatal('starting the MCP server', err);
+  process.exitCode = 1;
+});

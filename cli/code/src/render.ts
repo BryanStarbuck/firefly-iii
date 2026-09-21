@@ -105,13 +105,80 @@ export function getPath(row: unknown, key: string): unknown {
 
 // ----------------------------------------------------------------- table ---
 
-/** Display width, counting a few wide glyphs as one (good enough for our content). */
-function width(s: string): number {
-  return [...s].length;
+/** Terminal columns one code point occupies: 0 for combining marks and joiners, 2 for wide CJK and emoji. */
+export function codePointWidth(cp: number): number {
+  if (
+    (cp >= 0x0300 && cp <= 0x036f) || // combining diacritics
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe20 && cp <= 0xfe2f) ||
+    (cp >= 0xfe00 && cp <= 0xfe0f) || // variation selectors
+    (cp >= 0x200b && cp <= 0x200f) || // zero-width space / joiners / marks
+    (cp >= 0x1f3fb && cp <= 0x1f3ff) || // emoji skin-tone modifiers
+    (cp >= 0xe0100 && cp <= 0xe01ef)
+  ) {
+    return 0;
+  }
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2e80 && cp <= 0x303e) ||
+    (cp >= 0x3041 && cp <= 0x33ff) ||
+    (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) ||
+    (cp >= 0xa000 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe4f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1f64f) || // pictographs, emoticons
+    (cp >= 0x1f680 && cp <= 0x1f6ff) || // transport
+    (cp >= 0x1f900 && cp <= 0x1faff) || // supplemental symbols
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
+/** Display width in terminal columns — what alignment must count, not code units or code points. */
+export function displayWidth(s: string): number {
+  let w = 0;
+  for (const ch of s) w += codePointWidth(ch.codePointAt(0) ?? 0);
+  return w;
+}
+
+/** Cut to at most `w` columns, ending in … when anything was cut. Never splits a wide glyph across the edge. */
+export function clipToWidth(s: string, w: number): string {
+  if (displayWidth(s) <= w) return s;
+  let out = '';
+  let used = 0;
+  for (const ch of s) {
+    const cw = codePointWidth(ch.codePointAt(0) ?? 0);
+    if (used + cw > w - 1) break;
+    out += ch;
+    used += cw;
+  }
+  return `${out}…`;
+}
+
+/**
+ * Server text is untrusted (a payee name comes from a bank statement): C0/C1
+ * control characters — ESC above all — are replaced so a cell can never move
+ * the cursor, recolour the terminal, or break the table's lines.
+ */
+export function safeCell(s: string): string {
+  return s.replace(/\s*[\r\n]+\s*/g, ' ').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
+}
+
+/** Like safeCell but keeps line breaks — for stderr notes and error text that came from the server. */
+export function stripControls(s: string): string {
+  return s.replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g, ' ');
 }
 
 function padCell(s: string, w: number, align: 'left' | 'right'): string {
-  const gap = w - width(s);
+  const gap = w - displayWidth(s);
   if (gap <= 0) return s;
   return align === 'right' ? ' '.repeat(gap) + s : s + ' '.repeat(gap);
 }
@@ -119,17 +186,16 @@ function padCell(s: string, w: number, align: 'left' | 'right'): string {
 export function renderTable(view: View): string {
   const cols = view.columns;
   if (view.rows.length === 0) return '(no rows)';
-  const cells = view.rows.map((row) => cols.map((c) => cellText(row, c, 'table').replace(/\s*\n\s*/g, ' ')));
+  const cells = view.rows.map((row) => cols.map((c) => safeCell(cellText(row, c, 'table'))));
   const maxCell = 60;
   const widths = cols.map((c, i) =>
-    Math.min(maxCell, Math.max(width(c.header), ...cells.map((r) => width(r[i] ?? '')))),
+    Math.min(maxCell, Math.max(displayWidth(safeCell(c.header)), ...cells.map((r) => displayWidth(r[i] ?? '')))),
   );
-  const clip = (s: string, w: number): string => (width(s) > w ? [...s].slice(0, w - 1).join('') + '…' : s);
   const aligns = cols.map((c) => c.align ?? (c.kind === 'amount' ? 'right' : 'left'));
   const line = (l: string, m: string, r: string): string => l + widths.map((w) => '─'.repeat(w + 2)).join(m) + r;
   const rowLine = (vals: string[]): string =>
-    '│' + vals.map((v, i) => ` ${padCell(clip(v, widths[i] ?? 0), widths[i] ?? 0, aligns[i] ?? 'left')} `).join('│') + '│';
-  const parts = [line('┌', '┬', '┐'), rowLine(cols.map((c) => c.header)), line('├', '┼', '┤')];
+    '│' + vals.map((v, i) => ` ${padCell(clipToWidth(v, widths[i] ?? 0), widths[i] ?? 0, aligns[i] ?? 'left')} `).join('│') + '│';
+  const parts = [line('┌', '┬', '┐'), rowLine(cols.map((c) => safeCell(c.header))), line('├', '┼', '┤')];
   for (const r of cells) parts.push(rowLine(r));
   parts.push(line('└', '┴', '┘'));
   return parts.join('\n');
@@ -237,7 +303,7 @@ export function render(outcome: Outcome, opts: RenderOptions): void {
     out(renderCsv(view));
     return;
   }
-  if (view.title) note(view.title, opts.quiet);
+  if (view.title) note(stripControls(view.title), opts.quiet);
   out(renderTable(view));
-  for (const n of [...(view.notes ?? []), ...metaNotes(outcome.envelope)]) note(n, opts.quiet);
+  for (const n of [...(view.notes ?? []), ...metaNotes(outcome.envelope)]) note(stripControls(n), opts.quiet);
 }

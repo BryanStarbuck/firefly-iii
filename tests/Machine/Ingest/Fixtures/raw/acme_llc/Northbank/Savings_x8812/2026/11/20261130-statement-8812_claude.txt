@@ -1,0 +1,6 @@
+Institution: Northbank
+Account holder: acme_llc
+Account ending in 8812
+Statement period: 2026-11-01 to 2026-11-30
+2026-11-05  TRANSFER FROM OPERATING        1,000.00
+2026-11-30  INTEREST PAID                      1.25

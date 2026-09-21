@@ -11,13 +11,13 @@
 import fs from 'node:fs';
 
 import type { Envelope } from '../client.js';
-import { iso } from '../dates.js';
+import { iso, monthRange } from '../dates.js';
 import { CliError, EXIT } from '../errors.js';
 import type { Outcome, Row, View } from '../render.js';
-import { getPath, inferColumns, objectView, warn } from '../render.js';
+import { getPath, inferColumns, objectView, renderTable, warn } from '../render.js';
 import type { Ctx, FlagDef, VerbDef } from '../verbs.js';
 import { TRANSACTION_COLUMNS, TRANSACTION_FILTER_FLAGS, flattenGroups, transactionFilterQuery } from './ledger.js';
-import { applyCommand, C, changeNotes, isNumericId, monthOf, RANGE_FLAGS, rangeOf, ref, refs, rowsOf, seg, writeFlow } from './shared.js';
+import { applyCommand, ask, C, changeNotes, shellQuote, isNumericId, monthOf, RANGE_FLAGS, rangeOf, ref, refs, rowsOf, seg, writeFlow } from './shared.js';
 
 const G = 'Writing (dry run unless --write)';
 
@@ -93,8 +93,7 @@ async function planThenApply(
   apply: { route: string; body?: Record<string, unknown>; noDryRun?: boolean },
 ): Promise<Outcome> {
   const client = await ctx.plane();
-  const token = ctx.universal.token;
-  if (token) {
+  const applyWith = async (token: string): Promise<Outcome> => {
     if (!ctx.universal.write && apply.noDryRun) {
       throw new CliError(EXIT.USAGE, 'this operation has no dry run — its plan is the preview you already read', { hint: applyCommand(token) });
     }
@@ -104,7 +103,9 @@ async function planThenApply(
     const view = plan.view(env);
     view.title = ctx.universal.write ? 'APPLIED' : 'DRY RUN — nothing was changed';
     return { envelope: env, view };
-  }
+  };
+  if (ctx.universal.token) return applyWith(ctx.universal.token);
+
   const env = await client.call(plan.method, plan.route, plan.body ? { body: plan.body } : {});
   const view = plan.view(env);
   const t = getPath(env.data, 'confirm_token');
@@ -113,8 +114,18 @@ async function planThenApply(
     ...(view.notes ?? []),
     ...(typeof t === 'string' ? [`confirm token  ${t}`, `apply with:    ${applyCommand(t)}`] : ['(no confirm token — nothing to apply)']),
   ];
-  if (ctx.universal.write) warn('ffx: refused: --write needs --token — read the plan, then run the apply command it prints');
-  return { envelope: env, view, exit: ctx.universal.write ? EXIT.USAGE : EXIT.OK };
+  if (!ctx.universal.write) return { envelope: env, view };
+  // --write without --token (cli.mdx §11.1): on a terminal, show the plan and ask; piped, refuse.
+  if (typeof t === 'string' && ctx.stdinTTY && process.stderr.isTTY) {
+    process.stderr.write(`${view.title}\n${renderTable(view)}\n${(view.notes ?? []).join('\n')}\n`);
+    if (!(await ask('Apply this? [y/N] '))) {
+      ctx.note('not applied.');
+      return { envelope: env, lines: [], exit: EXIT.OK };
+    }
+    return applyWith(t);
+  }
+  warn('ffx: refused: --write needs --token — read the plan, then run the apply command it prints');
+  return { envelope: env, view, exit: EXIT.USAGE };
 }
 
 // ---------------------------------------------------------- transactions ---
@@ -287,16 +298,22 @@ function limitView(env: Envelope): View {
   return { rows, columns, notes };
 }
 
-function periodBody(ctx: Ctx): { start: string; end: string } {
+/**
+ * The budget period a write targets: --month, or --start AND --end, or (neither
+ * given) this month. Pure — it reads the flags and never writes them back.
+ */
+export function periodBody(ctx: Ctx): { start: string; end: string } {
   const month = ctx.str('month');
-  if (month || (!ctx.str('start') && !ctx.str('end'))) {
+  const start = ctx.str('start');
+  const end = ctx.str('end');
+  if (month && (start || end)) throw new CliError(EXIT.USAGE, 'give either --month or --start/--end, not both');
+  if (month || (!start && !end)) {
     const m = monthOf(ctx, 'this-month') as string;
-    const saved = ctx.flags.month;
-    ctx.flags.month = m;
-    const r = rangeOf(ctx, 'none');
-    if (saved === undefined) delete ctx.flags.month;
-    else ctx.flags.month = saved;
-    return { start: r.start as string, end: r.end as string };
+    const r = monthRange(m);
+    if (!r) throw new CliError(EXIT.USAGE, `bad --month "${month ?? m}"`);
+    if (!month) ctx.note(`(no period given — using this month)`);
+    ctx.note(`range ${r.start} .. ${r.end}`);
+    return r;
   }
   const r = rangeOf(ctx, 'none');
   if (!r.start || !r.end) throw new CliError(EXIT.USAGE, 'a budget period needs both --start and --end (or --month)');
@@ -439,6 +456,7 @@ const rulesRun: VerbDef = {
     const ids = ctx.list('id');
     const group = ctx.str('group');
     if (!ids.length && !group) throw new CliError(EXIT.USAGE, 'give --id <rule> or --group <rule group>');
+    if (ids.length && group) throw new CliError(EXIT.USAGE, 'give --id or --group, not both (the route takes rule_ids OR rule_group_id)');
     const r = rangeOf(ctx, 'none');
     return writeFlow(ctx, {
       method: 'POST',
@@ -533,7 +551,7 @@ const recurringTrigger: VerbDef = {
       const env = await client.call('GET', `/recurrences/${id}`, { query: { count: 3 } });
       const view = objectView(((getPath(env.data, 'recurrence') ?? env.data) as Record<string, unknown>) ?? {});
       view.title = 'PREVIEW — nothing was created';
-      view.notes = [`this operation has no dry run; to create the occurrence: ffx ${process.argv.slice(2).join(' ')} --write`];
+      view.notes = [`this operation has no dry run; to create the occurrence: ffx ${[...process.argv.slice(2), '--write'].map(shellQuote).join(' ')}`];
       return { envelope: env, view };
     }
     ctx.note(`writing to ${ctx.cfg.apiUrl} (key ${client.fingerprint})`);
@@ -564,7 +582,11 @@ const undo: VerbDef = {
   summary: 'reverse the most recent write made through the plane — preview first, then --token --write',
   route: 'GET /undo/last, POST /undo',
   writes: true,
+  flags: { show: { help: 'only preview what undo would reverse (the default without --token)' } },
   async run(ctx) {
+    if (ctx.bool('show') && (ctx.universal.write || ctx.universal.token)) {
+      throw new CliError(EXIT.USAGE, '--show only previews; drop --write/--token, or drop --show to apply');
+    }
     return planThenApply(ctx, { method: 'GET', route: '/undo/last', view: undoView }, { route: '/undo', noDryRun: true });
   },
 };

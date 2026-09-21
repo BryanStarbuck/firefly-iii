@@ -1,0 +1,12 @@
+Northbank — Statement
+Institution: Northbank
+Account holder: household
+Account ending in 4021
+Statement period: 2026-09-01 to 2026-09-30
+
+Date        Description                         Amount      Balance
+Beginning balance                                           1,000.00
+2026-09-03  CORNER CAFE #12                      -5.00        995.00
+2026-09-03  CORNER CAFE #12                      -5.00        990.00
+2026-09-15  PAYROLL EXAMPLE CO DIRECT DEP     2,500.00      3,490.00
+Ending balance                                              3,490.00

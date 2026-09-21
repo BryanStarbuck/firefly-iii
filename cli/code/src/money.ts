@@ -80,8 +80,12 @@ export function displayAmount(value: unknown, currency?: unknown, places?: numbe
  * pick sparkline glyph heights — never to compute or display a figure.
  */
 export function compareDecimal(a: string, b: string): number {
-  const na = a.startsWith('-');
-  const nb = b.startsWith('-');
+  // "-0.00" is zero, not a negative number below "0".
+  const isZero = (x: string): boolean => /^-?0*(\.0*)?$/.test(x);
+  const na = a.startsWith('-') && !isZero(a);
+  const nb = b.startsWith('-') && !isZero(b);
+  if (isZero(a) && a.startsWith('-')) a = a.slice(1);
+  if (isZero(b) && b.startsWith('-')) b = b.slice(1);
   if (na !== nb) return na ? -1 : 1;
   const sign = na ? -1 : 1;
   const [ai = '', af = ''] = (na ? a.slice(1) : a).split('.');

@@ -1,0 +1,7 @@
+Institution: Northbank
+Account holder: household
+Account ending in 4021
+Statement period: 10/01/2026 to 10/31/2026
+10/04  POS PURCHASE GREEN GROCER XXXX4021          -42.17
+10/20  RENT EXAMPLE PROPERTIES                  -1,200.00
+10/28  INTEREST PAID                                 0.41

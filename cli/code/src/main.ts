@@ -17,7 +17,7 @@ import { initLogger, log, scrub } from './logger.js';
 import { Spinner } from './progress.js';
 import { LOCAL_VERBS, REGISTRY, assertUniquePaths } from './registry.js';
 import type { Format } from './render.js';
-import { note, out, render } from './render.js';
+import { note, out, render, stripControls } from './render.js';
 import type { Ctx, FlagValue } from './verbs.js';
 import { verbName } from './verbs.js';
 
@@ -30,9 +30,9 @@ function reportError(err: unknown, jsonErrors: boolean, verbose: boolean): numbe
       );
       return err.exit;
     }
-    const lines = [`ffx: ${err.message}`, ...err.details.map((d) => `  ${d}`)];
+    const lines = [`ffx: ${stripControls(err.message)}`, ...err.details.map((d) => `  ${stripControls(d)}`)];
     if (verbose && err.serverDetails !== undefined) lines.push(`  details: ${scrub(JSON.stringify(err.serverDetails))}`);
-    if (err.hint) lines.push(`  fix: ${err.hint}`);
+    if (err.hint) lines.push(`  fix: ${stripControls(err.hint)}`);
     process.stderr.write(lines.join('\n') + '\n');
     return err.exit;
   }

@@ -70,4 +70,5 @@ return [
     TagServiceProvider::class,
     AdminServiceProvider::class,
     RecurringServiceProvider::class,
+    FireflyIII\Machine\MachinePlaneServiceProvider::class, // the machine plane (pm/apis.mdx) — the fork's one-line upstream delta
 ];

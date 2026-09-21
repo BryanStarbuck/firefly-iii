@@ -29,16 +29,19 @@ setup:
     mkdir -p "{{state}}/db" && chmod 700 "{{state}}" "{{state}}/db"
     db="{{state}}/db/firefly.sqlite"
     [ -f "$db" ] || { touch "$db"; chmod 600 "$db"; }
-    composer install --no-interaction --prefer-dist
     fresh_env=0
+    # .env FIRST: composer's post-install script boots artisan, which needs APP_KEY.
     if [ ! -f .env ]; then
       cp .env.example .env
       fresh_env=1
       # SQLite outside the repo tree; bind to loopback; local environment.
       perl -pi -e 's/^DB_CONNECTION=.*/DB_CONNECTION=sqlite/; s/^DB_HOST=.*/# DB_HOST not used with sqlite/; s{^DB_DATABASE=.*}{DB_DATABASE='"$db"'}; s{^APP_URL=.*}{APP_URL=http://{{host}}:{{port}}}; s/^APP_ENV=.*/APP_ENV=local/' .env
       printf '\n# ---- machine plane (pm/apis.mdx) ----\n# FIREFLY_MACHINE_ALLOW_WRITE=1\n# FIREFLY_MACHINE_ALLOW_ADMIN=1\n# FIREFLY_MACHINE_OPERATOR=you@example.com\n# FIREFLY_MACHINE_ADMINISTRATION=1\n' >> .env
-      php artisan key:generate --force
+      appkey="base64:$(php -r 'echo base64_encode(random_bytes(32));')"
+      perl -pi -e 's{^APP_KEY=.*}{APP_KEY='"$appkey"'}' .env
+      chmod 600 .env
     fi
+    composer install --no-interaction --prefer-dist
     case "$(grep -E '^DB_DATABASE=' .env | cut -d= -f2-)" in
       "{{root}}"/*|storage/*|"") echo "refusing: DB_DATABASE in .env points inside the repo — private data must live outside it" >&2; exit 1 ;;
     esac
@@ -49,6 +52,11 @@ setup:
       php artisan firefly-machine:key --init
     else
       ./cli/ffx key init
+    fi
+    # The web UI's Vite assets (public/build is git-ignored upstream; without it every page 500s).
+    if [ ! -f public/build/manifest.json ]; then
+      npm install --no-audit --no-fund
+      (cd resources/assets/v3 && npm run build)
     fi
     (cd cli && npm install --no-audit --no-fund)
     [ -d mcp ] && [ -f mcp/package.json ] && (cd mcp && npm install --no-audit --no-fund) || true
@@ -87,7 +95,7 @@ logs:
 # The CLI's tests and canaries; the machine plane's PHPUnit suite when it exists.
 test: build
     cd "{{root}}/cli" && node --test code/dist/test/
-    if [ -d "{{root}}/tests/Machine" ] && [ -x "{{root}}/vendor/bin/phpunit" ]; then cd "{{root}}" && vendor/bin/phpunit tests/Machine; fi
+    if [ -d "{{root}}/tests/Machine" ] && [ -x "{{root}}/vendor/bin/phpunit" ]; then cd "{{root}}" && vendor/bin/phpunit --no-coverage tests/Machine; fi
     if [ -f "{{root}}/mcp/package.json" ]; then cd "{{root}}/mcp" && npm test --silent; fi
 
 # Print the PATH line for ~/.zshrc (never edits your profile).

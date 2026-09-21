@@ -66,13 +66,18 @@ const BARS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /** Glyph heights from rank order. null → a gap, never a zero. */
 export function sparkline(values: readonly unknown[]): string {
   const nums = values.filter((v): v is string => isDecimalString(v));
-  const distinct = [...new Set(nums)].sort(compareDecimal);
+  // Distinct by VALUE, not by spelling: "612.40" and "612.4" are one amount and get one height.
+  const distinct: string[] = [];
+  for (const n of [...nums].sort(compareDecimal)) {
+    const last = distinct[distinct.length - 1];
+    if (last === undefined || compareDecimal(last, n) !== 0) distinct.push(n);
+  }
   const top = BARS.length - 1;
   return values
     .map((v) => {
       if (!isDecimalString(v)) return ' ';
       if (distinct.length <= 1) return BARS[3];
-      const rank = distinct.indexOf(v);
+      const rank = distinct.findIndex((d) => compareDecimal(d, v) === 0);
       return BARS[Math.round((rank * top) / (distinct.length - 1))];
     })
     .join('');
@@ -304,8 +309,13 @@ export function pivotSeries(data: unknown): { rows: Row[]; columns: Column[]; sp
   const columns: Column[] = [C.text('x', String(getPath(data, 'x.kind') ?? 'x'))];
   const rows: Row[] = labels.map((l) => ({ x: l }));
   const sparks: string[] = [];
+  const used = new Set<string>(['x']);
   series.forEach((s, i) => {
-    const key = `s${i}`;
+    // The column key is what a CSV header prints, so use the server's own series key when it is a
+    // safe, unique identifier; fall back to s0, s1… only when it is not.
+    const own = typeof s.key === 'string' && /^[A-Za-z0-9_-]+$/.test(s.key) && !used.has(s.key) ? s.key : undefined;
+    const key = own ?? `s${i}`;
+    used.add(key);
     const cur = typeof s.currency_code === 'string' ? s.currency_code : '';
     columns.push({ key, header: `${String(s.label ?? s.key ?? key)}${cur ? ` (${cur})` : ''}`, kind: 'amount', currencyKey: '__none__' });
     const values = Array.isArray(s.values) ? s.values : [];

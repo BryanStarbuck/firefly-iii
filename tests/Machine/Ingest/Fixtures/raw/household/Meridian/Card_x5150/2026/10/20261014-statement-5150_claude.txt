@@ -1,0 +1,8 @@
+Institution: Meridian
+Account holder: household
+Card account ending in 5150
+Statement period: Sep 15, 2026 to Oct 14, 2026
+Trans date  Description                 Amount
+09/20       BOOKSHOP EXAMPLE             23.50
+10/14       HARBOR COFFEE                 5.00
+10/01       PAYMENT THANK YOU           (300.00)

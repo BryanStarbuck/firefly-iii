@@ -58,26 +58,45 @@ function flagName(token: string): { name: string; inline: string | undefined } {
   return eq === -1 ? { name: body, inline: undefined } : { name: body.slice(0, eq), inline: body.slice(eq + 1) };
 }
 
-/** Find the verb: the longest registry path that prefixes the non-flag words. */
-export function resolveVerb(argv: readonly string[], registry: readonly VerbDef[]): { verb: VerbDef | undefined; words: string[] } {
+/** The non-flag words of argv, skipping the value of every flag `defs` declares as value-taking. */
+function wordsOf(argv: readonly string[], defs: Readonly<Record<string, FlagDef>>): string[] {
   const words: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i] as string;
     if (t === '--') break;
     if (isFlagToken(t)) {
       const { name, inline } = flagName(t);
-      if (inline === undefined && UNIVERSAL_FLAGS[name]?.value) i++;
+      if (inline === undefined && defs[name]?.value) i++;
       continue;
     }
     words.push(t);
   }
-  let best: VerbDef | undefined;
-  for (const v of registry) {
+  return words;
+}
+
+/**
+ * Find the verb: the longest registry path that prefixes the non-flag words.
+ *
+ * "Flags anywhere" (cli.mdx §7) means a verb's own value flag may come BEFORE
+ * the verb's words (`ffx transactions --month 2026-09 list`). Which tokens are
+ * flag values depends on the verb, so each candidate is tried with its own
+ * declarations, longest path first; the first that matches wins.
+ */
+export function resolveVerb(argv: readonly string[], registry: readonly VerbDef[]): { verb: VerbDef | undefined; words: string[] } {
+  const universalWords = wordsOf(argv, UNIVERSAL_FLAGS);
+  const byLength = [...registry].sort((a, b) => b.path.length - a.path.length);
+  for (const v of byLength) {
+    const words = v.flags ? wordsOf(argv, { ...UNIVERSAL_FLAGS, ...v.flags }) : universalWords;
     if (v.path.length > words.length) continue;
     if (v.path.length === 0 && words.length > 0) continue; // bare `ffx` only when there are no words
-    if (v.path.every((p, i) => p === words[i]) && (!best || v.path.length > best.path.length)) best = v;
+    if (v.path.every((p, i) => p === words[i])) return { verb: v, words };
   }
-  return { verb: best, words };
+  return { verb: undefined, words: universalWords };
+}
+
+/** A token that looks like a negative amount ("-12.50", "-.5") — taken as a value so the amount check can explain it. */
+function looksNegativeNumber(t: string): boolean {
+  return /^-(\d|\.\d)/.test(t);
 }
 
 function validate(name: string, def: FlagDef, raw: string): string {
@@ -167,7 +186,12 @@ export function parseArgs(argv: readonly string[], registry: readonly VerbDef[])
     const { name, inline } = flagName(t);
     let def = defs[name];
     let negated = false;
-    if (!def && name.startsWith('no-') && defs[name.slice(3)] && !defs[name.slice(3)]?.value) {
+    if (!def && name.startsWith('no-') && defs[name.slice(3)]) {
+      if (defs[name.slice(3)]?.value) {
+        throw new CliError(EXIT.USAGE, `--${name}: --${name.slice(3)} takes a value, so it cannot be negated with --no-`, {
+          hint: `leave --${name.slice(3)} out instead   (ffx help ${verbName(verb)})`,
+        });
+      }
       def = defs[name.slice(3)];
       negated = true;
     }
@@ -186,7 +210,7 @@ export function parseArgs(argv: readonly string[], registry: readonly VerbDef[])
     let raw = inline;
     if (raw === undefined) {
       const next = argv[i + 1];
-      if (next === undefined || (isFlagToken(next) && def.value !== 'amount')) {
+      if (next === undefined || next === '--' || (isFlagToken(next) && !(def.value === 'amount' && looksNegativeNumber(next)))) {
         throw new CliError(EXIT.USAGE, `--${name} needs a value`, { hint: `ffx help ${verbName(verb)}` });
       }
       raw = next;

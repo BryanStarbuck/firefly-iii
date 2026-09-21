@@ -17,6 +17,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 
 import { probeUp } from './client.js';
@@ -84,12 +85,41 @@ export function isAlive(pid: number): boolean {
   }
 }
 
-/** The pid listening on a TCP port, via lsof. Undefined when free or when lsof is absent. */
+/**
+ * Who holds a TCP port. `pid` via lsof; when lsof is absent (or answers
+ * nothing) a plain TCP connect still tells us whether SOMETHING listens —
+ * treating "lsof missing" as "port free" would start a second server, which
+ * `php artisan serve` then silently moves to the next port.
+ */
+export interface PortHolder {
+  held: boolean;
+  pid?: number;
+}
+
 export function listenerPid(port: number): number | undefined {
   const r = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8', timeout: 5000 });
   if (r.error || !r.stdout) return undefined;
   const n = parseInt(r.stdout.trim().split('\n')[0] ?? '', 10);
   return n > 0 ? n : undefined;
+}
+
+export function portAcceptsConnections(host: string, port: number, timeoutMs = 1000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host, port });
+    const done = (v: boolean): void => {
+      sock.destroy();
+      resolve(v);
+    };
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+
+export async function portHolder(host: string, port: number): Promise<PortHolder> {
+  const pid = listenerPid(port);
+  if (pid !== undefined) return { held: true, pid };
+  return { held: await portAcceptsConnections(host, port) };
 }
 
 function psField(pid: number, field: 'ppid' | 'pgid' | 'comm' | 'command'): string | undefined {
@@ -108,6 +138,7 @@ export function isOurs(cfg: Config, pid: number): boolean {
 }
 
 export function tailFile(file: string, lines = 20): string[] {
+  if (lines <= 0) return []; // slice(-0) is the WHOLE file, not none of it
   try {
     const text = fs.readFileSync(file, 'utf8');
     const all = text.split('\n');
@@ -155,22 +186,78 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function lockFilePath(cfg: Config): string {
+  return path.join(cfg.stateDir, 'server.lock');
+}
+
+const BRINGUP_LOCK_STALE_MS = HEALTH_WAIT_MS + 30_000;
+
+/**
+ * One bring-up at a time. Two ffx invocations that both find the app down
+ * would otherwise both spawn a server: the second lands on :7374 (artisan
+ * serve moves on when the port is taken), and its pid overwrites server.pid,
+ * so `ffx stop` stops the wrong one and the first is orphaned.
+ */
+async function withBringupLock<T>(cfg: Config, fn: () => Promise<T>): Promise<T> {
+  fs.mkdirSync(cfg.stateDir, { recursive: true, mode: 0o700 });
+  const lock = lockFilePath(cfg);
+  const deadline = Date.now() + BRINGUP_LOCK_STALE_MS;
+  let fd: number | undefined;
+  while (fd === undefined) {
+    try {
+      fd = fs.openSync(lock, 'wx', 0o600);
+      fs.writeSync(fd, `${process.pid}\n`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      try {
+        const holder = parseInt(fs.readFileSync(lock, 'utf8').trim(), 10);
+        const age = Date.now() - fs.statSync(lock).mtimeMs;
+        if (!(holder > 0 && isAlive(holder)) || age > BRINGUP_LOCK_STALE_MS) fs.rmSync(lock, { force: true });
+      } catch {
+        /* released while we looked */
+      }
+      if (Date.now() > deadline) throw new CliError(EXIT.UNAVAILABLE, `another ffx is bringing Firefly III up (${lock})`, { hint: 'wait for it, or ffx status' });
+      await sleep(250);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(lock, { force: true });
+  }
+}
+
 /** Start `php artisan serve` detached, and wait for /up. */
 export async function startDetached(cfg: Config, spinner: Spinner): Promise<number> {
   const refusal = preflightRefusal(cfg);
   if (refusal) throw refusal;
+  return withBringupLock(cfg, async () => {
+    // Another ffx may have brought it up while we waited for the lock.
+    if (await probeUp(cfg)) return readPid(cfg) ?? 0;
+    return spawnAndWait(cfg, spinner);
+  });
+}
+
+async function spawnAndWait(cfg: Config, spinner: Spinner): Promise<number> {
   const url = new URL(cfg.apiUrl);
   const port = portOf(cfg.apiUrl);
-  const holder = listenerPid(port);
-  if (holder !== undefined) {
-    if (!isOurs(cfg, holder)) {
-      const comm = psField(holder, 'command') ?? psField(holder, 'comm') ?? 'unknown';
-      throw new CliError(EXIT.UNAVAILABLE, `port ${port} is held by a process ffx did not start: pid ${holder} (${comm})`, {
+  const holder = await portHolder(url.hostname, port);
+  if (holder.held) {
+    if (holder.pid === undefined) {
+      throw new CliError(EXIT.UNAVAILABLE, `port ${port} is taken by a process ffx cannot identify (lsof is not available), and it is not answering /up`, {
+        hint: 'find it yourself (e.g. lsof -iTCP:' + port + ') — ffx never starts a second server beside it, and never kills a port',
+      });
+    }
+    if (!isOurs(cfg, holder.pid)) {
+      const comm = psField(holder.pid, 'command') ?? psField(holder.pid, 'comm') ?? 'unknown';
+      throw new CliError(EXIT.UNAVAILABLE, `port ${port} is held by a process ffx did not start: pid ${holder.pid} (${comm})`, {
         hint: 'stop it yourself, or point ffx elsewhere with --api — ffx never kills a foreign process',
       });
     }
     throw failWithLogTail(cfg, `our server (pid ${readPid(cfg)}) holds :${port} but /up is not answering`, 'ffx stop && ffx up');
   }
+
 
   fs.mkdirSync(cfg.stateDir, { recursive: true, mode: 0o700 });
   const logFd = fs.openSync(serverLogPath(cfg), 'a', 0o600);
@@ -241,6 +328,13 @@ export async function stopOurs(cfg: Config): Promise<StopResult> {
   if (!isAlive(pid)) {
     fs.rmSync(pidFilePath(cfg), { force: true });
     return { stopped: false, pid, reason: `recorded pid ${pid} is not running (stale pid file removed)` };
+  }
+  // A stale server.pid whose number the OS has since reused belongs to somebody else's process
+  // (group). Only signal it when it still looks like the php server ffx started.
+  const command = psField(pid, 'command') ?? psField(pid, 'comm');
+  if (command !== undefined && !/\bphp\b|artisan/.test(command)) {
+    fs.rmSync(pidFilePath(cfg), { force: true });
+    return { stopped: false, pid, reason: `recorded pid ${pid} is now "${command}", not the php server ffx started — stale pid file removed, nothing stopped` };
   }
   try {
     process.kill(-pid, 'SIGTERM');

@@ -1,0 +1,4 @@
+entity,institution,label,last4,kind,currency,path,statements,transactions,first,last,reconciled,recon_na
+household,Northbank,Checking_x4021,4021,checking,USD,bank/household/Northbank/Checking_x4021,2,5,2026-09,2026-10,2,0
+acme_llc,Northbank,Checking_x7734,7734,checking,,bank/acme_llc/Northbank/Checking_x7734,1,3,2026-08,2026-09,0,0
+household,Meridian,Mortgage,,mortgage,USD,bank/household/Meridian/Mortgage,1,1,2026-09,2026-09,1,0

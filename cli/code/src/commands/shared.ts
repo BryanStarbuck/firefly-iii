@@ -5,7 +5,7 @@
 import readline from 'node:readline';
 
 import type { Envelope, Query } from '../client.js';
-import { currentMonth, lastFullMonth, monthRange } from '../dates.js';
+import { currentMonth, lastFullMonth, monthRange, relativeRange } from '../dates.js';
 import { CliError, EXIT } from '../errors.js';
 import type { Column, Outcome, Row, View } from '../render.js';
 import { firstArray, getPath, inferColumns, objectView, renderTable, warn } from '../render.js';
@@ -106,9 +106,8 @@ export function rangeOf(ctx: Ctx, fallback: 'this-month' | 'last-month' | 'ytd' 
     r = monthRange(fallback === 'this-month' ? currentMonth() : lastFullMonth()) as Range;
     ctx.note(`(no period given — using ${fallback.replace('-', ' ')})`);
   } else if (fallback === 'ytd') {
-    const y = new Date().getFullYear();
-    const d = new Date();
-    r = { start: `${y}-01-01`, end: `${y}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` };
+    // One clock read: two reads straddling midnight on Dec 31 would give an end in the wrong year.
+    r = relativeRange('ytd') as Range;
     ctx.note('(no period given — using year to date)');
   } else {
     r = {};
@@ -189,23 +188,31 @@ export interface WriteSpec {
   appliedView?: (env: Envelope) => View;
 }
 
-function shellQuote(arg: string): string {
+export function shellQuote(arg: string): string {
   return /^[A-Za-z0-9_./:@%+=,-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
-/** The exact command that applies this plan: the same argv, minus any old token, plus --write --token. */
+/**
+ * The exact command that applies this plan: the same argv, minus any old
+ * token and --write, plus --write --token. Everything after a `--` is
+ * positional and is kept verbatim — and the new flags go BEFORE it, or they
+ * would become positionals themselves.
+ */
 export function applyCommand(token: string, argv: readonly string[] = process.argv.slice(2)): string {
   const kept: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i] as string;
+  const dd = argv.indexOf('--');
+  const flagPart = dd === -1 ? argv : argv.slice(0, dd);
+  const rest = dd === -1 ? [] : argv.slice(dd);
+  for (let i = 0; i < flagPart.length; i++) {
+    const a = flagPart[i] as string;
     if (a === '--token') {
       i++;
       continue;
     }
-    if (a.startsWith('--token=') || a === '--write') continue;
+    if (a.startsWith('--token=') || a === '--write' || a === '--no-write') continue;
     kept.push(a);
   }
-  return `ffx ${[...kept, '--write', '--token', token].map(shellQuote).join(' ')}`;
+  return `ffx ${[...kept, '--write', '--token', token, ...rest].map(shellQuote).join(' ')}`;
 }
 
 /** Default rendering of a plan or result: a changes summary row set plus any listed items. */
@@ -243,7 +250,7 @@ function tokenOf(env: Envelope): { token?: string; expires?: string } {
   return { ...(token ? { token } : {}), ...(expires ? { expires } : {}) };
 }
 
-function ask(question: string): Promise<boolean> {
+export function ask(question: string): Promise<boolean> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
   return new Promise((resolve) => {
     rl.question(question, (answer) => {
@@ -299,7 +306,8 @@ export async function writeFlow(ctx: Ctx, spec: WriteSpec): Promise<Outcome> {
     process.stderr.write(`${view.title}\n${renderTable(view)}\n${(view.notes ?? []).join('\n')}\n`);
     if (!(await ask('Apply these changes? [y/N] '))) {
       ctx.note('not applied.');
-      return { envelope: plan, view, exit: EXIT.OK };
+      // The plan is already on the terminal (stderr); printing it again on stdout would show it twice.
+      return { envelope: plan, lines: [], exit: EXIT.OK };
     }
     return apply(token);
   }

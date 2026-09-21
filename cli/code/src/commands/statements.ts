@@ -20,7 +20,7 @@ import { CliError, EXIT } from '../errors.js';
 import type { Column, Outcome, Row, View } from '../render.js';
 import { getPath, inferColumns } from '../render.js';
 import type { Ctx, FlagDef, VerbDef } from '../verbs.js';
-import { applyCommand, C, changeNotes, get, rangeOf, RANGE_FLAGS, ref, rowsOf, send } from './shared.js';
+import { applyCommand, C, changeNotes, get, rangeOf, RANGE_FLAGS, ref, rowsOf, send, shellQuote } from './shared.js';
 
 const G = 'The statements pipeline';
 
@@ -35,23 +35,63 @@ const SCOPE_FLAGS: Record<string, FlagDef> = {
   year: { value: 'int', help: 'only this year' },
 };
 
-function realOrSelf(p: string): string {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return path.resolve(p);
+/**
+ * realpath() that also works for a path that does not exist yet: the deepest
+ * EXISTING ancestor is resolved (symlinks followed — /tmp → /private/tmp on
+ * macOS) and the missing tail is appended. Without this a not-yet-existing
+ * file under a symlinked directory is compared unresolved against a resolved
+ * root, and containment gives the wrong answer in both directions.
+ */
+export function realOrSelf(p: string): string {
+  const abs = path.resolve(p);
+  const tail: string[] = [];
+  let cur = abs;
+  for (;;) {
+    try {
+      const real = fs.realpathSync(cur);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return abs;
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
   }
 }
 
-/** The statements root, resolved and required. */
+/** True when `inner` is `outer` itself or lies beneath it (both already resolved). */
+function isInside(outer: string, inner: string): boolean {
+  const rel = path.relative(outer, inner);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/**
+ * The statements root, resolved and required. A --root must itself lie inside
+ * the configured root (FFX_STATEMENTS_DIR or the credentials file) when one is
+ * configured — `--root ../../.ssh` is refused here and again by the server
+ * (cli.mdx §16).
+ */
 export function rootOf(ctx: Ctx): string {
-  const raw = resolveStatementsRoot(ctx.cfg, ctx.str('root'));
+  const flag = ctx.str('root');
+  const raw = resolveStatementsRoot(ctx.cfg, flag);
   if (!raw) {
     throw new CliError(EXIT.USAGE, 'no statements root configured', {
       hint: 'pass --root, set FFX_STATEMENTS_DIR, or set firefly_iii.statements.root in ~/.credentials/firefly_iii.json',
     });
   }
-  const root = realOrSelf(raw.replace(/^~(?=\/|$)/, ctx.cfg.home));
+  const expand = (p: string): string => p.replace(/^~(?=\/|$)/, ctx.cfg.home);
+  const root = realOrSelf(expand(raw));
+  if (flag) {
+    const configured = resolveStatementsRoot(ctx.cfg, undefined);
+    if (configured) {
+      const base = realOrSelf(expand(configured));
+      if (!isInside(base, root)) {
+        throw new CliError(EXIT.USAGE, `refused: --root ${flag} is outside the configured statements root ${tildify(base, ctx.cfg.home)}`, {
+          hint: 'a --root must be the configured root or a directory inside it',
+        });
+      }
+    }
+  }
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
     throw new CliError(EXIT.NOT_FOUND, `the statements root does not exist: ${tildify(root, ctx.cfg.home)}`);
   }
@@ -65,8 +105,7 @@ export function rootOf(ctx: Ctx): string {
  */
 export function containedPath(root: string, candidate: string): string {
   const resolved = realOrSelf(path.isAbsolute(candidate) ? candidate : path.resolve(process.cwd(), candidate));
-  const rel = path.relative(root, resolved);
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+  if (resolved === root || !isInside(root, resolved)) {
     throw new CliError(EXIT.USAGE, `refused: ${candidate} is outside the statements root`, {
       hint: 'every statements path must live inside the configured root',
     });
@@ -437,7 +476,9 @@ const importFile: VerbDef = {
     const account = ctx.str('account');
     if (!account) throw new CliError(EXIT.USAGE, 'import-file needs --account <firefly account id or name>');
     if (ctx.universal.token) return applyWithToken(ctx, '/ingest/file/apply', {}, 'statements import-file');
-    const env = await send(ctx, 'POST', '/ingest/file/plan', { root, path: file, ...ref(account, 'account') }, { longRunning: true });
+    // apis.mdx §11.4: /ingest/file/plan takes account_id and path only — the server contains the path itself,
+    // and it rejects unknown top-level fields (§5.7), so no `root` is sent.
+    const env = await send(ctx, 'POST', '/ingest/file/plan', { path: file, ...ref(account, 'account') }, { longRunning: true });
     const view = importView(env);
     if (!view.rows.length) {
       const items = rowsOf(env.data, 'rows', 'transactions');
@@ -445,7 +486,7 @@ const importFile: VerbDef = {
       view.columns = pickColumns(items, [C.date('date'), C.text('type'), C.amt('amount'), C.text('description'), C.text('verdict'), C.text('duplicate_of', 'duplicate of')]);
     }
     view.title = 'PLAN — nothing was imported';
-    view.notes = [...(view.notes ?? []), ...tokenNotes(env, `statements import-file ${ctx.positionals[0] as string} --account ${account}`)];
+    view.notes = [...(view.notes ?? []), ...tokenNotes(env, ['statements', 'import-file', ctx.positionals[0] as string, '--account', account].map(shellQuote).join(' '))];
     return { envelope: env, view };
   },
 };

@@ -1,0 +1,28 @@
+{
+  "name": "firefly-iii-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "firefly_iii — the MCP server for THIS install of Firefly III. A thin client of the /machine/v1 plane. Never published. See pm/mcp.mdx.",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "bin": {
+    "firefly-iii-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "instructions": "node scripts/build-instructions.ts",
+    "build": "node scripts/build-instructions.ts && tsc -p tsconfig.json && node scripts/stamp.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test .test-build/test/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

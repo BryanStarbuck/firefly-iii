@@ -103,7 +103,23 @@ export function checkCredentialsFile(file: string, home: string): fs.Stats | und
 export function readCredentialsDoc(file: string, home: string): CredentialsDoc | undefined {
   const st = checkCredentialsFile(file, home);
   if (!st) return undefined;
-  const text = fs.readFileSync(file, 'utf8');
+  // Read through a descriptor opened with O_NOFOLLOW and check it is the file we just stat'ed:
+  // a symlink swapped in between the lstat and the read is refused, not followed (R7).
+  let text: string;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const same = fs.fstatSync(fd);
+    if (same.ino !== st.ino || same.dev !== st.dev) {
+      throw new CliError(EXIT.USAGE, `refused: ${tildify(file, home)} changed while it was being read`);
+    }
+    text = fs.readFileSync(fd, 'utf8');
+  } catch (err) {
+    if (err instanceof CliError) throw err;
+    throw new CliError(EXIT.USAGE, `cannot read ${tildify(file, home)}: ${(err as Error).message}`);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
   if (text.trim() === '') return {};
   try {
     const parsed: unknown = JSON.parse(text);
@@ -192,7 +208,8 @@ export function tryLoadMachineKey(cfg: Config): { key?: MachineKey; problem?: Cl
     return { key: loadMachineKey(cfg) };
   } catch (err) {
     if (err instanceof CliError) return { problem: err };
-    throw err;
+    // An unreadable file (EACCES, EISDIR…) is a report line for bare `ffx`/status/doctor, never a crash.
+    return { problem: new CliError(EXIT.USAGE, `cannot read the machine key: ${(err as Error).message}`) };
   }
 }
 
@@ -200,7 +217,12 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** An exclusive lock file beside the credentials file; stale locks (>30 s) are broken. */
+/**
+ * An exclusive lock file beside the credentials file; stale locks (>30 s) are
+ * broken. Breaking is inode-checked: two waiters that both saw the SAME stale
+ * lock must not have the second one delete the fresh lock the first just took.
+ * Release likewise removes the lock only while it is still ours.
+ */
 function withLock<T>(file: string, fn: () => T): T {
   const lock = `${file}.lock`;
   const deadline = Date.now() + 5000;
@@ -211,7 +233,11 @@ function withLock<T>(file: string, fn: () => T): T {
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
       try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > 30_000) fs.unlinkSync(lock);
+        const seen = fs.lstatSync(lock);
+        if (Date.now() - seen.mtimeMs > 30_000) {
+          const now = fs.lstatSync(lock);
+          if (now.ino === seen.ino && now.dev === seen.dev) fs.unlinkSync(lock);
+        }
       } catch {
         /* raced with the holder releasing it */
       }
@@ -221,12 +247,14 @@ function withLock<T>(file: string, fn: () => T): T {
       sleepSync(50);
     }
   }
+  const mine = fs.fstatSync(fd);
   try {
     return fn();
   } finally {
     fs.closeSync(fd);
     try {
-      fs.unlinkSync(lock);
+      const st = fs.lstatSync(lock);
+      if (st.ino === mine.ino && st.dev === mine.dev) fs.unlinkSync(lock);
     } catch {
       /* already gone */
     }
@@ -247,22 +275,27 @@ export function writeMerged(file: string, home: string, mutate: (doc: Credential
     const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
     const fd = fs.openSync(tmp, 'wx', 0o600);
     try {
-      fs.writeSync(fd, JSON.stringify(doc, null, 2) + '\n');
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    try {
-      const st = fs.lstatSync(file);
-      if (st.isSymbolicLink()) {
-        fs.unlinkSync(tmp);
-        throw new CliError(EXIT.USAGE, `refused: ${tildify(file, home)} became a symlink during the write`);
+      try {
+        fs.writeSync(fd, JSON.stringify(doc, null, 2) + '\n');
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
       }
+      try {
+        const st = fs.lstatSync(file);
+        if (st.isSymbolicLink()) {
+          throw new CliError(EXIT.USAGE, `refused: ${tildify(file, home)} became a symlink during the write`);
+        }
+      } catch (err) {
+        if (err instanceof CliError) throw err;
+        /* ENOENT: first write */
+      }
+      fs.renameSync(tmp, file);
     } catch (err) {
-      if (err instanceof CliError) throw err;
-      /* ENOENT: first write */
+      // Never leave a 0600 copy of every product's secrets lying beside the real file.
+      fs.rmSync(tmp, { force: true });
+      throw err;
     }
-    fs.renameSync(tmp, file);
   });
 }
 
@@ -298,9 +331,11 @@ export function initMachineKey(cfg: Config): MintResult {
     setMachineBlock(doc, key, os.hostname());
     result = { created: true, fingerprint: fingerprint(key) };
   });
-  // A read-back: trust the file, not our own mint.
+  // A read-back: trust the file, not our own mint. If another writer replaced our fresh key
+  // between our rename and this read, the key on disk is not the one we created.
   const back = loadMachineKey({ ...cfg, keyFromEnv: undefined, keyFile: undefined });
-  return { created: result?.created ?? false, fingerprint: fingerprint(back.key) };
+  const fp = fingerprint(back.key);
+  return { created: (result?.created ?? false) && result?.fingerprint === fp, fingerprint: fp };
 }
 
 /** `ffx key rotate --yes` — mint unconditionally. */

@@ -1,0 +1,54 @@
+# firefly_iii — the MCP server for THIS install of Firefly III (pm/mcp.mdx). Run `just` to list.
+
+set shell := ["bash", "-uc"]
+
+root := justfile_directory()
+
+default:
+    @just --list
+
+# Install the two pinned runtime deps (+ typescript) into mcp/node_modules.
+install:
+    cd "{{root}}" && npm install --no-audit --no-fund
+
+_ensure-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{root}}"
+    if [ ! -d node_modules/@modelcontextprotocol/sdk ] || [ ! -d node_modules/zod ] || [ ! -x node_modules/.bin/tsc ]; then
+      echo "mcp deps missing — installing into mcp/node_modules"
+      npm install --no-audit --no-fund
+    fi
+
+# Generate src/instructions.ts from ../ai/mcp_prompt_firefly.md, compile, stamp dist/index.js executable.
+build: _ensure-deps
+    cd "{{root}}" && npm run build
+
+# Build, then every test: catalogue, gates, money, routing, envelope, audit, canaries on dist/, process probes.
+test: build
+    cd "{{root}}" && ./node_modules/.bin/tsc -p tsconfig.test.json && node --test .test-build/test/
+
+# Hand-piped initialize against the BUILT server, with a throwaway fake key (never the real one).
+probe: build
+    #!/usr/bin/env bash
+    set -uo pipefail
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    printf '{"firefly_iii":{"machine":{"api_key":"%s"}}}' "$(printf '0%.0s' {1..64})" > "$tmp/creds.json"
+    chmod 600 "$tmp/creds.json"
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
+      | FFMCP_CREDENTIALS_FILE="$tmp/creds.json" FFMCP_LOG_DIR="$tmp/logs" node "{{root}}/dist/index.js" serve \
+      | head -c 900
+    echo
+
+# Re-copy the CLI's credentials module body (it is duplicated on purpose; the test fails on drift).
+sync-credentials:
+    cd "{{root}}" && node scripts/sync-credentials.ts
+
+# Print the registration command (does not run it — registering is the operator's call).
+register:
+    @echo 'claude mcp add --scope user firefly_iii -- "$HOME/BGit/Bryan_git/firefly-iii/mcp/dist/index.js" serve'
+    @echo '  The bare -- is load-bearing: everything after it is the command and its argv.'
+
+clean:
+    rm -rf "{{root}}/dist" "{{root}}/.test-build"

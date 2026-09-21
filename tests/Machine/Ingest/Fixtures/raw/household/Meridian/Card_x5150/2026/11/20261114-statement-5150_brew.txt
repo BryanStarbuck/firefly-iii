@@ -1,0 +1,7 @@
+Institution: Meridian
+Account holder: household
+Card account ending in 5150
+Statement period: Oct 15, 2026 to Nov 14, 2026
+Trans date  Description                 Amount
+10/14       HARBOR COFFEE                 5.00
+11/02       GAS STATION EXAMPLE          38.20

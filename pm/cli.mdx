@@ -1,0 +1,1209 @@
+---
+title: Firefly III — the operator CLI (`ffx`)
+description: >
+  The terminal front door to THIS install of Firefly III. `ffx` is a deliberately THIN client — it
+  owns argument parsing, output formatting and getting the app up, and it owns no bookkeeping logic
+  at all: every balance, every search, every reconciliation, every duplicate verdict is computed by
+  the running Firefly III app behind a localhost-only MACHINE PLANE (/machine/v1, specified in
+  apis.mdx) and returned over HTTP. Authentication is a 256-bit machine key the web app generates
+  with a CSPRNG into ~/.credentials/firefly_iii.json at mode 0600 — longer than a UUID, unique to
+  this app; the CLI reads it from the same filesystem, sends it as X-Firefly-Machine-Key, and the
+  server compares it in constant time before any handler runs. A process on another computer that
+  reaches the port has no way to hold that file, so the shared-filesystem trick IS the
+  authentication — and it is loopback-only by construction. If the app is not running when `ffx` is
+  invoked, the CLI brings it up itself (the same work the root justfile does: php artisan serve on
+  127.0.0.1:7373) and gates on the health endpoint before issuing its call. The flagship command
+  family is the STATEMENTS PIPELINE (§10) — walk a tree of bank statements, de-duplicate at BOTH the
+  statement level (the same month scanned twice) and the transaction level (a deterministic
+  external_id that survives re-runs without collapsing two genuine $5.00 coffees on the same day),
+  and hand the rows to Firefly's own store path, whose import_hash_v2 check stays the sole authority
+  on what is a duplicate. `ffx` is NOT the Firefly III Data Importer and NOT `php artisan` (§1).
+---
+
+# Firefly III — the operator CLI (`ffx`)
+
+`~/BGit/Bryan_git/firefly-iii/cli/` · binary **`ffx`** · Node + TypeScript
+
+---
+
+## Table of Contents
+
+- [Introduction](#introduction)
+  - [Why this repo exists](#why-this-repo-exists)
+  - [Where this spec fits under that umbrella](#where-this-spec-fits-under-that-umbrella)
+  - [What the operator gets from it](#what-the-operator-gets-from-it)
+  - [How it works — the idea](#how-it-works--the-idea)
+  - [How it works — the machinery](#how-it-works--the-machinery)
+  - [What this spec covers](#what-this-spec-covers)
+- [Goal](#goal)
+- [Overview](#overview)
+- [1. Three other command-line things in this world, and never confusing them](#1-three-other-command-line-things-in-this-world-and-never-confusing-them)
+- [2. Placement, layout, and build integration](#2-placement-layout-and-build-integration)
+- [3. Bring-up — the CLI's justfile-equivalent duty](#3-bring-up--the-clis-justfile-equivalent-duty)
+- [4. Authentication — the local machine key](#4-authentication--the-local-machine-key)
+- [5. The machine plane — the HTTP surface `ffx` speaks](#5-the-machine-plane--the-http-surface-ffx-speaks)
+- [6. The verb catalogue](#6-the-verb-catalogue)
+- [7. The argument contract](#7-the-argument-contract)
+- [8. The zero-argument default — bare `ffx`](#8-the-zero-argument-default--bare-ffx)
+- [9. The read verbs](#9-the-read-verbs)
+- [10. The statements pipeline — `ffx statements`](#10-the-statements-pipeline--ffx-statements)
+- [11. The write verbs](#11-the-write-verbs)
+- [12. The operational verbs](#12-the-operational-verbs)
+- [13. Output contracts](#13-output-contracts)
+- [14. Exit codes](#14-exit-codes)
+- [15. Progress, logging, and what a failure leaves behind](#15-progress-logging-and-what-a-failure-leaves-behind)
+- [16. Security](#16-security)
+- [17. Open-source safety](#17-open-source-safety)
+- [18. Testing](#18-testing)
+- [19. Use cases](#19-use-cases)
+- [20. Acceptance criteria](#20-acceptance-criteria)
+- [21. Build phases](#21-build-phases)
+- [22. Invariants recap](#22-invariants-recap)
+- [23. Related specs](#23-related-specs)
+
+---
+
+## Introduction
+
+### Why this repo exists
+
+Firefly III is a self-hosted, double-entry personal finance manager: accounts, transactions with
+splits, budgets with per-period limits, categories, tags, subscriptions, piggy banks, recurring
+transactions and a genuinely powerful rule engine — all on the operator's own machine, with no
+cloud in the loop. That is the whole proposition, and it is the reason this repo is a working copy
+rather than a subscription.
+
+This repo — `~/BGit/Bryan_git/firefly-iii/`, a fork of `firefly-iii/firefly-iii` at
+`github.com/BryanStarbuck/firefly-iii` — is a working copy we build on and keep open source. Two
+consequences run through every decision below. **One:** nothing private ever lands in this directory
+tree; the operator's statements, the database and every secret live elsewhere on the disk and reach
+the code only through configuration (§17). **Two:** the repo tracks an upstream that ships often, so
+anything we add is added where an upstream merge will never touch it (§2.1).
+
+### Where this spec fits under that umbrella
+
+The product has three front doors onto one engine. The **browser** at `http://127.0.0.1:7373/` is
+the one a human uses. The **MCP server** ([mcp.mdx](./mcp.mdx)) is the one Claude Code uses. This
+spec is the third: the **terminal**, for the operator who is already in a shell, already standing in
+a directory full of bank statements, and does not want to open a browser to answer _"which months am
+I missing?"_ or _"did that import double anything?"_
+
+All three answer from the same engine, through one contract: **[apis.mdx](./apis.mdx)**, the
+machine-plane API. That spec is the authority on every route; this spec is one of its two clients.
+
+### What the operator gets from it
+
+- The questions a browser answers, answered in a pipe: balances, transactions, the budget period,
+  reports, Firefly search queries — as JSON for a script, a table for a human, or CSV for a
+  spreadsheet.
+- The job a browser is bad at: taking **years of bank statements**, spread across entities, banks,
+  accounts, years and months, and turning them into a clean, de-duplicated import — where
+  "de-duplicated" means the same month scanned twice does not produce two copies of January, and a
+  re-run next week does not produce a second copy of everything (§10).
+- An install that starts itself. `ffx` never says _"start the server first."_ If the app is down, it
+  brings it up and then answers the question (§3).
+- A credential story with nothing to type. No password prompt, no OAuth token to paste, no secret in
+  a config file inside a repo that is public (§4).
+
+### How it works — the idea
+
+The web app already knows everything. Rather than teach a second program to read Firefly's database,
+we give the running app a **loopback-only machine plane** — HTTP routes meant for programs rather
+than browsers — and make the CLI a caller of it.
+
+Authentication falls out of the filesystem. The web app generates a 256-bit random key into a file in
+the operator's home directory that only the operator can read. Any program running as that operator
+can read it; nothing running anywhere else can. So the CLI proves it belongs on this machine by
+producing a secret that only this machine's filesystem holds — and the plane refuses anything that
+did not arrive on the loopback interface, so an attacker who reaches the port from the network is
+turned away before the key is even considered.
+
+### How it works — the machinery
+
+1. `ffx` parses arguments and resolves a target (§7.2). The default target is **this machine**.
+2. It reads the machine key from `~/.credentials/firefly_iii.json`, generating it with
+   `crypto.randomBytes(32)` only on an explicit `ffx key init` if no process has yet (§4.3).
+3. It probes `GET http://127.0.0.1:7373/up`. If that fails, it performs the root justfile's `run`
+   work itself — detached — and waits for health, showing a spinner the whole time (§3, §15).
+4. It issues one HTTP call to `/machine/v1/*` with `X-Firefly-Machine-Key: <64 hex>` (§5).
+5. The app checks loopback, origin, the key in constant time, the tier, the input — and only then
+   reaches the ledger through Firefly's own repositories and factories (apis.mdx §4.7).
+6. `ffx` renders the answer to stdout and everything else to stderr (§13).
+
+### What this spec covers
+
+Every verb, every flag, the exit-code contract, the key lifecycle, the bring-up contract, the
+statements pipeline end to end including both de-duplication layers, the write protocol as a human
+types it, what the CLI prints on stdout versus stderr, what it logs, what it refuses, and the
+acceptance criteria that say it is done.
+
+It does **not** cover the MCP server ([mcp.mdx](./mcp.mdx)), the route-by-route wire reference
+([apis.mdx](./apis.mdx)), or upstream's Data Importer, which is somebody else's app and is discussed
+here only to keep the two apart (§1).
+
+---
+
+## Goal
+
+**One command, from any directory, that answers a question about this install truthfully, changes it
+only when told to twice, or takes a directory of bank statements and lands them in the ledger
+exactly once.**
+
+Four properties make that goal real rather than decorative:
+
+- **Truthfully** — the CLI computes nothing. A number `ffx` prints was computed by the same PHP that
+  computed it for the browser, so the two can never disagree (§5.4).
+- **Told to twice** — every write is a dry run unless `--write` is passed, and a real write echoes
+  the confirm token the dry run produced (§11).
+- **Exactly once** — de-duplication is defined at two levels, is deterministic, and survives re-runs,
+  re-scans, and the same month arriving in three different PDFs; Firefly's own hash check decides
+  what already exists (§10.6).
+- **From any directory** — the tool is on `PATH`, it starts the app if the app is down, and it needs
+  no environment set up by hand (§2.4, §3, §4).
+
+---
+
+## Overview
+
+|                        |                                                                                                                         |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| **Binary**             | `ffx`                                                                                                                   |
+| **Lives in**           | `~/BGit/Bryan_git/firefly-iii/cli/` (shim at the top, implementation under `cli/code/`)                                 |
+| **Stack**              | TypeScript on Node ≥ 22, ESM, zero runtime dependencies beyond Node's standard library                                  |
+| **Talks to**           | `http://127.0.0.1:7373/machine/v1/*` — the machine plane inside the Firefly app ([apis.mdx](./apis.mdx))                |
+| **Authenticates with** | `X-Firefly-Machine-Key`, 64 hex chars, from `~/.credentials/firefly_iii.json` (0600)                                    |
+| **State / logs**       | `~/T/_firefly_iii/` — `cli.info`, `cli.err`, `server.log`, `server.pid`                                                 |
+| **Env prefix**         | `FFX_`                                                                                                                  |
+| **Never**              | computes a balance, parses a float, reimplements Firefly's duplicate check, writes a source PDF, or sends the key off loopback |
+| **Is not**             | the Firefly III Data Importer, `php artisan`, or a Personal Access Token client of `/api/v1` — see §1                  |
+
+---
+
+## 1. Three other command-line things in this world, and never confusing them
+
+This section is first because the mistake is first.
+
+| Thing                            | What it is                                                                                           | Reaches                                    | Credential                                   |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------ | -------------------------------------------- |
+| **`php artisan firefly-iii:*`**  | upstream's maintenance commands — `upgrade-database`, `correct-database`, `cron`, `export-data`, `apply-rules`… | the database directly, as PHP              | none — it _is_ the app                        |
+| **Firefly III Data Importer**    | upstream's separate import app (`firefly-iii/data-importer`) — CSV, camt.053, GoCardless, SimpleFIN, Spectre     | `/api/v1` over HTTP, possibly remote       | a human's Personal Access Token               |
+| **`curl` against `/api/v1`**     | upstream's REST API, used by the mobile apps and integrations                                         | `/api/v1`, possibly remote                 | an OAuth or Personal Access Token             |
+| **`ffx` — this spec**            | the operator's terminal front door                                                                    | **this machine's `/machine/v1` on loopback** | **a generated machine key, no human credential** |
+
+### 1.1 The one-line routing test
+
+> **Is it maintenance of the install itself? `php artisan`. Is it importing through a remote
+> server's OAuth API? The Data Importer. Is it a question about, or a change to, THIS machine's
+> ledger — this install, this disk, these statements? `ffx`.**
+
+### 1.2 What `ffx` must never do
+
+- **Never shell out to `php artisan` for a ledger operation.** Artisan commands bypass the plane's
+  gates, dry runs and audit. The single exception is bring-up (§3), which runs `php artisan serve`
+  and `php artisan migrate` exactly as the justfile does — install operations, not ledger
+  operations.
+- **Never call `/api/v1` directly.** It needs a human's token, it has no dry run, and a second path
+  to the ledger is a second place for the answers to diverge. Reads upstream has and the plane has
+  not typed yet are reachable through the plane's **mirror** (apis.mdx §8.12): `ffx api get <path>`.
+- **Never read or accept a Personal Access Token, the login password, `APP_KEY`, or
+  `STATIC_CRON_TOKEN`.** If `FIREFLY_III_ACCESS_TOKEN` or a similar variable is set in the
+  environment, `ffx` ignores it silently — it is not an error, it is simply not ours.
+- **Never read or write the Data Importer's configuration or its import-job files.**
+- **Never publish to npm.** `"private": true` in `cli/package.json`, asserted by a test (§18).
+
+### 1.3 Why `ffx` lives in `cli/` at the repo top level (LOCKED)
+
+Upstream's tree has `app/`, `config/`, `database/`, `resources/`, `routes/`, `public/` and friends,
+and a `package.json` that builds the frontend assets. Anything we add inside those is inside a
+directory upstream owns and edits every release. `cli/`, `mcp/`, `ai/` and `pm/` sit at the top
+level as directories upstream has never heard of, so an upstream merge cannot conflict with them.
+They have their own `package.json` files and are **not** part of upstream's `npm` build; the root
+justfile builds them explicitly (§2.3).
+
+---
+
+## 2. Placement, layout, and build integration
+
+### 2.1 Directory layout (LOCKED)
+
+```
+firefly-iii/
+├── cli/                         # THE CLI — ours, outside upstream's directories
+│   ├── ffx                      # POSIX shim — the callable
+│   ├── ffx.mjs                  # self-building entry: compiles code/ when dist/ is stale, then runs
+│   ├── package.json             # "private": true, "type": "module", zero runtime deps
+│   ├── tsconfig.json
+│   ├── justfile                 # build | test | run, for working on the CLI alone
+│   ├── README.md
+│   └── code/                    # ALL implementation lives under here
+│       ├── src/
+│       │   ├── index.ts             # the entry the shim runs
+│       │   ├── main.ts              # parse → dispatch → render → exit code
+│       │   ├── args.ts              # the argument contract (§7)
+│       │   ├── verbs.ts             # VerbDef, FlagDef, the universal flags
+│       │   ├── registry.ts          # THE one array of verbs
+│       │   ├── help.ts              # help generated from the declarations
+│       │   ├── config.ts            # FFX_* env, target resolution, paths
+│       │   ├── credentials.ts       # the machine key (§4)
+│       │   ├── client.ts            # the ONE HTTP client — the only module that opens a socket
+│       │   ├── bringup.ts           # justfile-equivalent bring-up (§3)
+│       │   ├── progress.ts          # the spinner (§15.1)
+│       │   ├── render.ts            # json | table | csv (§13) — the only stdout writer
+│       │   ├── money.ts             # display formatting of decimal STRINGS — no parsing to number
+│       │   ├── dates.ts             # relative-date resolution ("last-month" → YYYY-MM-DD)
+│       │   ├── logger.ts            # cli.info / cli.err (§15.2)
+│       │   ├── errors.ts            # CliError, exit codes (§14)
+│       │   └── commands/            # one file per verb family
+│       ├── test/                    # node:test: unit, CLI-against-a-fake-plane, canaries
+│       └── dist/                    # build output, git-ignored
+├── mcp/                         # the MCP server — see mcp.mdx
+├── ai/mcp_prompt_firefly.md     # the MCP's instructions payload
+├── pm/                          # product management. NO CODE, EVER
+└── app/Machine/                 # the machine plane — see apis.mdx
+```
+
+**The charter, stated once.** `cli/code/` may hold **CLI wrapper code only** — argument handling,
+HTTP calls, rendering, process bring-up, credential reading, local file discovery for the statements
+tree. Anything that computes an _answer about money_ is forbidden there and belongs behind the
+machine plane. If a CLI feature seems to need new computation, the computation becomes a route in
+[apis.mdx](./apis.mdx) first, and the CLI calls it.
+
+### 2.2 Language and stack
+
+TypeScript on Node ≥ 22, ESM, compiled with `tsc`. **Zero runtime dependencies**: the argument
+parser, the table renderer, the spinner and the HTTP client are small and ours, built on `node:`
+modules (`fetch`, `node:crypto`, `node:fs`, `node:child_process` for bring-up only). A dependency is
+a thing that can reach the network on import, write to stdout, or be compromised upstream; a CLI that
+holds a machine key to someone's money should have as few as it can. Dev dependencies are
+`typescript` and `@types/node`; tests use `node:test`.
+
+### 2.3 Build integration with the root justfile (LOCKED)
+
+Upstream has no justfile. This fork adds one at the repo root, and it owns the whole local
+lifecycle:
+
+| Recipe          | Does                                                                                                   |
+| --------------- | ------------------------------------------------------------------------------------------------------ |
+| `just setup`    | `composer install`, writes a git-ignored `.env` with `DB_DATABASE` **outside the repo**, `php artisan migrate`, `php artisan firefly-machine:key --init` |
+| `just build`    | builds `cli/` and `mcp/` (and upstream's frontend assets when stale)                                   |
+| `just run`      | builds, then serves on `127.0.0.1:7373` **in the foreground**                                         |
+| `just server-bg`| the same, **detached**, logging to `~/T/_firefly_iii/server.log`, pid in `server.pid`                  |
+| `just stop`     | stops **our** instance (the recorded pid tree), never a foreign process                                |
+| `just status`   | ports, pid, `/up`, machine-plane ping                                                                   |
+| `just test`     | the PHP plane tests and both Node suites                                                               |
+
+- **`just build` builds the CLI too.** The CLI must never be stale relative to the app.
+- **`cli/` has its own justfile** so it can be worked on alone: `cd cli && just build`,
+  `cd cli && just test`.
+- **The shim self-builds as a backstop**: `cli/ffx` compares source mtimes against `code/dist/` and
+  runs `tsc` when stale, so a freshly cloned repo works with zero setup steps.
+
+Handles: building the CLI whenever the app is built.
+Code: `~/BGit/Bryan_git/firefly-iii/justfile` — recipes `setup`, `build`, `run`, `server-bg`, `stop`, `status`, `test`
+Code: `~/BGit/Bryan_git/firefly-iii/cli/justfile` — recipes `build`, `test`, `run`
+Code: `~/BGit/Bryan_git/firefly-iii/cli/ffx` — the shim's staleness check
+
+### 2.4 Installation on PATH
+
+```bash
+export PATH="$HOME/BGit/Bryan_git/firefly-iii/cli:$PATH"   # in ~/.zshrc, once
+```
+
+`ffx install-path` prints exactly that line. It never edits a shell profile — a tool that silently
+rewrites `~/.zshrc` is a tool nobody trusts twice.
+
+---
+
+## 3. Bring-up — the CLI's justfile-equivalent duty
+
+### 3.1 The preflight (LOCKED)
+
+Every `ffx` invocation that needs the machine plane begins with a liveness preflight:
+
+1. **Probe** `GET http://127.0.0.1:7373/up` with a ~2 s timeout. HTTP 200 → proceed. (`/up` is
+   Laravel's own health route, registered by upstream in `bootstrap/app.php`.)
+2. **If down, bring it up** — the same effective work as `just server-bg`, without requiring `just`:
+   - refuse, loudly, if `php` is missing or older than 8.5, naming `brew install php`;
+   - refuse if `vendor/` is missing, naming `just setup` — the CLI never runs `composer install`
+     unasked, because it can take minutes and rewrites the lockfile's resolved tree;
+   - refuse if a **foreign** process holds `:7373`, naming its pid and command — never kill a port;
+   - start `php artisan serve --host=127.0.0.1 --port=7373` detached, with
+     `PHP_CLI_SERVER_WORKERS=4`, stdout and stderr appended to `~/T/_firefly_iii/server.log`, pid to
+     `server.pid`;
+   - **wait** for `/up`, bounded at 60 s, spinner running.
+3. **If bring-up fails**, print the failure and the last 20 lines of `server.log`, and exit **`5`**.
+   Never fall back to computing the answer locally — there is no local compute path (§5.4).
+
+`--no-bringup` (or `FFX_NO_BRINGUP=1`) disables step 2: if the app is down, exit `5` at once.
+
+### 3.2 What "up" means — two gates (LOCKED)
+
+`/up` proves the PHP process answers. It does not prove the plane is armed or the key is right.
+Every verb that uses the plane therefore also gets, on its first call, a `401`/`404`/`503`
+interpretation:
+
+| The plane says                  | The CLI says                                                                                   | Exit |
+| ------------------------------- | ---------------------------------------------------------------------------------------------- | ---- |
+| 404 on `/machine/v1/ping`       | _"the app is up but the machine plane is not mounted — is this checkout on the fork's branch?"_ | 5    |
+| 401                             | _"the app holds a different key than `~/.credentials/firefly_iii.json` — the key changed on disk"_ | 6    |
+| 503 `not_ready`                 | the server's hint verbatim — usually _"set `FIREFLY_MACHINE_OPERATOR`"_                        | 5    |
+
+A green `/up` with a 404 from the plane is the single most likely first-run failure, and it gets its
+own sentence.
+
+### 3.3 `ffx up`, `ffx stop`, `ffx status`
+
+- `ffx up` — bring the app up and wait for health. Idempotent; already-up is a success.
+- `ffx stop` — stop **our** instance: the pid in `server.pid` and its process group. If the pid file
+  is missing or stale, it says so and stops nothing.
+- `ffx status` — web URL, pid, `/up`, the plane ping, the key's fingerprint, the operator and
+  administration the plane is bound to, and the write tier.
+
+Handles: the health gate and the bring-up.
+Code: `~/BGit/Bryan_git/firefly-iii/cli/code/src/bringup.ts` — `ensureUp()`, `startDetached()`, `stopOurs()`, `probeHealth()`
+
+---
+
+## 4. Authentication — the local machine key
+
+**The authority is [apis.mdx §4](./apis.mdx#4-authentication--the-machine-key).** This section says
+what the CLI does with it.
+
+### 4.1 Why not a Personal Access Token (LOCKED)
+
+Firefly already has a token scheme for programs: Passport Personal Access Tokens, minted in
+Profile → OAuth. The CLI does not use one:
+
+1. **It is a human's grant.** Someone logs in, clicks, copies a 1,000-character JWT, and pastes it
+   into a file — and that file is the thing that ends up committed in a public repo.
+2. **It works from anywhere.** A PAT is valid over the network for as long as it lives. The machine
+   key is useless off this computer, which is the property the whole design rests on.
+3. **There is nothing to type with the machine key.** The web app mints it on first run; the CLI
+   reads it. No onboarding step, no secret in shell history.
+
+### 4.2 The credentials file (LOCKED)
+
+- **Location:** `~/.credentials/firefly_iii.json`, mode `0600`, owned by the current uid. Override
+  the path with `FFX_CREDENTIALS_FILE`.
+- **Shape** — one top-level product object, so the file is this app's alone and the directory can
+  hold other products' files alongside:
+
+```json
+{
+  "firefly_iii": {
+    "machine": {
+      "api_key": "<64 hex chars — 32 bytes from a CSPRNG>",
+      "created": "2026-09-21T17:04:11.221Z",
+      "created_by": "firefly-web",
+      "label": "bryan-macstudio"
+    },
+    "statements": { "root": "/…/bank_statements" }
+  }
+}
+```
+
+- **Resolution order in the CLI, first hit wins:**
+  1. `FFX_MACHINE_KEY` (env)
+  2. `FFX_MACHINE_KEY_FILE` (env — a path to a file holding only the key)
+  3. `~/.credentials/firefly_iii.json` → `firefly_iii.machine.api_key`
+  4. nothing — exit `2` with the R6 message (§4.4). The CLI mints only on `ffx key init`.
+
+### 4.3 Generation (LOCKED)
+
+The operator never creates this by hand. **The web app mints it on its own first run** and reuses it
+forever after (apis.mdx §4.4). `ffx key init` exists for a machine where the operator wants the key
+before the app has ever run; it uses `crypto.randomBytes(32).toString('hex')` and the same write
+discipline as the server:
+
+- **merge**, never replace — read the JSON, set `firefly_iii.machine`, keep every other key;
+- **atomic** — temp file in the same directory opened with `wx` (`O_EXCL`) and mode `0600`,
+  `fsync`, `rename`;
+- **refuse a symlink** at the destination;
+- create `~/.credentials/` with mode `0700` if absent;
+- **compare-and-set** — if a well-formed key appeared while it was working, keep that one.
+
+Handles: reading, validating and (on request) minting the machine key.
+Code: `~/BGit/Bryan_git/firefly-iii/cli/code/src/credentials.ts` — `loadMachineKey()`, `initMachineKey()`, `rotateMachineKey()`, `fingerprint()`, `writeMerged()`
+
+### 4.4 The rules, stated once
+
+**R1 — The key is 256 bits from a CSPRNG**, 64 lowercase hex characters, validated
+`/^[0-9a-f]{64}$/` on every read. Not a UUID, not a timestamp, not a hash of the hostname.
+
+**R2 — The key is never logged, never echoed, never in an error, never on stdout.** Only its
+**fingerprint** — first 4 hex plus a SHA-256 prefix (`4f2a…/sha256:9c1b`).
+
+**R3 — The key is never attached to a URL that is neither loopback nor `https:`.** Checked in the
+client before the socket opens; the refusal names the URL and exits `2`.
+
+**R4 — The CLI never rotates the key implicitly.** `ffx key rotate --yes` exists, prints the new
+fingerprint, and notes that the running app picks it up on its next request (apis.mdx §4.8) and the
+MCP must be restarted to re-read it.
+
+**R5 — The CLI never writes a key it did not generate.** There is no `ffx key set <value>`. Pasting a
+secret into a CLI puts it in shell history.
+
+**R6 — A missing key is a LOUD local failure with the remedy, never a silent 401:**
+
+```
+ffx accounts list
+  refused: no machine key for http://127.0.0.1:7373
+  Looked in: FFX_MACHINE_KEY, FFX_MACHINE_KEY_FILE,
+             ~/.credentials/firefly_iii.json  (firefly_iii.machine.api_key)
+  The Firefly web app mints this on its first run. Start it and try again:
+    ffx up
+  Or mint it here without starting anything:
+    ffx key init
+```
+
+**R7 — Mode check before read.** A credentials file looser than `0600` or owned by another uid is
+refused, exit `2`, with `fix: chmod 600 ~/.credentials/firefly_iii.json`.
+
+**R8 — The key authorises a MACHINE, not a person.** The plane decides which Firefly user it acts as
+(apis.mdx §4.9); the CLI cannot choose, and `ffx status` shows which one it is.
+
+**R9 — The CLI never reads a human credential** (§1.2).
+
+**R10 — One key per install, never a fallback.** A second checkout on another port reads its own
+credentials file via `FFX_CREDENTIALS_FILE`; the CLI never tries a second key after a 401, because a
+401 that "fixed itself" on the second key is a diagnosis that was never made.
+
+---
+
+## 5. The machine plane — the HTTP surface `ffx` speaks
+
+### 5.1 Where it is
+
+`http://127.0.0.1:7373/machine/v1/*`, mounted inside the Firefly Laravel app by
+`MachinePlaneServiceProvider` (apis.mdx §3). The same process serves the web UI on `/` and upstream's
+REST API on `/api/v1`; the CLI touches neither.
+
+### 5.2 The routes the verbs are written against
+
+[apis.mdx §8](./apis.mdx#8-the-route-catalogue) is the full catalogue and is **the authority on the
+wire**. Every verb in §6 names its route. Where this spec and apis.mdx disagree, apis.mdx is right.
+
+### 5.3 Response envelope (LOCKED)
+
+Every plane response — success or failure — is one JSON object:
+
+```json
+{ "ok": true,  "data": { }, "meta": { "administrationId": 1, "administrationName": "Household", "asOf": "…", "tookMs": 41 } }
+{ "ok": false, "error": { "code": "not_found", "message": "No account with that id.", "hint": "ffx accounts list" } }
+```
+
+The CLI understands the nine codes — `unauthorized` · `forbidden` · `not_found` · `invalid_input` ·
+`conflict` · `write_disabled` · `not_ready` · `upstream_error` · `internal` — and maps each to an exit
+code (§14). It prints `hint` verbatim on stderr. A response that is not the envelope (an HTML error
+page from a misconfigured proxy, a truncated body) is exit `5` with the first 200 bytes shown.
+
+### 5.4 The thin-client rule (LOCKED)
+
+**The CLI owns argument parsing, output formatting, bring-up and local file discovery. It owns no
+bookkeeping logic.**
+
+Every balance, every date-range filter, every reconciliation decision, every "is this a duplicate"
+verdict is computed behind the machine plane and returned verbatim. The CLI never re-filters, never
+re-sums, never rounds, and **never converts an amount string to a JavaScript number** — not for
+display, not for sorting, not for a total row. A table has no "Total" footer unless the route returned
+a total.
+
+The rendering layer is the one bounded exception: inserting thousands separators into a decimal
+string and padding columns is _presentation_, it happens in one module, operates on characters, and
+`--format json` always carries the server's string untouched (§13.3).
+
+---
+
+## 6. The verb catalogue
+
+One page, so the whole surface is visible before any one verb's contract is read. Every verb maps to
+one route in [apis.mdx](./apis.mdx); the route is named in `ffx help <verb>`.
+
+```
+ORIENTATION
+  ffx                                   orientation report — status + what needs doing (§8)
+  ffx status                            web, pid, /up, plane ping, key fingerprint, operator, tiers
+  ffx doctor                            is this environment sane? (§12.1)
+  ffx up | stop                         bring the app up / take it down (§3.3)
+  ffx logs [--follow] [--lines N] [--laravel | --cli]
+  ffx key init | show | rotate --yes    the machine key (§4)
+  ffx whoami                            operator, administration, primary currency, tiers
+  ffx capabilities [--planned]          what this server build can do
+  ffx help [verb] | install-path
+
+READING THE LEDGER                                          (§9)
+  ffx accounts list [--type asset|expense|revenue|liability|cash|all] [--inactive] [--as-of D]
+  ffx accounts show | balance [--as-of D] | properties | transactions  <id|name>
+  ffx transactions list [--start D] [--end D] [--month M] [--account X…] [--category X] [--budget X]
+                        [--tag T] [--without-category] [--without-budget] [--without-tag] [--type T]
+                        [--min A] [--max A] [--currency C] [--search S] [--limit N] [--offset N]
+  ffx transactions show <group-id> | export [filters]
+  ffx categories list | show <id|name>
+  ffx budgets list | show <id|name>
+  ffx budget period | gaps | available   [--month M | --start D --end D]
+  ffx subscriptions list | status
+  ffx piggy-banks list | show <id|name> [--events]
+  ffx recurring list | show <id>
+  ffx rules list [--group G] | show <id> | groups
+  ffx tags list | currencies list | administrations list
+  ffx search "<firefly query>" [--count] | ffx search operators
+  ffx api get <path>                    upstream /api/v1 GET, via the plane's mirror
+
+ANALYTICS, CHARTS AND REPORTS                               (§9.3)
+  ffx summary                           the dashboard boxes
+  ffx spending [--by category|budget|tag] [--interval month|quarter|year|none] [--top N]
+  ffx payees [--top N] [--direction out|in]
+  ffx income-vs-expense | cash-flow | net-worth  [--interval …]
+  ffx trend <category>
+  ffx budget performance [--budget B…]
+  ffx runway [--basis 3|6|12]
+  ffx recurring-detect | anomalies | uncategorized
+  ffx subscriptions cost | piggy-banks progress
+  ffx chart <name> [--interval …] [--source /analytics/…]   chart-ready series; the table adds sparklines
+  ffx report default|audit|budget|category|tag|double [--start D --end D] [--account …] [--section S]
+
+THE STATEMENTS PIPELINE  (§10 — the flagship)
+  ffx statements roots
+  ffx statements manifest [--root P]
+  ffx statements scan     [--root P] [--entity E] [--bank B] [--account A] [--year Y]
+  ffx statements missing  [--root P]                 exits 3 when nothing is missing
+  ffx statements dupes    [--root P] [--conflicts] [--prefer <file>]
+  ffx statements map      [--root P] [--infer]
+  ffx statements rows     [--root P] --account A [--start D] [--end D]
+  ffx statements extract  [--root P] [--force]      raw archives only
+  ffx statements accounts-plan  [--root P]           then: accounts-apply --token T --write
+  ffx statements plan     [--root P] [--account A…] [--start D] [--end D] [--no-rules]
+  ffx statements apply    --token T --write [--max-changes N]
+  ffx statements import-file <path> --account X      (plan; add --token T --write to apply)
+  ffx statements runs [<id>]
+
+WRITING  (each is a dry run unless --write; a real write needs --token from the dry run)   (§11)
+  ffx transactions add --type withdrawal|deposit|transfer --amount "12.50" --from X --to X
+                       --description S [--date D] [--category C] [--budget B] [--tag T…] [--no-rules]
+  ffx transactions update <group-id> [--description S] [--date D] [--amount A] [--category C] …
+  ffx transactions categorize (--ids … | <filters>) --to <category>
+  ffx transactions set-budget (--ids … | <filters>) (--to <budget> | --none)
+  ffx transactions convert <group-id> --to withdrawal|deposit|transfer
+  ffx budget set <budget> --amount "450.00" [--month M]
+  ffx budget set-available --amount "4000.00" [--month M]
+  ffx budget copy-previous [--month M] | set-average [--month M] [--periods 6]
+  ffx rules preview (--rule-file F | --id N) [--start D --end D]      a READ
+  ffx rules add --rule-file F | rules run (--id N… | --group G)
+  ffx reconcile <account> --balance "4211.08" --end D [--start D]
+  ffx piggy-banks add|remove <piggy> --amount "200.00" [--account X]
+  ffx recurring trigger <id> [--date D]      no dry run exists; needs --write
+  ffx undo                                   preview; then --token T --write
+```
+
+Every verb accepts the universal flags in §7.1.
+
+---
+
+## 7. The argument contract
+
+**Positional first, flags anywhere.** `--flag value` and `--flag=value` are both accepted. A flag is
+a boolean unless the verb **declares** it as taking a value.
+
+### 7.1 The universal flags
+
+| Flag                        | Meaning                                                                                    |
+| --------------------------- | ------------------------------------------------------------------------------------------ |
+| `--format json\|table\|csv` | what stdout carries. **`table` on a TTY, `json` when piped** (§13.2)                        |
+| `--write`                   | actually write. Without it, every write verb is a dry run that prints the plan and a token |
+| `--token <cf_…>`            | the confirm token from the dry run you just read                                           |
+| `--max-changes <n>`         | the write ceiling for this run. Default 200                                                |
+| `--api <url>`               | a different install. Loopback or `https:` only (R3)                                        |
+| `--timeout <ms>`            | per-call timeout, default 30000. **Ignored by ingest apply/extract** (§7.4)                |
+| `--no-bringup`              | never start the app; if it is down, exit `5`                                               |
+| `--quiet`                   | no spinner, no informational stderr. Errors still print                                    |
+| `--verbose`                 | informational stderr, plus the resolved target and key fingerprint                         |
+| `--json-errors`             | errors on stderr as one JSON object per line, for scripts                                  |
+| `--help` / `-h`             | usage for the verb                                                                         |
+
+### 7.2 Target resolution — this machine is the default (LOCKED)
+
+| Mode      | How                          | Base URL                | When it is right                                        |
+| --------- | ---------------------------- | ----------------------- | ------------------------------------------------------- |
+| **local** | nothing                      | `http://127.0.0.1:7373` | **the default.** This is a local-first app              |
+| explicit  | `--api <url>` or `FFX_API_URL` | whatever was typed      | a second checkout on another port                       |
+
+There is deliberately **no `--prod`**. The resolved target is printed on stderr under `--verbose`,
+and **always** printed before any write.
+
+### 7.3 Flag declarations are the parser's only source (LOCKED)
+
+Each verb declares its own flags, with arity, next to its handler:
+
+```ts
+// cli/code/src/commands/transactions.ts
+export const list: VerbDef = {
+  path: ['transactions', 'list'],
+  route: 'GET /transactions',
+  summary: 'Transactions, filtered.',
+  flags: {
+    start: { value: 'date', help: 'first day, inclusive (YYYY-MM-DD, or today, last-month…)' },
+    'without-category': { help: 'only transactions with no category' },
+  },
+  run: async (ctx) => { … },
+};
+```
+
+The parser builds the value-taking set by walking the resolved verb's `flags` plus §7.1. A flag that
+takes a value **cannot** be registered without declaring it, because the declaration is the only
+place it exists. There is no second list.
+
+- An **unknown** flag is exit `2` with the verb's flags and the nearest match by edit distance.
+- A **missing value** for a value flag is exit `2` naming the flag.
+- `ffx help <verb>` is generated from the same object, so help can never describe a flag the parser
+  does not have.
+
+### 7.4 No client-side timeout on the long verbs (LOCKED)
+
+`ffx statements extract` and `ffx statements apply` run with **no client-side timeout**. A client
+that gives up at thirty seconds reports a failure about a job that is running perfectly, the operator
+re-runs it, and now two imports are racing. The spinner is what stops it looking hung.
+
+### 7.5 Amounts are typed as strings, and validated as strings (LOCKED)
+
+`--amount "12.50"` is twelve dollars fifty. The CLI validates the **shape** with a regular expression
+(`^\d+(\.\d+)?$` — positive, no sign, no separators, no exponent) and sends the string unchanged. It
+never calls `parseFloat`, `Number()` or `+x` on an amount. A negative amount is refused with a hint
+naming the transaction type that expresses the direction (apis.mdx §14.1). The server enforces the
+currency's decimal places.
+
+### 7.6 Relative dates are resolved here, and echoed
+
+`--start` and `--end` accept `YYYY-MM-DD` and a small closed vocabulary: `today`, `yesterday`,
+`this-month`, `last-month`, `this-year`, `last-year`, `ytd`. `--month YYYY-MM` expands to its first
+and last day. The CLI resolves them to dates **before** the call (the wire never carries relative
+dates — apis.mdx §14.3) and prints the resolved range on stderr, so a call made at 23:59 on the 31st
+is auditable.
+
+---
+
+## 8. The zero-argument default — bare `ffx` (LOCKED)
+
+Running `ffx` with no arguments prints a short **orientation report** and exits `0`:
+
+```
+Firefly III — this machine
+  web          http://127.0.0.1:7373/        UP    (pid 48213)
+  plane        /machine/v1                   ok    (key 4f2a…/sha256:9c1b)
+  operator     ops@local · administration "Household" (#1) · USD
+  writes       DISABLED on the server   (FIREFLY_MACHINE_ALLOW_WRITE)
+
+  61 transactions without a category · 3 budgets with spending and no limit this month
+  statements   ~/…/bank_statements   27 accounts in the manifest
+
+  ffx doctor              check the environment
+  ffx budget period       this month's budgets
+  ffx statements scan     look at the statements tree
+```
+
+- It **never starts the app.** Bare `ffx` is a question, not an instruction; if the app is down it
+  says so and suggests `ffx up`.
+- It never fails because something is down. Each missing piece is a line with the command that
+  fixes it. Exit is `0` unless the environment is broken in a way that makes the report a lie.
+- `ffx help`, `-h` and `--help` print the verb catalogue; an unknown verb prints it and exits `2`.
+
+---
+
+## 9. The read verbs
+
+The read verbs are thin by construction: parse, call one route, render.
+
+### 9.1 The ledger
+
+- **`ffx accounts list`** — id, name, type, role, currency, current balance. Asset accounts by
+  default, because that is what "my accounts" means; `--type all` for everything.
+- **`ffx accounts balance <account> [--as-of D]`** — the balance at end of day, per currency, from
+  Firefly's running balance. The CLI does not sum transactions to get one.
+- **`ffx transactions list`** — the rows. **Split transactions** print one row per journal with the
+  group id beside it, and the table marks rows sharing a group, so a human summing a column by eye can
+  see the split. `--without-category` is the single most useful flag in the catalogue.
+- **`ffx budget period`** — the Budgets page: per budget per currency, limit, spent, left, plus
+  available and left to spend. **A budget with no limit prints `—`, never `0.00`** — "not budgeted"
+  is not "budgeted zero" in every format, and in JSON it is `null`.
+- **`ffx budget gaps`** — budgets with spending and no limit, plus withdrawals with no budget.
+- **`ffx search "<query>"`** — Firefly's own search language, verbatim (apis.mdx §13). The CLI prints
+  the operators the server parsed on stderr, so a misspelt operator is visible.
+- **`ffx api get <path>`** — any upstream `/api/v1` `GET`, through the plane's read-only mirror. The
+  escape hatch for a read the typed verbs do not cover yet.
+
+### 9.2 Names are accepted wherever ids are
+
+`<account>`, `<category>`, `<budget>`, `<piggy>` accept an id or a name. The **server** resolves the
+name (apis.mdx §14.4); an ambiguous name is exit `2` listing the candidates. The CLI never picks.
+
+### 9.3 Analytics, charts and reports
+
+Each is one route in apis.mdx §10 and prints the server's figures, **per currency**. `--format table`
+shows the provenance (range, accounts, what was excluded) as a footer on stderr. `ffx chart <name>`
+prints chart-ready series; in `table` format each series gets a unicode sparkline drawn from the
+**rank order** of its values, computed on the strings by the server's own ordering — never by
+parsing them.
+
+---
+
+## 10. The statements pipeline — `ffx statements`
+
+This is the family `ffx` exists for, and the one with no counterpart in the browser.
+
+### 10.1 The tree on disk
+
+The operator's statements live **outside this repo**, under a configured root. On this machine that
+is the private archive named in [../CLAUDE.md](../CLAUDE.md); in the code it is **configuration,
+never a constant** (§17). It is resolved: `--root` → `FFX_STATEMENTS_DIR` →
+`firefly_iii.statements.root` in `~/.credentials/firefly_iii.json` → none, and the verb refuses with
+the name of the setting.
+
+```
+{ROOT}/
+├── {ENTITY}/{BANK}/{ACCOUNT}/{YYYY}/{MM}/
+│   ├── 20260930-statement-4021.pdf          the source of truth
+│   ├── 20260930-statement-4021_brew.txt     text extraction
+│   ├── 20260930-statement-4021_ocr.txt      OCR extraction
+│   └── 20260930-statement-4021_claude.txt   LLM extraction
+├── import/                                  may already exist — it is the ARCHIVE's, not ours
+└── .firefly-staging/                        OUR staging directory — the only place anything writes
+```
+
+**Nothing under `{ROOT}` is ever written, moved, renamed or deleted except under
+`{ROOT}/.firefly-staging/`.** The PDFs are the operator's financial records and some are the only
+copy. (The sibling Actual Budget fork stages into `.actual-staging/`; the two never share.)
+
+### 10.2 Stage 1 — discover (`scan`, `missing`, `manifest`)
+
+`ffx statements scan` calls `POST /ingest/scan`. The server walks the root and returns entity → bank
+→ account → year with counts, and flags three things loudly: **missing months**, **duplicate scans**,
+and **PDFs with no usable extraction**. It changes nothing. `ffx statements missing` prints only the
+gaps, one `ENTITY/BANK/ACCOUNT YYYY-MM` per line on stdout, so it pipes into whatever fetches them.
+`ffx statements manifest` shows what a prepared archive says about itself — the **first** call of
+any import, because it decides `prepared` versus `raw` mode.
+
+### 10.3 Stage 2 — extract (`extract`, raw mode only)
+
+For every statement with no usable rows yet, the server produces rows. Source preference, highest
+fidelity first: `_claude.txt`, `_brew.txt`, `_ocr.txt`, then the PDF's own text. **Every row records
+its source** (`source_file`, `source_kind`, `source_line`), so a wrong number six months from now is
+traceable to a file and a line. A statement that yields zero rows is reported by name and makes
+`extract` exit `1` — a silent zero is how a whole year goes missing.
+
+### 10.4 Stage 3 — de-duplication, layer one: the STATEMENT level (LOCKED)
+
+_The same month, scanned twice._ Statements are grouped by (`entity`, `bank`, `account_last4`,
+`period`). Within a group:
+
+1. **Identical bytes** → one statement; the others are `duplicate_identical`.
+2. **Different bytes** → ranked: more extracted rows; then wider date range; then better extraction
+   source; then newer mtime; then lexicographically first path — deterministic, so two machines choose
+   the same winner. The winner is `primary`; the rest are `superseded`, each recording **which rule
+   decided it**.
+3. **Candidates that disagree about which transactions exist** → `conflict`. It **blocks** that
+   account-month until the operator chooses with `ffx statements dupes --prefer <path>`. Choosing
+   silently is choosing which transactions exist.
+
+Nothing is deleted. `ffx statements dupes` prints every group, the verdict, and the rule.
+
+### 10.5 Stage 4 — normalise to canonical rows
+
+| Field                | Rule                                                                                     |
+| -------------------- | ---------------------------------------------------------------------------------------- |
+| `date`               | the transaction date, `YYYY-MM-DD`                                                       |
+| `amount`             | a **positive decimal string** — never a float                                            |
+| `type`               | `withdrawal` or `deposit` from the statement's sign; `transfer` only when the map says the counterparty is another of the operator's asset accounts |
+| `description`        | the bank's text with the per-bank noise stripped (a rule table, not code per bank)       |
+| `internal_reference` | the bank's raw text, byte for byte                                                       |
+| `external_id`        | §10.6                                                                                    |
+| `notes`              | **never written** — the operator's field                                                 |
+
+### 10.6 Stage 5 — de-duplication, layer two: the TRANSACTION level (LOCKED)
+
+Every row gets a deterministic `external_id`, and Firefly's own `import_hash_v2` check — which hashes
+the whole canonical row, `external_id` included — decides whether it already exists
+([apis.mdx §11.6](./apis.mdx#116-fireflys-duplicate-check-is-the-authority-locked--r7)).
+
+- **Prepared OFX/QFX:** `ofx:{last4}:{FITID}` — the bank's own id. Never minted over.
+- **Everything else:** `ff1:{last4}:{YYYYMMDD}:{amount}:{ordinal}:{sha1_8(normalised description)}`.
+
+**The two-coffees rule.** Two identical $5.00 coffees on the same day at the same shop get ordinals
+`0` and `1`, so they get two `external_id`s, two hashes, and both import. The same coffee in two scans
+of one month gets the same id, the same hash, and Firefly refuses the second.
+
+**The ordinal is counted over the merged ACCOUNT-MONTH, never per statement.** A card whose
+statements run the 15th to the 14th feeds calendar October from two statements; counting per
+statement gives both October coffees ordinal `0`, the same id, and Firefly silently keeps one. So:
+all `primary` statements feeding one `(account, YYYY-MM)` are concatenated first — sorted by
+`period_end`, then `sha256`, rows in `source_line` order — and ordinals are assigned per
+`(date, amount, normalised description)` tie-group over that merged set. The ordinal and its
+tie-group size are recorded in `_dupes.csv`, because it is the one field a human cannot re-derive by
+looking at a statement. There is a fixture for exactly this (§18).
+
+**Deleted stays deleted.** Firefly's duplicate lookup includes soft-deleted transactions, so a row
+the operator deleted in the UI is refused on every future run. The CLI reports those rows as
+`duplicate_of` a deleted group and says so in plain words. There is no `--reimport-deleted`: a
+deleted row comes back only if the operator re-enters it by hand.
+
+### 10.7 Stage 6 — the staging directory (LOCKED)
+
+```
+{ROOT}/.firefly-staging/
+├── _manifest.csv     one row per source file ever seen, with status and the rule that decided it
+├── _rows.csv         every de-duplicated row, across every account
+├── _dupes.csv        every collapsed row and file, the rule, and each ordinal's tie-group size
+├── _conflicts.csv    the rule-3 cases that block apply
+├── _run.log          append-only: run id, timestamp, counts, outcome
+└── {ENTITY}/{BANK}/{ACCOUNT}/{YYYY}-{MM}.csv
+```
+
+Rebuildable from the source tree at any time; atomic per file; gets a `.gitignore` containing `*` on
+first write. The server writes it; the CLI only reads it (`ffx statements runs`).
+
+### 10.8 Stage 7 — plan and apply
+
+**`ffx statements plan`** calls `POST /ingest/plan`. The plan **is** Firefly's store path run inside a
+rolled-back transaction with `error_if_duplicate_hash: true` (apis.mdx §7.2) — so "already present"
+is Firefly's verdict, not the CLI's guess. It prints, per account:
+
+```
+household / Northbank / Checking_x4021  ->  "Household · Northbank Checking ••4021" (#14)
+  statements      21 primary, 3 superseded, 0 conflicts
+  rows           368 extracted  ->  361 after de-dupe  (7 collapsed)
+  vs. ledger     244 already present (Firefly duplicate hash)
+                   2 previously deleted in Firefly — will stay deleted
+                 115 NEW   (rules would categorise 97)
+  date range    2024-10-01 .. 2026-06-30
+
+confirm token  cf_01J8XK…   expires 19:11   (ffx statements apply --token cf_01J8XK… --write)
+```
+
+**`ffx statements apply --token T --write`** runs it. Nothing is applied without three things at
+once: `--write`, a `--token` from a plan, and the server's write tier. The server **recomputes** the
+plan at apply time; if the ledger moved since, it refuses with `conflict` and the new counts, and the
+CLI exits `4` asking for a fresh plan. `--max-changes N` (default 200) refuses a larger run and
+reports the real number — the first real run of a ten-year archive is a deliberate act.
+
+### 10.9 What the pipeline never does
+
+- Never writes anything under `{ROOT}` outside `.firefly-staging/`.
+- Never deletes a transaction, and never brings back one the operator deleted.
+- Never guesses a category or a budget — Firefly's rule engine does, on store.
+- Never invents a date, an amount or a balancing row.
+- Never uploads a statement anywhere.
+
+---
+
+## 11. The write verbs
+
+### 11.1 The two-step, as a human types it (LOCKED)
+
+Every write verb runs the same way:
+
+1. **Without `--write`** it calls the route with `dry_run: true`, prints what would change, and
+   prints the confirm token and the exact command to apply it. Exit `0`. Nothing changed.
+2. **With `--write --token T`** it calls the route with `dry_run: false` and the token. The server
+   refuses a missing, expired, mismatched or stale token; the CLI maps each refusal to its exit code.
+
+`--write` without `--token` does step 1 and then, **only on a TTY**, asks _"apply these N changes?
+[y/N]"_ and uses the token it just got. Piped, it never prompts: it exits `2` naming the token, so a
+script cannot write without having captured a plan.
+
+The server's write tier is separate (apis.mdx §6.1). With it off, every write verb's step 2 exits `2`
+with the server's hint naming `FIREFLY_MACHINE_ALLOW_WRITE`.
+
+### 11.2 The verbs
+
+- **`ffx transactions add`** — one withdrawal, deposit or transfer. `--from` and `--to` take account
+  ids or names; for a withdrawal `--to` is the payee (an expense account Firefly creates if new), for
+  a deposit `--from` is the payer. Rules apply by default (`--no-rules` to skip).
+- **`ffx transactions categorize` / `set-budget`** — by `--ids` or by the same `--filter` shape
+  `transactions list` uses; the dry run reports the exact count.
+- **`ffx transactions convert`** — withdrawal ↔ transfer ↔ deposit, the UI's "convert".
+- **`ffx budget set`** — **sets** a budget's limit for one period. `ffx budget copy-previous` and
+  `ffx budget set-average --periods 6` build a whole period.
+- **`ffx rules preview`** is a read; **`ffx rules run`** is a write that re-categorises history.
+- **`ffx reconcile`** — plan first (the difference, from Firefly's reconcile code), then `--write
+  --token` marks the rows reconciled and, if the difference is non-zero, creates Firefly's one
+  visible reconciliation transaction. **Hunt the difference before applying it.**
+- **`ffx piggy-banks add|remove`** — money into or out of a savings goal.
+- **`ffx undo`** — reverses the most recent **plane** write. `ffx undo --show` previews it. It refuses
+  if the operator has since edited a touched row in the browser, and it cannot undo browser actions
+  (apis.mdx §7.5).
+
+**There is no delete verb.** Deleting records is admin-tier on the server and a human act in the UI.
+
+---
+
+## 12. The operational verbs
+
+### 12.1 `ffx doctor`
+
+Prints a report and exits `1` if any REQUIRED check failed:
+
+| Check                                                 | Required? | What a failure means                                                       |
+| ----------------------------------------------------- | --------- | -------------------------------------------------------------------------- |
+| Node ≥ 22                                             | yes       | the CLI's own runtime                                                      |
+| `php` ≥ 8.5 on PATH                                   | yes       | `composer.json` requires it; bring-up cannot work without it               |
+| `composer` on PATH and `vendor/` present              | yes       | `just setup` has not been run                                              |
+| `.env` present, `DB_DATABASE` outside the repo        | yes       | a database inside the repo tree is a private-data leak waiting (§17)       |
+| No `storage/database/*.sqlite` inside the repo        | yes       | the same, from upstream's default                                          |
+| State dir `~/T/_firefly_iii` writable                 | yes       | logs and the pid file cannot be written                                    |
+| Credentials file exists, `0600`, ours, well-formed    | yes       | §4.4                                                                       |
+| `:7373` `/up`                                         | **no**    | "is my environment sane" and "is the app up" are different questions       |
+| `/machine/v1/ping` with the key                       | no        | reports `401` distinctly from `404` — they have different fixes           |
+| Operator + administration resolved                    | no        | `FIREFLY_MACHINE_OPERATOR` needed on a multi-user install                  |
+| Statements root configured and readable               | no        | informational; only the `statements` family needs it                       |
+| `ffx` on PATH points at this checkout                 | no        | catches the second-checkout confusion                                      |
+
+### 12.2 `ffx logs`
+
+Tails `~/T/_firefly_iii/server.log` (and, with `--laravel`, `storage/logs/laravel.log`). `--follow`
+for `tail -f`, `--lines N` for the size. It prints paths first.
+
+### 12.3 `ffx key`
+
+`init` (mint if absent, print the fingerprint), `show` (path, mode, owner, fingerprint, `created`,
+`created_by`, `label` — **never the key**), `rotate --yes` (mint a new one, merge-write, print the
+new fingerprint).
+
+---
+
+## 13. Output contracts
+
+### 13.1 stdout is the answer; everything else is stderr (LOCKED)
+
+stdout carries **exactly one payload** — the JSON, the table, the CSV, the list of lines. The
+spinner, warnings, the resolved target, provenance, hints and every progress line go to **stderr**.
+`ffx statements missing > gaps.txt` yields a file of lines and nothing else, and
+`ffx accounts list --format json | jq '.data.accounts[].name'` never chokes on a banner.
+
+### 13.2 The three formats
+
+| `--format` | Shape                                                   | Amounts                                              |
+| ---------- | ------------------------------------------------------- | ---------------------------------------------------- |
+| `json`     | the plane's envelope, pretty-printed, **unmodified**    | the server's decimal strings, untouched              |
+| `table`    | box-drawn, headers, aligned columns, currency beside amounts | the server's string with thousands separators added |
+| `csv`      | RFC 4180, header row, `\n` line endings                 | the server's string, untouched                       |
+
+Default: `table` when stdout is a TTY, `json` when it is not — a human at a terminal and a script in
+a pipe each get the right thing without a flag.
+
+### 13.3 Money — strings in, strings out (LOCKED)
+
+> **An amount is a decimal string with a currency code. `ffx` never turns it into a number, in any
+> variable, at any point.**
+
+Firefly already does money in `bcmath` strings; the CLI's job is not to break that. Formatting for
+`table` inserts separators into the integer part of the string character by character and right-aligns
+it; it never calls `parseFloat`, `Number`, `toFixed` or `Intl.NumberFormat` on an amount. A test
+greps the built `dist/` for those calls outside `money.ts`, and `money.ts` has none on amounts
+either. Sorting by amount, where offered, is the server's `order` argument, never a client sort.
+
+---
+
+## 14. Exit codes
+
+| Code | Meaning                                                                                                                         |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | it worked — including "zero results", and including a dry run                                                                   |
+| `1`  | it ran and failed — a `doctor` check failed, an extraction yielded nothing, the server said `internal`/`upstream_error`         |
+| `2`  | usage, or a local refusal before any call: unknown verb or flag, missing value, no key (R6), loose key file, non-loopback `http:` URL, `--write` with the server tier off, `invalid_input`, `forbidden` |
+| `3`  | **not found** — no such account, no statement for that month. A fact, not an error                                             |
+| `4`  | **conflict** — a statement conflict, a duplicate, a stale or mismatched token, a changed plan                                    |
+| `5`  | the app is not up, could not be brought up, or the plane is not mounted / not ready                                             |
+| `6`  | authentication failed — a `401` from an app that IS reachable. Distinct from `2`, which is "we never sent anything"             |
+| `69` | the binary is not built and the shim's self-build failed                                                                       |
+
+Exit `3` is what lets `ffx statements missing || echo all-present` be written. Exit `4` is a question
+for a human, not a failure of the program.
+
+---
+
+## 15. Progress, logging, and what a failure leaves behind
+
+### 15.1 The CLI must never look hung (LOCKED)
+
+One self-updating line on **stderr** — spinner frame, phase, elapsed seconds, and a count where a
+count is honest: `⠹ Applying statements… 148/412  1m12s`. **TTY-gated**: piped stderr gets plain
+status lines and no animation; `--quiet` suppresses both. **stdout is never touched.** The line is
+fully erased before any result, error or log tail prints, including on failure. Long ingest routes
+stream NDJSON progress (apis.mdx §15) and the spinner shows it.
+
+### 15.2 Logs
+
+- **`~/T/_firefly_iii/cli.info`** — INFO and `API_CALL` lines: verb, target, route, status, duration,
+  counts. **File only.**
+- **`~/T/_firefly_iii/cli.err`** — WARN and ERROR lines, **and** stderr.
+
+The machine key is never in either, only its fingerprint. **No financial data in the logs** — a
+count of rows, yes; a payee, an amount, an account number, no. Logging can never crash the CLI; every
+filesystem fault in the logger is swallowed. Files are `0600`, append-only, rotated at 8 MB. An
+uncaught exception is caught at top level, logged with its stack to `cli.err`, printed as one sentence
+plus the remediation, and exits `1`.
+
+---
+
+## 16. Security
+
+- **It holds one secret, the machine key**, and it reads it rather than being handed it (§4).
+- **It never holds a human credential** (§1.2, R9).
+- **It never sends the key to a non-loopback, non-`https:` URL** (R3), and the plane never answers off
+  loopback.
+- **The server is the gate, not the client.** Every check the CLI makes — the amount shape, the path
+  containment, the tier — exists to produce a better message before the round trip. Each is
+  **repeated server-side**.
+- **Path containment.** A `--root` or file path is resolved with `realpath` and must be inside a
+  configured statements root; the server re-checks. `--root ../../.ssh` is refused twice.
+- **It opens no socket but one.** Only `client.ts` calls `fetch`, only to the resolved target; a test
+  asserts no other module does.
+- **Prompt-injection posture.** A statement is untrusted input. Extracted text is **data** — parsed
+  into typed fields on the server, never evaluated, never used to build a shell command.
+- **`child_process` is used for bring-up only** (`php artisan serve`), with a fixed argv, never a
+  shell string, never with operator-supplied text.
+
+---
+
+## 17. Open-source safety (LOCKED)
+
+This repo is public. Three rules, each with a test (§18):
+
+1. **No secret in the tree.** No config key anywhere in `cli/` can hold a key, password or token. A
+   test greps the built `dist/` for 64-hex literals.
+2. **No private path in the code.** The statements root, the operator email, the entity names, the
+   account last-fours — all configuration. A test greps `cli/code/src/` for `/Users/`, the private
+   archive's directory name and the entity names used on this machine. The example paths in _this
+   spec_ are illustrations, not defaults.
+3. **No financial data in the repo.** The staging directory is outside the repo by construction.
+   Fixtures under `cli/code/test/fixtures/` use invented banks and invented amounts.
+
+---
+
+## 18. Testing
+
+`node:test`, run by `cd cli && just test`, against a **fake machine plane** — a tiny `node:http`
+server in the test suite that speaks the envelope, enforces the header and records calls — plus an
+integration run against a real `php artisan serve` when PHP is present.
+
+| Layer                    | What it holds                                                                                                                         |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| **Parser**               | positional/flag mixing; `--flag=value`; declared-arity only; unknown flag → exit 2 with a suggestion; every flag in §6 is declared on its verb; help generated from declarations |
+| **Credentials**          | resolution order; `0644` refused; symlink refused; merge keeps a foreign product's keys; `init` mints 64 hex from `randomBytes`; concurrent init converges |
+| **Client**               | header attached; key never in URL; non-loopback `http:` refused before connect; each of the nine codes maps to its exit code; a non-envelope body → exit 5 |
+| **Money**                | amounts pass through `json`/`csv` byte-identical; `table` adds separators without changing digits; negative and malformed `--amount` refused; the `dist/` canary for `parseFloat`/`Number(`/`toFixed` |
+| **Absent ≠ zero**        | a `null` limit renders `—` in table, empty in CSV, `null` in JSON                                                                     |
+| **Write protocol**       | no `--write` → dry run only; `--write` without token when piped → exit 2 naming the token; stale token → exit 4                      |
+| **Dates**                | every relative word resolves correctly on month and year boundaries and is echoed                                                     |
+| **stdout purity**        | greps the built `dist/` for `console.log(` and `process.stdout.write(` outside `render.ts`                                            |
+| **Bring-up**             | foreign holder refusal; missing php/vendor refusals; pid file written; `stop` never kills a pid it did not record                     |
+| **Open-source canaries** | the §17 greps                                                                                                                         |
+| **Smoke**                | `ffx`, `ffx doctor`, `ffx --help` exit as specified with the app up and down                                                          |
+
+---
+
+## 19. Use cases
+
+**UC-1 — First run on a fresh clone.** `just setup && just build`, `cli/` on PATH, `ffx`. The app is
+down; the report says so and suggests `ffx up`. `ffx up` starts it; the first request makes the web
+app mint the key. **No secret was typed.**
+
+**UC-2 — "What's in checking?"** `ffx accounts balance Checking`. App down; the CLI brings it up with
+a spinner, waits for `/up`, prints the balance with its currency and its as-of date.
+
+**UC-3 — A decade of statements, first import.** `ffx statements manifest` (prepared, 27 accounts),
+`ffx statements accounts-plan` (24 create, 3 link, 0 ambiguous), `accounts-apply --token … --write`,
+`ffx statements plan` (12,007 rows, all new), `apply --token … --write --max-changes 20000`. Firefly
+stores 12,007.
+
+**UC-4 — The next month.** Same commands. The plan says 38 new and 12,007 already present by
+Firefly's duplicate hash. Apply adds 38. **This is the case the whole `external_id` design exists
+for.**
+
+**UC-5 — Two coffees across a cycle boundary.** Both import, with distinct ids; a re-run imports
+neither again.
+
+**UC-6 — The operator deleted a bad OCR row last week.** The next plan lists it as "previously
+deleted — will stay deleted". Nothing comes back.
+
+**UC-7 — "Build October from the last six months."** `ffx budget set-average --month 2026-10
+--periods 6` prints 14 limits and a token; `--write --token …` applies them; `ffx budget period
+--month 2026-10` shows them.
+
+**UC-8 — A key rotated elsewhere.** A call gets `401` from a reachable app; exit `6` and the sentence
+says the key changed on disk.
+
+**UC-9 — A cron reconcile.** `ffx statements plan --format json > plan.json` then
+`ffx statements apply --token "$(jq -r .data.confirm_token plan.json)" --write --quiet`. No spinner,
+no prompt, non-zero exit on anything but success.
+
+**UC-10 — An agent asks the same question.** Claude Code uses the MCP server, which reads the same
+key and calls the same routes. The answers are identical because the engine is.
+
+---
+
+## 20. Acceptance criteria
+
+1. `ffx` with no arguments prints the orientation report and exits `0` with the app down and no key.
+2. A fresh machine needs **zero typed secrets**: the web app mints the key; `ffx` reads it.
+3. With the app stopped, `ffx accounts list` brings it up, waits on `/up`, and prints the accounts —
+   spinner on a TTY, none when piped.
+4. `ffx accounts list --format json | jq .` succeeds; stdout contains nothing but the envelope.
+5. No amount is ever converted to a number — the `dist/` canary passes, and a JSON round trip through
+   `--format json` is byte-identical to the server's response.
+6. `chmod 644 ~/.credentials/firefly_iii.json` makes the CLI refuse with the `chmod 600` fix.
+7. Every write verb is a dry run without `--write`, and a real write requires the token.
+8. Running the statements pipeline twice over the fixture tree applies zero rows the second time.
+9. The cycle-dated two-coffee fixture imports both rows with distinct `external_id`s.
+10. No path under the statements root outside `.firefly-staging/` is modified by any verb.
+11. Every flag in §6 is declared on its verb; `ffx help <verb>` lists exactly the declared flags.
+12. The §17 canaries pass; `cli/package.json` is private.
+13. `just build` leaves `cli/code/dist/` newer than every source file.
+
+---
+
+## 21. Build phases
+
+| Phase                          | Ships                                                                                               | Done when       |
+| ------------------------------ | --------------------------------------------------------------------------------------------------- | --------------- |
+| **P1 — the spine**             | `cli/` layout, shim, parser, verb registry, logger, progress, render, errors, `ffx help`            | AC 11           |
+| **P2 — the key and client**    | `credentials.ts`, `client.ts`, `ffx key`, `ffx doctor`, `ffx whoami`, `ffx capabilities`            | AC 2, 6         |
+| **P3 — bring-up**              | `bringup.ts`, `ffx up/stop/status/logs`, bare `ffx`                                                 | AC 1, 3         |
+| **P4 — the read verbs**        | every §9 verb, `ffx search`, `ffx api get`                                                          | AC 4, 5         |
+| **P5 — analytics and charts**  | §9.3                                                                                                | —               |
+| **P6 — statements, read**      | roots, manifest, scan, missing, dupes, map, extract, plans                                          | AC 10           |
+| **P7 — the write protocol**    | dry-run/token flow, every §11 verb, statements apply, undo                                          | AC 7, 8, 9      |
+| **P8 — hardening**             | every canary, integration against a real app                                                        | AC 12, 13       |
+
+The CLI can be built ahead of the plane: every route it calls is in apis.mdx, and the fake plane in
+the test suite speaks that contract. Verbs whose route the server publishes as `planned` print the
+server's `not_ready` hint naming the phase.
+
+---
+
+## 22. Invariants recap (LOCKED)
+
+1. `ffx` is not the Data Importer, not `php artisan`, and not a `/api/v1` token client.
+2. CLI code lives only in `cli/`; `pm/` holds no code.
+3. `just build` builds the CLI; the shim self-builds as a backstop.
+4. If the app is down, the CLI brings it up and gates on `:7373/up`, then on the plane's answer.
+5. The machine key is 256 CSPRNG bits, minted by the web app on its first run, reused thereafter,
+   stored in `~/.credentials/firefly_iii.json` at `0600`, sent as `X-Firefly-Machine-Key`, and never
+   logged, echoed or sent off loopback.
+6. The CLI computes no answer about money, and never turns an amount string into a number.
+7. Every write is a dry run unless `--write`, and a real write carries the token from that dry run.
+8. Two de-dupe layers; ordinals over the merged account-month; Firefly's duplicate hash is the sole
+   authority on what exists; deleted stays deleted.
+9. Nothing under the statements root outside `.firefly-staging/` is ever written.
+10. stdout carries exactly one payload.
+11. No secret, no private path and no financial data in this repo.
+
+---
+
+## 23. Related specs
+
+- **[apis.mdx](./apis.mdx) — the machine-plane API this CLI is a client of.** The authority on every
+  route, argument and error code. A verb here is one route there.
+- [mcp.mdx](./mcp.mdx) — the MCP server. Same key, same plane, same engine; a different caller.
+- [../CLAUDE.md](../CLAUDE.md) — where things live on this machine and the private-data boundary.
+- [../agents.md](../agents.md) — upstream's rules for AI-assisted contributions sent upstream.
+- Sister spec: `~/BGit/Bryan_git/actual_budget_bryan/pm/cli.mdx` (`abx`, the same design on Actual
+  Budget).

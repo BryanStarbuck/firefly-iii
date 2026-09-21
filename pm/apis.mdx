@@ -1,0 +1,2322 @@
+---
+title: Firefly III — the machine-plane API
+description: >
+  The HTTP contract that `ffx` and the MCP server both speak, and the ONLY way either of them reaches
+  the operator's ledger. One loopback-bound plane mounted inside the running Laravel app at
+  /machine/v1, authenticated by a 256-bit CSPRNG machine key the web app mints for itself into
+  ~/.credentials/firefly_iii.json at mode 0600 — longer than a UUID, generated with random_bytes(),
+  and never a password, never an OAuth token, never a Passport Personal Access Token that a human
+  pastes. Behind the plane is Firefly III's OWN service layer — the same repositories, factories and
+  rule engine the web UI and the upstream /api/v1 controllers call — so the browser, the terminal and
+  the agent answer from one place and cannot disagree about a balance. The design goal is
+  COMPLETENESS: every action a person can take in the Firefly III web UI has a route here — reading
+  accounts and transactions, but also creating accounts, importing a decade of bank statements with
+  Firefly's own duplicate-hash check as the authority, reconciling to a printed statement balance,
+  setting budget limits, running rules, converting a withdrawal into a transfer, splitting,
+  linking, moving money into a piggy bank, and undoing any of it. Writes are gated by three
+  independent switches and a confirm token the caller can only obtain by first reading a plan, every
+  write has a dry run that is the write itself rolled back, every result that hit a cap says so, and
+  money is a decimal STRING in a named currency at every layer — never a float. This spec is the
+  contract; cli.mdx and mcp.mdx are its two clients.
+---
+
+# Firefly III — the machine-plane API
+
+`~/BGit/Bryan_git/firefly-iii/app/Machine/` · base **`/machine/v1`** · PHP 8.5 + Laravel 13, inside
+the Firefly III app itself
+
+---
+
+## Table of Contents
+
+- [Introduction](#introduction)
+  - [Why this repo exists](#why-this-repo-exists)
+  - [Where this spec fits under that umbrella](#where-this-spec-fits-under-that-umbrella)
+  - [What the operator gets from it](#what-the-operator-gets-from-it)
+  - [How it works — the idea](#how-it-works--the-idea)
+  - [How it works — the machinery](#how-it-works--the-machinery)
+  - [What this spec covers](#what-this-spec-covers)
+- [Goal](#goal)
+- [Overview](#overview)
+- [1. The three specs, and which one owns what](#1-the-three-specs-and-which-one-owns-what)
+- [2. The ten design rules](#2-the-ten-design-rules)
+- [3. Placement, layout and build integration](#3-placement-layout-and-build-integration)
+- [4. Authentication — the machine key](#4-authentication--the-machine-key)
+- [5. The transport contract](#5-the-transport-contract)
+- [6. Tiers, capabilities and negotiation](#6-tiers-capabilities-and-negotiation)
+- [7. The write protocol](#7-the-write-protocol)
+- [8. The route catalogue](#8-the-route-catalogue)
+- [9. Coverage — every UI action, and the route that carries it](#9-coverage--every-ui-action-and-the-route-that-carries-it)
+- [10. The analytics and charting plane](#10-the-analytics-and-charting-plane)
+- [11. The ingest plane — statements into the ledger](#11-the-ingest-plane--statements-into-the-ledger)
+- [12. Account provisioning from a manifest](#12-account-provisioning-from-a-manifest)
+- [13. The query escape hatch — Firefly's search language](#13-the-query-escape-hatch--fireflys-search-language)
+- [14. Money, dates and identifiers](#14-money-dates-and-identifiers)
+- [15. Concurrency, limits and performance](#15-concurrency-limits-and-performance)
+- [16. Security](#16-security)
+- [17. Open-source safety](#17-open-source-safety)
+- [18. Testing](#18-testing)
+- [19. Use cases](#19-use-cases)
+- [20. Acceptance criteria](#20-acceptance-criteria)
+- [21. Build phases](#21-build-phases)
+- [22. Invariants recap](#22-invariants-recap)
+- [23. Related specs](#23-related-specs)
+
+---
+
+## Introduction
+
+### Why this repo exists
+
+This is a fork of [firefly-iii/firefly-iii](https://github.com/firefly-iii/firefly-iii) — the
+self-hosted, double-entry personal finance manager — kept at
+`https://github.com/BryanStarbuck/firefly-iii` for one purpose: to run **this operator's own money**
+on their own machine, with their own decade of bank statements in it, driven from wherever they
+happen to be working. Upstream Firefly III is an excellent web app with an unusually complete REST
+API. It is still a web app, and its API is built for OAuth clients — the mobile apps, the Data
+Importer, a Home Assistant integration — that a human has logged in and granted a token to. The
+operator does not live in a browser, and an agent in Claude Code should not be holding a
+human-granted OAuth token.
+
+So this fork grows two extra front doors — a CLI (`ffx`) and an MCP server (`firefly_iii`) — and
+both of them need the same thing: **a way to ask the running app a question, and a way to tell it
+to do something, that is not a browser and not a human's OAuth grant.**
+
+That is this spec. The fork's longer arc — more APIs, MCP support, and **more charting** than
+upstream ships — is written down in [../CLAUDE.md](../CLAUDE.md); this spec is the foundation all
+of it stands on.
+
+### Where this spec fits under that umbrella
+
+Three specs, one stack:
+
+```
+                       ┌──────────────────────────────┐
+   web browser ───────▶│  Firefly III (Laravel)       │
+   OAuth clients ─────▶│  /api/v1   ← upstream, as-is │──┐
+   `ffx` (cli.mdx) ───▶│  /machine/v1   apis.mdx      │──┼──▶ Firefly's repositories, factories,
+   MCP  (mcp.mdx)  ───▶│  ← THIS SPEC                 │──┘    rule engine ──▶ the database
+                       └──────────────────────────────┘
+```
+
+[cli.mdx](./cli.mdx) says what the terminal surface looks like. [mcp.mdx](./mcp.mdx) says what the
+agent surface looks like. **This spec says what is behind both of them**, and it is written first
+among equals: a verb `ffx` cannot serve and a tool the MCP cannot serve are the same bug — a
+missing route here.
+
+### What the operator gets from it
+
+Concretely, on a Tuesday evening:
+
+- _"How much did I actually spend on groceries this year, by month?"_ — one route, Firefly's own
+  insight aggregation, no model arithmetic anywhere in the chain.
+- _"Create the 27 asset accounts in my statement archive and import all 12,007 transactions."_ — a
+  manifest route, a provisioning route, and Firefly's own duplicate-hash check deciding every
+  duplicate.
+- _"Northbank says $4,211.08 as of the 31st. What do I say?"_ — a reconcile route that returns the
+  difference and, only if asked again, writes the reconciliation transaction the way the UI's
+  Reconcile screen does.
+- _"Every Whole Foods row should be Groceries."_ — a rule preview (Firefly's own `test` endpoint),
+  then the rule, then a run over history.
+- _"Undo that."_ — a route, because an agent that can write must be an agent that can be
+  un-written. Firefly III has no undo stack of its own, so this plane keeps one for its own writes
+  (§7.5).
+
+### How it works — the idea
+
+**One engine, three faces.** Firefly III is a Laravel app. Its web controllers and its `/api/v1`
+controllers are both thin: the work is done by repositories (`AccountRepository`,
+`BudgetRepository`, `JournalRepository`…), factories (`TransactionGroupFactory`,
+`TransactionJournalFactory`), the rule engine, and the insight/chart generators. The plane mounts
+**inside the same Laravel app** and calls **the same classes**. Every balance the browser shows,
+every number `ffx` prints, and every figure the MCP hands a model comes out of that one code path.
+There is no second implementation of anything to drift.
+
+**The filesystem is the authentication.** The web app mints a 256-bit random key into a `0600` file
+in the operator's home directory. A caller that can read that file is already a process running as
+the operator on the operator's machine — at which point it could read the SQLite database directly.
+The key is not trying to stop that person. It is stopping _everything else_: the other user on the
+box, the web page the operator happens to have open, the container on the same host.
+
+**Nothing computes twice.** The clients are thin on purpose (cli.mdx §5.4, mcp.mdx §9.4). If a
+question needs arithmetic, the arithmetic happens here, once, in PHP with `bcmath` — and that is why
+this spec has an analytics plane (§10) and a reconcile route, which upstream computes inside web
+controllers the API cannot reach.
+
+### How it works — the machinery
+
+An `ffx` or MCP call is:
+
+1. HTTP to `127.0.0.1:7373/machine/v1/...` with an `X-Firefly-Machine-Key` header.
+2. Five gates in order — loopback, origin, key, tier, input validation (§4.7, §16).
+3. The key gate binds the request to **one configured operator user and one administration**
+   (§4.9). No user is ever guessed.
+4. A controller that validates its arguments, calls **one** Firefly service operation, and returns.
+5. One JSON envelope, success or failure, always the same shape (§5).
+
+Writes add a sixth step in front: the caller must first call the matching `plan` route (or the
+route's own dry run), read the `confirm_token` it returns, and echo it back (§7).
+
+### What this spec covers
+
+The auth model; the envelope; the tier model; the write protocol; the complete route catalogue
+family by family; a coverage matrix against the web UI; the analytics and charting plane; the
+ingest plane and its manifest-driven account provisioning; the search escape hatch; the money and
+date rules; limits, concurrency, security, open-source safety, testing, use cases, acceptance
+criteria and build phases.
+
+It does not cover argument parsing or terminal rendering (cli.mdx §7, §13), tool descriptions or
+model-facing prompt design (mcp.mdx §9, and
+[ai/mcp_prompt_firefly.md](../ai/mcp_prompt_firefly.md)).
+
+---
+
+## Goal
+
+> **Everything a person can do in the Firefly III web UI, a program can do over this plane — with the
+> same service layer computing it, Firefly's own duplicate-hash check deciding duplicates, and three
+> switches plus a token standing between an agent and the operator's real money.**
+
+Four halves to that sentence, and each is a rule the build is measured against:
+
+| Half                           | The rule                                                                                                                                                   |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Everything the UI can do**   | §9's coverage matrix has a row per UI action and a route per row. A blank cell is a backlog item, never a shrug.                                           |
+| **The same service layer**     | No route reimplements a calculation Firefly already does. Where upstream computes inside a web-only controller, the calculation **moves** here (§10, §8.2). |
+| **The same duplicate check**   | Duplicate detection is `TransactionJournalFactory` with `error_if_duplicate_hash: true`, never a lookup we wrote (§11.6).                                  |
+| **Three switches and a token** | Server tier, client tier, `dry_run: false`, and a `confirm_token` the caller can only have read from a plan (§7).                                          |
+
+---
+
+## Overview
+
+```
+                    ┌────────────────────────────────────────────────────────────────┐
+  ~/.credentials/   │  Firefly III  (php artisan serve on 127.0.0.1:7373)            │
+  firefly_iii.json  │                                                                │
+  0600              │   /  /accounts /budgets …  ← web UI, upstream, untouched        │
+       │            │   /api/v1/…                ← upstream REST + Passport, untouched│
+       │  256-bit   │   /up                      ← Laravel health, upstream           │
+       └───key──────┼──▶ /machine/v1/…           ← THIS SPEC                          │
+                    │     gate 1 loopback socket (REMOTE_ADDR, never X-Forwarded-For) │
+   ffx ─────────────┼──▶  gate 2 origin + host                                        │
+   MCP ─────────────┼──▶  gate 3 constant-time key compare  → binds operator user     │
+                    │     gate 4 tier  (read · write · admin)                          │
+                    │     gate 5 input validation                                      │
+                    │     gate 6 confirm token + ceiling   (writes only)               │
+                    │          │                                                       │
+                    │          ▼                                                       │
+                    │     Firefly repositories · factories · rule engine · insight     │
+                    │          │                                                       │
+                    │          ▼                                                       │
+                    │     SQLite (outside the repo) — or MySQL/Postgres if configured  │
+                    └────────────────────────────────────────────────────────────────┘
+```
+
+**Twelve families, ~170 routes, three tiers.** Read is always on. Write needs two switches and a
+token. Admin — the routes that can lose data — needs a third switch the MCP never gets.
+
+---
+
+## 1. The three specs, and which one owns what
+
+| Concern                                                   | Owner                                                                               |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| What is computable, and what it is called on the wire     | **apis.mdx**                                                                        |
+| The envelope, the error vocabulary, the tier model        | **apis.mdx**                                                                        |
+| The machine key: shape, storage, rotation, gate ladder    | **apis.mdx** (cli.mdx §4 and mcp.mdx §6 restate it, and defer here on any conflict) |
+| Argument parsing, flags, exit codes, terminal rendering   | cli.mdx                                                                             |
+| Bring-up, ports, health gating, `ffx` verb names          | cli.mdx                                                                             |
+| Tool names, tool descriptions, JSON Schema, model framing | mcp.mdx                                                                             |
+| How the model is told to think about money                | [ai/mcp_prompt_firefly.md](../ai/mcp_prompt_firefly.md)                             |
+
+**Precedence (LOCKED).** Where this spec and a client spec disagree about the wire, **this spec
+wins** and the client spec is the one with the bug. Where they disagree about a client's own
+surface, the client spec wins. A route exists here before it exists there, never after.
+
+### 1.1 The one-line routing test
+
+> _Is it a fact about what the app can compute?_ → here.
+> _Is it a fact about how a human types it or how a model reads it?_ → cli.mdx or mcp.mdx.
+
+### 1.2 Why not simply use upstream's `/api/v1` (LOCKED)
+
+Upstream already has roughly 250 REST routes. The obvious design is to point `ffx` and the MCP at
+them with a Personal Access Token. It is rejected for five reasons, each a failure we can name:
+
+1. **The credential is a human's.** A Passport token is minted by a logged-in person in
+   Profile → OAuth, is scoped to that person, and is pasted into a config file. That is the exact
+   secret-in-a-file-in-a-repo-going-public problem this design exists to remove (§17).
+2. **There is no dry run.** `POST /api/v1/transactions` writes or refuses. There is no preview of
+   what the rule engine will do to a row, what the duplicate check will say, or how many rows a
+   bulk edit touches. An agent with no preview is an agent that learns by writing.
+3. **The web-only computations are unreachable.** Reconciliation, the six report types, the
+   "left to spend" boxes, and most chart data are computed in web controllers
+   (`app/Http/Controllers/…`) that `/api/v1` does not expose.
+4. **Deletes are ordinary verbs there.** `DELETE /api/v1/accounts/{id}` is one call with the same
+   token as a read. Here every destructive delete is its own tier (§6).
+5. **The CORS posture is a browser posture.** `config/cors.php` allows `api/*` from any origin — the
+   right answer for a public API and the wrong one for a loopback surface that holds a machine key.
+
+**What we keep from `/api/v1`:** its transformers (the JSON shapes, so a Firefly developer
+recognises every entity), its request validators where they apply, and — for reads — its entire
+surface through the **mirror** (§8.12), so the plane has upstream's read coverage on day one.
+`/api/v1` itself is **not modified**; the Data Importer and the mobile apps keep working exactly as
+upstream intends.
+
+---
+
+## 2. The ten design rules
+
+Each of these has shown up as a real bug in a real finance tool. They are stated once, here, and
+every route in §8 is written to obey them.
+
+**R1 — One service call per route.** A route validates, calls one Firefly service operation, and
+renders. A route that needs two calls is either two routes or one new service method. The exception
+is explicitly-named **composed routes** (reconcile, ingest apply, batch, budget month), which say so
+in their entry and carry `meta.composed: true`.
+
+**R2 — Money is a decimal string in a named currency.** Every amount in every argument, every
+response field and every intermediate value is a string like `"123.45"` with a `currency_code`
+beside it, computed with `bcmath`. Never a float, never a bare number, never summed across two
+currencies. §14.1.
+
+**R3 — Absent is not zero.** A budget with no limit for a period returns `limit: null`, not `"0"`. A
+balance we could not compute is an error, not `"0"`. §14.2.
+
+**R4 — Every write has a dry run, and the dry run is the write.** `dry_run` defaults to **true** on
+every write route where a preview is meaningful. The preview is the real write executed inside a
+database transaction that is rolled back — never a second function that predicts it. §7.2.
+
+**R5 — Every cap is reported.** A clamped result carries `meta.truncated: true` and
+`meta.limit_applied`. A silent cap is how a caller concludes an account has exactly 1,000
+transactions. §5.5.
+
+**R6 — Every error names a fix.** `error.hint` is a remediation the caller can act on, in the
+caller's vocabulary. "Invalid input" without a hint is a bug report waiting. §5.4.
+
+**R7 — The app decides, we report.** Where Firefly has an opinion — what is a duplicate, what a rule
+does to a transaction, what an account's balance is, how much is left in a budget — the route
+returns Firefly's verdict verbatim and adds nothing. §11.6.
+
+**R8 — Reads never mutate.** No route in the read tier writes to the ledger, the filesystem, the
+cache of any other tenant, or fires a webhook. `/search` is a read because Firefly's search
+language has no mutation operator. `/ingest/scan` is a read because it only stats files. The one
+read-tier route that touches disk says so in its entry.
+
+**R9 — Fail closed.** No key, no plane. No operator user, no plane. No tier, no route. No validation
+match, no handler. An unauthenticated or untiered fallback does not exist anywhere in this design,
+and a 404 is the answer to everything the caller was not supposed to reach.
+
+**R10 — The plane is loopback-only, forever.** There is no configuration that binds it to another
+interface and no flag that turns the origin gate off. Remote access is what upstream's `/api/v1`
+with OAuth is for; it has its own auth and it is not this. §16.
+
+---
+
+## 3. Placement, layout and build integration
+
+### 3.1 Directory layout (LOCKED)
+
+```
+firefly-iii/
+├── app/Machine/                           ← ALL plane code. Namespace FireflyIII\Machine
+│   ├── MachinePlaneServiceProvider.php    boot(): resolve-or-mint the key, register routes/machine.php
+│   ├── Credentials/
+│   │   └── CredentialsFile.php            the key: mint, resolve, fingerprint, merge-write
+│   ├── Http/
+│   │   ├── Middleware/
+│   │   │   ├── LoopbackGate.php           gate 1
+│   │   │   ├── OriginGate.php             gate 2
+│   │   │   ├── MachineKeyGate.php         gate 3 + operator binding (§4.9)
+│   │   │   └── TierGate.php               gate 4
+│   │   └── Controllers/                   one controller per family (§8)
+│   │       ├── PlaneController.php        ping · whoami · capabilities · health
+│   │       ├── PlannedController.php      declared-but-unbuilt routes (§6.3a)
+│   │       ├── AdministrationController.php
+│   │       ├── AccountController.php      accounts, reconcile
+│   │       ├── TransactionController.php  groups, journals, splits, convert, links, bulk
+│   │       ├── CategoryController.php
+│   │       ├── BudgetController.php       budgets, limits, available budgets, the budget period
+│   │       ├── SubscriptionController.php bills / subscriptions
+│   │       ├── PiggyBankController.php
+│   │       ├── RecurrenceController.php
+│   │       ├── RuleController.php         rules and rule groups
+│   │       ├── ReferenceController.php    tags · object groups · currencies · rates · links · attachments
+│   │       ├── AnalyticsController.php    §10
+│   │       ├── ChartController.php        §10.5
+│   │       ├── IngestController.php       §11 and §12
+│   │       ├── SearchController.php       §13
+│   │       ├── MirrorController.php       §8.12 read-only /api/v1 passthrough
+│   │       ├── UndoController.php         §7.5
+│   │       └── AdminController.php        the destructive tier
+│   ├── Validation/                        gate 5 — one validator class per route
+│   ├── Confirm/ConfirmTokens.php          gate 6 — plan tokens, ceilings
+│   ├── DryRun.php                         the rolled-back-transaction harness (§7.2)
+│   ├── Undo/OperationLog.php              before-images for /undo (§7.5)
+│   ├── Envelope.php                       ok/error envelope + the nine error codes
+│   ├── Money.php                          the ONE place a decimal string is parsed or formatted
+│   ├── Operator.php                       resolves the operator user + administration (§4.9)
+│   └── RouteTable.php                     THE one array → router AND /capabilities (§6.3)
+├── routes/machine.php                     builds routes from RouteTable — nothing else
+├── database/migrations/2026_09_21_000001_create_machine_operations_table.php   §7.5
+└── tests/Machine/                         PHPUnit, colocated by family (§18)
+```
+
+**The whole upstream delta is three lines and two new files outside `app/Machine/`.** One line in
+`bootstrap/providers.php` registering `MachinePlaneServiceProvider`; the provider registers
+`routes/machine.php` itself (so `bootstrap/app.php` is untouched); one migration file; one route
+file. Everything else is a directory upstream has never heard of, so an upstream merge cannot
+conflict with it. The merge-conflict surface is **one line**.
+
+**Why inside the Laravel app and not a sidecar process.** A sidecar reading the same database is a
+second writer against the ledger with none of Firefly's invariants — running balances, the
+`import_hash_v2` meta, the event listeners that apply rules and recompute primary-currency amounts.
+One writer, one process, one set of invariants.
+
+**Why not a Laravel package.** A composer package is the tidy answer and the wrong one here: it
+would need a `composer.json` change upstream regenerates on every release, and it would hide the
+plane from the operator reading the repo. `app/Machine/` is visible, greppable and ours.
+
+### 3.2 Build integration
+
+The repo gains a root **`justfile`** (upstream has none — see cli.mdx §2.3), and the plane needs no
+separate build step: it is PHP inside the app. `just run` serves the app; the provider arms the plane
+on the first request after boot and logs one line to `~/T/_firefly_iii/server.log`:
+
+```
+Machine plane armed on /machine/v1 (key 4f2a…/sha256:9c1b, operator ops@local, administration 1, writes DISABLED)
+```
+
+That line is the operator's proof it is up. Its absence is the first thing `ffx doctor` reports.
+
+Handles: arming the plane and registering its routes.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/MachinePlaneServiceProvider.php` — class `MachinePlaneServiceProvider`, methods `boot()`, `registerRoutes()`
+Code: `~/BGit/Bryan_git/firefly-iii/bootstrap/providers.php` — the one added line (exists today; upstream file)
+
+### 3.3 The runtime this plane assumes (LOCKED)
+
+- **PHP 8.5 and Composer on the host**, as `composer.json` requires (`"php": ">=8.5"`), running
+  `php artisan serve --host=127.0.0.1 --port=7373` with `PHP_CLI_SERVER_WORKERS=4`. The built-in
+  server is enough for one operator, and it is the one runtime where `REMOTE_ADDR` is the kernel's
+  view of the peer.
+- **Docker is not a supported runtime for the plane in v1, and the plane fails closed there.**
+  Behind Docker's port forwarding every request arrives from the bridge gateway (`172.17.0.1`), not
+  loopback, so gate 1 returns 404 for everything. That is R9 working, not a bug. A Docker story
+  needs its own design (a Unix socket mounted into the container, most likely) and is phase P11.
+- **The database lives outside the repo.** `DB_CONNECTION=sqlite` with
+  `DB_DATABASE=~/T/_firefly_iii/db/firefly.sqlite` (the absolute path, written by `just setup` into
+  the git-ignored `.env`). Upstream's default is `storage/database/database.sqlite` — inside the
+  directory tree of a repo that is going public. The attachment disk (`storage/upload`) and export
+  disk move out the same way. §17.
+- **One process serves everything:** the web UI, `/api/v1`, `/up` and `/machine/v1` all answer on
+  `:7373`. There is no second port to pin.
+
+---
+
+## 4. Authentication — the machine key
+
+This section is the **authority**. cli.mdx §4 and mcp.mdx §6 restate parts of it for their own
+readers; where they differ, this text is correct.
+
+### 4.1 Why not a password, and why not a Passport token (LOCKED)
+
+Firefly III already has two credentials. Both are the wrong one for this plane:
+
+1. **The login password is a human's, typed by a human.** A CLI that prompts cannot run in a loop,
+   and an MCP server that prompts hangs a conversation. It also unlocks the whole web UI, including
+   2FA settings and user management.
+2. **A Passport Personal Access Token is a human's grant, pasted by a human.** It is created in
+   Profile → OAuth by a logged-in person, lives until revoked, travels in `Authorization: Bearer`
+   (which proxies and HTTP libraries forward helpfully), and works from **anywhere** the app is
+   reachable. The whole point of the machine key is that it never leaves this computer and is
+   useless off it.
+3. **Both are shared with remotes.** A token that works over the network has a network-sized blast
+   radius. This key's blast radius is this computer.
+
+### 4.2 Shape and entropy (LOCKED)
+
+> **32 bytes from `random_bytes()`, rendered as 64 lowercase hex characters.**
+
+- **At least the length of a UUID, and far stronger.** A UUIDv4 is 36 characters carrying 122
+  random bits. This key is 64 characters carrying **256** — more than twice the entropy — and it is
+  deliberately **not** UUID-shaped: a UUID _looks_ like an identifier, and identifiers get logged,
+  put in URLs and pasted into issues. A 64-character hex string looks like a secret and gets
+  treated like one.
+- **A CSPRNG and nothing else.** PHP's `random_bytes()` reads the OS CSPRNG (`getrandom(2)` /
+  `arc4random_buf`). `rand()`, `mt_rand()`, `uniqid()` and `Str::random()` built on them are
+  forbidden in `app/Machine/`; a test greps for all four. The Node clients use
+  `crypto.randomBytes(32)` for the same reason (cli.mdx §4.3).
+- **Validated on every read.** `/^[0-9a-f]{64}$/`. A key that does not match is refused at resolve
+  time with the rotate command as the hint — never silently padded, trimmed or lowercased.
+- Guessing it at a million tries a second from a process that could reach the port anyway takes
+  about 3.7 × 10^63 years. It is not the attack you need to worry about, and that is the point.
+
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Credentials/CredentialsFile.php` — `mintKey()`, `isWellFormedKey()`
+
+### 4.3 Where it lives (LOCKED)
+
+```jsonc
+// ~/.credentials/firefly_iii.json          mode 0600, directory mode 0700
+{
+  "firefly_iii": {
+    "machine": {
+      "api_key": "4f2a…64 hex chars…",
+      "created": "2026-09-21T18:04:11.902Z",
+      "created_by": "firefly-web", // or "ffx" or "mcp" — whoever needed it first
+      "label": "bryan-macstudio",
+    },
+    "statements": { "root": "/…/bank_statements" },
+  },
+  // …other products' top-level keys, which we preserve byte for byte
+}
+```
+
+- **Unique to this application.** One file, one top-level `firefly_iii` object. The sibling apps on
+  this machine (`actual_budget.json`, `ezbookkeeping.json`) have their own files and their own
+  keys; a key minted for one app never authenticates to another (§4.8).
+- **`~/.credentials/`, not the repo.** The repo is going public (§17). There is no `.env` key and no
+  config key anywhere in the tree that can hold this value. Upstream's `.env` holds `APP_KEY`,
+  `STATIC_CRON_TOKEN` and database passwords — the machine key is **not** added to that list.
+- **Per machine, never synced.** Not in Dropbox, not in a dotfiles repo. A second machine mints its
+  own.
+- **The write merges.** Other products share `~/.credentials/`. A writer that serialises the file
+  whole from memory is the program most likely to delete somebody else's secret at 2am, so the write
+  reads, mutates the `firefly_iii` subtree, and writes back — preserving every key it does not own.
+- **The write is atomic and refuses symlinks.** Temp file in the same directory opened with
+  `fopen(…, 'x')` (the `O_EXCL` equivalent) under `umask(0077)` so it is `0600` from creation rather
+  than `chmod`ed afterwards (a file that is briefly `0644` is a file that was briefly readable),
+  `fflush` + `fsync`, then `rename()`. If the destination is a symlink, the write is abandoned —
+  that is somebody redirecting our secret, not a convenience.
+- **Mode and owner are checked on every read.** A file looser than `0600`, or owned by another uid,
+  is refused with `fix: chmod 600 ~/.credentials/firefly_iii.json`. A world-readable shared secret
+  is a finding, not a warning.
+
+### 4.4 Who mints it, and when (LOCKED)
+
+**Whichever of the three processes needs it first, and exactly once.**
+
+The intended path is that **the web app mints it for itself, with no operator action at all**:
+`MachinePlaneServiceProvider::boot()` resolves the key when the app handles its first HTTP request,
+finds none, and mints one. By the time the operator first types `ffx` or first asks Claude Code a
+question, the key is already there, and neither of them had to be told about it. If the file exists
+with a well-formed key, the app **uses the pre-existing key** and never replaces it.
+
+Four rules make that safe:
+
+1. **Mint on an HTTP boot, never on a console boot or a test boot.** `boot()` runs for every
+   artisan command, every `composer install` package-discovery pass and every PHPUnit test. Minting
+   there would write a secret into the developer's real home directory as an invisible side effect
+   of `php artisan migrate`. So the provider mints only when `! app()->runningInConsole()` and
+   `! app()->runningUnitTests()`; `just run` also calls `php artisan firefly-machine:key --init` once
+   before serving, which is the same code path invoked on purpose.
+2. **The resolve is cheap.** `boot()` runs on every request, so after the first successful resolve
+   the result is memoised for the worker's lifetime; the per-request cost is one `stat()` to notice
+   a rotation (§4.8).
+3. **The mint is a compare-and-set.** The writer takes an exclusive `flock()` on a sibling lock file,
+   re-reads inside the lock and yields if a key appeared, then reads back and trusts the file rather
+   than its own mint. The web app, `ffx` and the MCP starting at once converge on one key instead of
+   three.
+4. **Until it is armed, the plane 404s everything** (R9). Not 500, not "auth disabled" — 404, the
+   same answer a stranger gets, so probing it teaches nothing.
+
+`ffx key init` and `ffx key rotate --yes` exist for the operator who wants to do it deliberately;
+they are conveniences over the same file format, not a separate mechanism.
+
+Handles: resolving the key at boot and minting it when absent.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/MachinePlaneServiceProvider.php` — `boot()`, `armPlane()`
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Credentials/CredentialsFile.php` — `resolveOrMint()`, `writeMerged()`, `fingerprint()`
+Code: `~/BGit/Bryan_git/firefly-iii/app/Console/Commands/Machine/MachineKey.php` — command `firefly-machine:key {--init} {--rotate} {--show}`
+
+### 4.5 Resolution order (LOCKED)
+
+First hit wins:
+
+| #   | Source                                                            | For                                               |
+| --- | ----------------------------------------------------------------- | ------------------------------------------------- |
+| 1   | `FIREFLY_MACHINE_KEY` (server) / `FFX_MACHINE_KEY` / `FFMCP_MACHINE_KEY` | CI, one-off overrides. Never in a checked-in file |
+| 2   | `…_MACHINE_KEY_FILE`                                              | the Docker-secret shape                           |
+| 3   | `~/.credentials/firefly_iii.json`                                 | **the normal path**                               |
+| 4   | mint one (the web app always; `ffx`/MCP only on an explicit `key init` or first start) | first run                   |
+
+`FIREFLY_MACHINE_CREDENTIALS_FILE` / `FFX_CREDENTIALS_FILE` / `FFMCP_CREDENTIALS_FILE` relocate step
+3 — that is the seam every test uses, and it is why no test touches a real home directory.
+
+### 4.6 How it is sent, and how it is checked (LOCKED)
+
+```http
+POST /machine/v1/transactions HTTP/1.1
+Host: 127.0.0.1:7373
+X-Firefly-Machine-Key: 4f2a…
+Content-Type: application/json
+Accept: application/json
+```
+
+- **A header, never a query parameter.** Query strings land in access logs, shell history, and the
+  `Referer` of anything the page loads. The key gate **rejects** a request that carries the key in a
+  query string, with 404, so the habit cannot form.
+- **`X-Firefly-Machine-Key`, not `Authorization: Bearer`.** Proxies, browser devtools and HTTP
+  libraries have special handling for `Authorization` — auto-forwarding on redirect, credential
+  managers, "remember this". And in this app specifically, `Authorization: Bearer` already means a
+  Passport token to the `api` guard; overloading it would make a machine key and a human's token
+  indistinguishable in every log line.
+- **Constant-time comparison.** `hash_equals()` over two SHA-256 digests of equal length — both the
+  presented and the stored key are hashed first, so one comparison of equal-length strings always
+  runs and the length of the presented value leaks nothing.
+- **The 401 body is constant.** `{"ok":false,"error":{"code":"unauthorized"}}` — byte for byte the
+  same for a missing key and a wrong one. The server keeps its silence; the _client_ does the
+  explaining, because the client knows which file it failed to read and the server does not know who
+  is asking.
+
+### 4.7 The gate ladder (LOCKED)
+
+Order is load-bearing. Nothing below a gate runs until it passes.
+
+| #   | Gate                 | Refuses                                          | Answer                           |
+| --- | -------------------- | ------------------------------------------------ | -------------------------------- |
+| 1   | Loopback socket      | another computer                                 | `404`                            |
+| 2   | Origin + Host        | a web page on this computer; DNS rebinding       | `404`                            |
+| 3   | The key (+ operator) | another user on this computer                    | `401`, constant body             |
+| 4   | Tier                 | a write with the tier off; admin from the MCP    | `403 write_disabled`/`forbidden` |
+| 5   | Input validation     | a malformed or unknown argument                  | `400 invalid_input`              |
+| 6   | Confirm + ceiling    | a write with no token, a stale token, or too big | `403`/`409`                      |
+
+**Three facts about the app this mounts inside that gates 1 and 2 must survive:**
+
+1. **`TrustProxies` is in the global middleware stack** (`bootstrap/app.php` —
+   `\Illuminate\Http\Middleware\TrustProxies::class`, configured by `TRUSTED_PROXIES`). With a
+   trusted proxy configured, `$request->ip()` and `$request->ips()` are derived from
+   `X-Forwarded-For`, which any client can send. **Gate 1 reads `$request->server('REMOTE_ADDR')` —
+   the socket peer — and never consults `ip()`, `ips()`, `X-Forwarded-For` or `X-Real-IP`.** Accepted
+   peers are exactly `127.0.0.1`, `::1` and `::ffff:127.0.0.1`. A remote request carrying
+   `X-Forwarded-For: 127.0.0.1` gets a 404, and there is a test that says so.
+2. **`HandleCors` is global, and `config/cors.php` allows `api/*` from `*`.** Our path is
+   `machine/*`, which is **not** in `cors.paths`, so `HandleCors` adds no
+   `Access-Control-Allow-Origin` to it — and a test pins that, because the day someone "fixes" CORS
+   by widening `paths` to `*` is the day the plane becomes browser-reachable. The key is the first
+   wall against a web page on this machine (`https://evil.example` can `fetch('http://127.0.0.1:7373/…')`
+   and the packet really does arrive on loopback); gate 2 is the second, so that is not one control
+   deep. A browser always sends `Origin` or `Sec-Fetch-Site` and cannot be talked out of it; `ffx`,
+   the MCP and `curl` send neither, so **presence** is the signal. A request carrying any `Origin`,
+   or a `Sec-Fetch-Site` of `cross-site`, `same-site` or `none`, is refused with 404.
+3. **The `web` middleware group starts a session and checks CSRF; the `api` group runs
+   `auth:api`.** The plane uses **neither group**. It is registered with its own middleware list —
+   the six gates, `Binder` for route-model binding, and nothing else — so a machine call never
+   creates a session cookie, never touches the CSRF token, and never consults Passport.
+
+Gate 2 also pins the `Host` header to `127.0.0.1:7373` / `localhost:7373`, because DNS rebinding is
+precisely the trick that turns a remote page into a loopback client, and the `Host` is what it has
+to lie about to get there. Every plane response carries `Cache-Control: no-store` and `Vary: Origin`.
+
+Handles: the three gates in front of the key.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Middleware/LoopbackGate.php` — `handle()`, `isLoopbackPeer()`
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Middleware/OriginGate.php` — `handle()`, `isBrowserRequest()`, `isAllowedHost()`
+Code: `~/BGit/Bryan_git/firefly-iii/bootstrap/app.php` — `TrustProxies` and `HandleCors` in `$middleware->use([...])` (exist today; upstream; untouched)
+Code: `~/BGit/Bryan_git/firefly-iii/config/cors.php` — `'paths' => ['api/*', 'sanctum/csrf-cookie']` (exists today; must never include `machine/*`)
+
+### 4.8 Rotation, and what the key is not
+
+**Rotation** is `ffx key rotate --yes` (or `php artisan firefly-machine:key --rotate`): mint,
+merge-write, and print the new fingerprint. Because PHP workers resolve the key per request against
+a memo invalidated by the file's `mtime` (§4.4 rule 2), a rotation takes effect on the next request
+with no restart — the one place this plane is simpler than a long-running Node server. Callers
+holding the old key get `401` immediately, with the client printing _"the key changed on disk —
+re-read it"_. Outstanding confirm tokens are bound to the key fingerprint and die with it (§7.3).
+
+**The fingerprint** — `4f2a…/sha256:9c1b`, the first four hex characters plus a SHA-256 prefix — is
+the **only** representation of the key that may be logged, printed, put in an error, or shown to a
+model. A test greps every log the test suite produced for anything matching `[0-9a-f]{64}`.
+
+**What the key is NOT:**
+
+- Not a user identity. It authenticates _the machine_; the plane then acts as the configured
+  operator user (§4.9). Holding the key does not let a caller choose a different user.
+- Not a capability grant. Holding it does not enable writes; the tier switches do (§6).
+- Not an OAuth token. It is never accepted by `/api/v1`, `/oauth/*`, or any web route, and a
+  Passport token is never accepted by `/machine/v1`.
+- Not an API key in the SaaS sense. It is never sent off this machine, ever, by anything.
+- Not encryption. Firefly's `APP_KEY` encrypts cookies and some stored values; it is a different
+  secret, owned by the app, and this plane never reads it, prints it, or accepts it as an argument.
+- Not shared with a sibling app. `actual_budget.json` and `ezbookkeeping.json` hold keys for other
+  apps' planes; this one reads only `firefly_iii.machine.api_key`.
+
+### 4.9 The operator binding — which user, which administration (LOCKED)
+
+Firefly III is multi-user, and every user can belong to several **administrations** (financial
+administrations, `user_groups` in the schema — each a separate set of books). The machine key names
+neither. So gate 3, after the key passes, binds the request to exactly one of each:
+
+| Setting                             | Resolution                                                                                                        |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `FIREFLY_MACHINE_OPERATOR` (email)  | that user. If unset and the install has **exactly one** user, that one. Otherwise **refuse**, naming the emails.  |
+| `FIREFLY_MACHINE_ADMINISTRATION` (id) | that administration, if the operator is a member. If unset, the operator's **current** administration (`user_group_id`) — which is what the web UI shows them. |
+
+- **No user is ever guessed.** With two users and no setting, every route that needs a ledger
+  refuses `not_ready` with the candidate emails in `error.details`. Choosing a user on the
+  operator's behalf is the worst mistake available on this plane (mcp.mdx §3).
+- **Blocked users are refused.** A user with `blocked = 1` gets the same refusal
+  `CatchBlockedUsers` gives the API.
+- **2FA does not apply.** MFA protects a human login; the plane has no login. This is written down
+  so nobody "fixes" it by wiring `MFAMiddleware` into a request that has no session.
+- **The binding is `auth()->setUser($operator)` on the default guard for this request only.** No
+  session is written and no token is minted.
+- **`meta.administrationId` and `meta.administrationName` are on every response** (§5.1), so a
+  caller that has drifted onto the wrong set of books is holding the evidence in every reply.
+
+Handles: binding a machine request to one user and one administration.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Operator.php` — `resolve()`, `refuseWithCandidates()`
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Middleware/MachineKeyGate.php` — `handle()`, `bindOperator()`
+Code: `~/BGit/Bryan_git/firefly-iii/app/Http/Middleware/CatchBlockedUsers.php` — `handle()` (exists today; the blocked-user rule we mirror)
+
+---
+
+## 5. The transport contract
+
+### 5.1 The envelope (LOCKED)
+
+Every response, success or failure, is one JSON object of the same shape.
+
+```jsonc
+// success
+{
+  "ok": true,
+  "data": { /* route-specific */ },
+  "meta": {
+    "target": "local",
+    "operator": "ops@local",
+    "administrationId": 1,
+    "administrationName": "Household",
+    "primaryCurrency": "USD",
+    "serverVersion": "6.4.2",
+    "planeVersion": "v1",
+    "asOf": "2026-09-21T18:41:02.118Z",
+    "tookMs": 38,
+    "truncated": false,
+    "tier": "read"
+  }
+}
+
+// failure
+{
+  "ok": false,
+  "error": {
+    "code": "not_found",
+    "message": "No account with that id.",
+    "hint": "GET /machine/v1/accounts — or pass account_name instead of account_id",
+    "details": { "id": "412" }   // optional, structured, never a stack
+  }
+}
+```
+
+**Casing (LOCKED).** Two conventions, and the split is principled:
+
+- **`meta` and `error` are OURS, and they are camelCase** — matching mcp.mdx §12.1.
+- **`data` is FIREFLY'S, verbatim, in Firefly's own casing — which is snake_case**
+  (`current_balance`, `currency_code`, `source_id`, `budget_id`, `pc_amount`). Where a route returns
+  an entity upstream's `/api/v1` also returns, **the same transformer renders it**
+  (`AccountTransformer`, `TransactionGroupTransformer`…), minus the JSON:API wrapping
+  (`data.attributes`) which we flatten one level. Renaming Firefly's fields would be a translation
+  layer, and a translation layer is a second representation of every entity that can drift.
+- **Arguments are snake_case**, matching Firefly's field names and the MCP's tool arguments, so
+  `budget_id` means the same thing in a filter, in a response and in a tool call.
+
+- **`data` is never a bare array.** A list route returns `{ "accounts": [...] }`, so the shape can
+  grow a `total` or a `cursor` later without breaking a caller.
+- **`meta.administrationId` / `administrationName` are on every response** — §4.9.
+- **`meta.primaryCurrency`** is on every response, because every "converted" amount in Firefly
+  (`pc_amount`, `pc_balance`) is in that currency and a caller must be able to say which.
+- **`meta.asOf` is the server's clock.** A balance without a timestamp is a lie tomorrow.
+- **`error.details` is structured and bounded.** Field names, counts, ids, the conflicting rows. It
+  never contains a stack trace, a file path outside the statements root, a SQL string or a Laravel
+  exception class name — those go to `storage/logs` and stay there (§16.4).
+- **Laravel's own error pages never reach a plane caller.** The plane's exception renderer
+  converts `ValidationException`, `ModelNotFoundException`, `AuthorizationException`,
+  `DuplicateTransactionException` and `FireflyException` into the envelope; anything else becomes
+  `internal`. A test asserts no plane response is HTML.
+
+### 5.2 The nine codes (LOCKED)
+
+`unauthorized` · `forbidden` · `not_found` · `invalid_input` · `conflict` · `write_disabled` ·
+`not_ready` · `upstream_error` · `internal`
+
+| Code             | HTTP | Means                                                                                                    |
+| ---------------- | ---- | -------------------------------------------------------------------------------------------------------- |
+| `unauthorized`   | 401  | gate 3 — no key or wrong key                                                                             |
+| `forbidden`      | 403  | gate 4 — the tier or a guard says no (admin route, a mirror path we refuse)                              |
+| `not_found`      | 404  | gates 1–2, an unknown route, or a real missing entity                                                    |
+| `invalid_input`  | 400  | gate 5 — validation, range, or an argument combination that cannot hold                                  |
+| `conflict`       | 409  | the world changed under the caller — stale token, concurrent write, a duplicate, two statements disagree |
+| `write_disabled` | 403  | gate 4 — a write route with the tier off                                                                 |
+| `not_ready`      | 503  | the app is up but no operator/administration resolved, the DB is not migrated, or the plane is not armed |
+| `upstream_error` | 502  | a Firefly service failed in a way we can name (a `FireflyException` with a known cause)                  |
+| `internal`       | 500  | anything else; the message is generic and the detail is in the log                                      |
+
+**A tenth code is a spec change, not a commit.** mcp.mdx §12.3 lists twelve: the three extra
+(`confirm_required`, `too_many_changes`, `wrong_server`) are minted by the MCP and **never appear on
+this wire**. Every code here is also an MCP code, so the MCP passes a server error through
+unchanged. A test asserts the superset.
+
+**A duplicate is a `conflict`, and it carries the original.** When Firefly's duplicate check fires,
+`error.details` names the existing transaction group id it collided with, so the caller can show the
+operator the row that already exists instead of a bare "duplicate".
+
+### 5.3 Versioning (LOCKED)
+
+The path carries the version: `/machine/v1/`. Within `v1`:
+
+- **Adding a route, an optional argument, or a response field is not a breaking change.** Callers
+  must ignore fields they do not know.
+- **Removing or renaming anything, or changing a field's type, is `v2`.** There is no deprecation
+  window inside a version.
+- **The plane's version is independent of Firefly's.** An upstream release that changes an
+  `/api/v1` transformer is absorbed here — the plane pins the shape it publishes and a contract test
+  (§18) catches the drift on the merge that introduced it, not in a user's terminal.
+- `GET /capabilities` (§6.3) is how a client discovers what this build has, so a newer CLI against
+  an older server degrades with a clear message instead of a 404 it cannot interpret.
+
+### 5.4 Errors name a fix (R6)
+
+`hint` is written for the caller who will read it, and it is a _command or a decision_, never a
+restatement:
+
+| Bad hint              | Good hint                                                                          |
+| --------------------- | ---------------------------------------------------------------------------------- |
+| "Invalid account id." | `GET /machine/v1/accounts` — or pass `account_name` instead of `account_id`        |
+| "Write disabled."     | Set `FIREFLY_MACHINE_ALLOW_WRITE=1` in the app's `.env` and restart it (`ffx stop && ffx up`) |
+| "Too many changes."   | 1,904 transactions would change; raise `max_changes`, or narrow with `start`       |
+| "Not ready."          | Two users exist and `FIREFLY_MACHINE_OPERATOR` is unset — set it to one of the emails in `details` |
+| "Duplicate."          | This is a duplicate of transaction group #8812 — `GET /machine/v1/transactions/8812` |
+
+### 5.5 Pagination, ordering and truncation
+
+Every list route takes `limit`, `offset` and `order`; every one has a hard cap.
+
+| Argument | Default | Cap   | Notes                                                      |
+| -------- | ------- | ----- | ---------------------------------------------------------- |
+| `limit`  | 200     | 5,000 | **Clamped, never rejected** — over the cap you get the cap |
+| `offset` | 0       | —     | Stable only under a stable `order`                         |
+| `order`  | route   | —     | `field` or `-field`; only fields the route documents       |
+
+When a cap bound the result: `meta.truncated: true` and `meta.limit_applied: 5000`. Upstream's
+`/api/v1` paginates with `page` and a per-user `listPageSize` preference; the plane translates, so a
+caller never has to know the operator's page-size preference to get a complete answer.
+
+**Ordering is always explicit and always total.** Every list route's default order ends with a tie
+break on `id`, because a paginated list with a non-total order silently skips and repeats rows.
+Firefly's own journal ordering (`date`, then `order`, then `id`) is preserved where the UI uses it.
+
+### 5.6 Idempotency
+
+- Every `GET` is idempotent and safe.
+- Every `POST` that creates something accepts an optional `idempotency_key` (up to 128
+  characters). A repeat within 24 hours returns the **original** response with `meta.replayed: true`
+  rather than creating a second thing. Keys live in the Laravel cache namespaced by the key
+  fingerprint — PHP has no long-lived process memory to hold them (§15).
+- `PUT` and `DELETE` on an id are naturally idempotent; a `DELETE` of something already gone is
+  `ok: true` with `deleted: 0`, not a 404, so a retry loop terminates.
+
+### 5.7 Request shape
+
+`Content-Type: application/json` on every body-bearing call; `Accept: application/json` expected
+(and assumed — the plane never content-negotiates into HTML). Bodies are capped at **8 MiB**.
+Unknown top-level fields are **rejected**, not ignored — a typo'd `start_date` that silently means
+"no filter" is how someone imports a decade into one month.
+
+---
+
+## 6. Tiers, capabilities and negotiation
+
+### 6.1 Three tiers
+
+| Tier      | Server switch                   | What it is for                                                                                                                     |
+| --------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| **read**  | always on                       | everything that computes and returns                                                                                               |
+| **write** | `FIREFLY_MACHINE_ALLOW_WRITE=1` | changes the ledger: transactions, budget limits, accounts, rules, piggy-bank amounts, imports                                      |
+| **admin** | `FIREFLY_MACHINE_ALLOW_ADMIN=1` | can lose data or change the install: every delete, `data/destroy`, `data/purge`, users, configuration, key rotation, cron trigger |
+
+Admin is a separate switch and not "write plus". Write is "I intend to let a program edit my books
+this week"; admin is "I am doing surgery right now and I am watching". **The MCP is never given the
+admin tier** — mcp.mdx §9.5 does not expose an admin tool, this plane refuses an admin call that
+carries `X-Firefly-Client: mcp`, and the refusal has its own test. (The client header is advisory
+everywhere else — §16.4 — but a _refusal_ keyed on it is safe: lying about it can only take
+privilege away.)
+
+The switches live in the app's git-ignored `.env`, are read once per request from config, and are
+echoed in `/whoami` and `/capabilities`.
+
+### 6.2 The client's switch is separate
+
+The server's tier is necessary and not sufficient. `ffx` requires `--write` on the call (cli.mdx
+§7.1) and the MCP requires `FFMCP_ALLOW_WRITE=1` plus a per-call confirm (mcp.mdx §9.7). The plane
+does not know or care which client is calling — **it enforces its own half and trusts nothing.**
+
+### 6.3 `GET /capabilities` (LOCKED)
+
+One read route returns the machine-readable route table of _this build_:
+
+```jsonc
+{
+  "ok": true,
+  "data": {
+    "apiVersion": "v1",
+    "serverVersion": "6.4.2",
+    "tiers": { "read": true, "write": true, "admin": false },
+    "operatorResolved": true,
+    "routes": [
+      {
+        "path": "/accounts",
+        "methods": ["GET", "POST"],
+        "tier": { "GET": "read", "POST": "write" },
+        "status": { "GET": "live", "POST": "live" },
+        "summary": { "GET": "Accounts, with balances.", "POST": "Create an account." },
+      },
+      {
+        "path": "/accounts/{id}/reconcile/apply",
+        "methods": ["POST"],
+        "tier": { "POST": "write" },
+        "status": { "POST": "planned" },
+        "summary": { "POST": "Write the reconciliation. NOT IMPLEMENTED YET (phase P8)." },
+      },
+    ],
+    "limits": { "maxLimit": 5000, "maxChangesDefault": 200, "maxBodyBytes": 8388608 },
+    "features": ["analytics", "charts", "ingest.prepared", "ingest.raw", "undo", "mirror", "search"],
+  },
+}
+```
+
+A CLI that wants `/analytics/runway` checks `features`, and if it is absent it says _"this server
+build does not have the analytics plane — update it"_ rather than a 404 the operator has to decode.
+
+**The table is generated from the same array the router is built from.** `routes/machine.php` walks
+`RouteTable::all()` to register routes; `/capabilities` walks the same array to describe them. A
+route present in one and missing in the other is impossible by construction, and a test walks every
+published entry and asserts it answers rather than falling through to the terminal 404.
+
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/RouteTable.php` — `RouteTable::all()`, `RouteTable::capabilities()`
+Code: `~/BGit/Bryan_git/firefly-iii/routes/machine.php` — the loop over `RouteTable::all()`
+
+### 6.3a `status` — `live` and `planned` (LOCKED)
+
+Every route publishes `status`. `live` means implemented. **`planned` means mounted, tiered and
+gated, with a handler that refuses `not_ready` naming the phase that will build it.**
+
+Planned routes exist because the gate ladder is the part most worth testing and least likely to
+change, and gates 4 and 6 cannot be integration-tested through a real route until a phase has one.
+Declaring `/accounts/{id}/reconcile/apply` as planned means the write-tier refusal is exercised end
+to end — through the real router, the real middleware and the real envelope — from P0 rather than
+from P8. `status` is published so this cannot mislead: a client reading the table sees `planned`
+and does not believe it works.
+
+---
+
+## 7. The write protocol
+
+### 7.1 The three switches and the token (LOCKED)
+
+Four things must be true before one transaction changes:
+
+1. `FIREFLY_MACHINE_ALLOW_WRITE=1` on the server.
+2. The client's own switch (`--write`, or `FFMCP_ALLOW_WRITE=1`).
+3. `dry_run: false` in the call.
+4. `confirm_token` echoing the token the matching plan (or the route's own dry run) returned.
+
+Plus a ceiling: `max_changes`, default **200**, and a refusal over it **reports the real count**, so
+the operator learns the size rather than being told "too many".
+
+### 7.2 `dry_run` is the default, and the preview is the write (R4)
+
+Every write route accepts `dry_run`, and **it defaults to `true`**. A call with no `dry_run` changes
+nothing and returns what it would have done.
+
+**The preview is produced by the same code path as the write.** `DryRun::run()` opens a database
+transaction, calls the exact service method the real write calls — `TransactionGroupFactory::create()`
+with `error_if_duplicate_hash: true`, `RuleEngine::fire()`, `BudgetLimitRepository::store()` —
+captures the result (created ids, the rule actions that fired, the duplicate verdicts, the resulting
+balances), and **rolls back**. Firefly's duplicate check, its rule engine, its running-balance
+recalculation and its primary-currency conversion all run for real, so the preview cannot disagree
+with the apply at the edges where a prediction would.
+
+Three side effects that do not live in the database must not escape a rollback, and the harness
+holds each of them:
+
+| Side effect                                   | How the dry run holds it                                                                          |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| **Webhooks** (`fire_webhooks`)                | forced `false` for the call, and the webhook dispatcher is swapped for a recorder                 |
+| **Queued jobs, mail, notifications**          | `Bus`, `Mail` and `Notification` are swapped for recorders for the duration; nothing is sent      |
+| **Attachment files, export files**            | routes that write files have no `dry_run: false` path through the harness; their preview is a stat |
+
+The preview reports what the recorders caught (`would_fire_webhooks: 2`), so the operator learns
+that a write has an outside effect before it has one. A test asserts that a dry run of every write
+route leaves the database byte-identical (a full-table hash), sends zero webhooks and zero mail,
+and queues zero jobs.
+
+**Rejected: a `predictChanges()` function.** A second implementation that guesses what the first
+will do disagrees with it exactly where it matters — a rule with a `stop processing` flag, a
+duplicate hash computed over a field the predictor forgot, a split whose amounts do not sum — and
+the disagreement surfaces as a plan that says 117 and an apply that does 131.
+
+The two routes that have **no** `dry_run`, and say so in their schema rather than accepting a flag
+they would ignore: `POST /undo` (the preview is the thing itself; its plan is `GET /undo/last`) and
+`POST /recurrences/{id}/trigger` (Firefly's trigger creates the next occurrence and its preview is
+`GET /recurrences/{id}` showing the next date).
+
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/DryRun.php` — `DryRun::run(callable $write): DryRunResult`, `holdSideEffects()`
+
+### 7.3 The confirm token
+
+A dry run returns:
+
+```jsonc
+{
+  "ok": true,
+  "data": {
+    "dry_run": true,
+    "changes": { "created": 117, "updated": 12, "unchanged": 1742, "duplicates": 3 },
+    "would_fire_webhooks": 0,
+    "confirm_token": "cf_01J8…",          // opaque, 128 bits from random_bytes
+    "expires_at": "2026-09-21T19:11:02Z", // 10 minutes
+    "fingerprint": "sha256:7ab3…",        // of the exact change set
+  },
+}
+```
+
+The real call passes `dry_run: false` and that token.
+
+- **Ten-minute expiry**, then `conflict` with the hint to re-plan.
+- **The change set is recomputed at apply time and compared against `fingerprint`.** If the world
+  moved — someone categorised a transaction in the browser, a recurring transaction fired from cron —
+  the token is refused with `conflict` and the _new_ counts, so nobody applies an hour-old plan
+  against a changed ledger.
+- **Stored in the Laravel cache, not process memory.** PHP workers share nothing between requests,
+  so a token is a cache entry `machine:confirm:{keyFingerprint}:{token}` with a 10-minute TTL,
+  holding the fingerprint, the route and a hash of the arguments. It is single-use (deleted on
+  apply), bound to the route and arguments it was minted for, and namespaced by the machine key —
+  so a key rotation invalidates every outstanding token at once.
+- A model cannot invent it. That is the mechanism: the write path _requires having read the
+  preview_, and no amount of confident guessing substitutes.
+
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Confirm/ConfirmTokens.php` — `mint()`, `redeem()`, `fingerprintOf()`
+
+### 7.4 Batch
+
+`POST /batch` takes an ordered list of write operations and runs them inside **one** database
+transaction, with Firefly's batch-submission flag set so the per-journal rule and running-balance
+listeners run once at the end (the same thing `POST /api/v1/batch/finish` exists to trigger) — the
+difference between setting 60 budget limits in 400 ms and in 30 s.
+
+```jsonc
+{
+  "dry_run": true,
+  "max_changes": 200,
+  "operations": [
+    { "op": "budget_limit.set", "budget_id": "3", "start": "2026-10-01", "end": "2026-10-31", "currency_code": "USD", "amount": "450.00" },
+    { "op": "budget_limit.set", "budget_id": "7", "start": "2026-10-01", "end": "2026-10-31", "currency_code": "USD", "amount": "120.00" },
+  ],
+}
+```
+
+- One `confirm_token` for the whole batch.
+- **All or nothing.** A failure rolls the batch back and reports the index that failed and why.
+- `op` names come from a closed set published in `/capabilities`.
+- The ceiling counts _changes_, not operations.
+
+### 7.5 Undo — the plane keeps its own (LOCKED)
+
+**Firefly III has no undo stack.** The browser's actions are final the moment they are submitted, and
+upstream has no equivalent of an application-wide `Ctrl-Z`. An agent that can write must still be an
+agent that can be un-written, so the plane records enough about **its own** writes to reverse them.
+
+- Every successful plane write appends one row to `machine_operations`, **inside the same database
+  transaction as the write**: the route, the operation id, the created ids, and a **before-image**
+  (the transformer output of every row it updated or soft-deleted, as it was before).
+- `GET /undo/last` is the preview: what the last plane operation did, and what undoing it would do.
+- `POST /undo` reverses the **most recent plane operation** — deleting what it created, restoring
+  the before-images of what it updated, and `restore()`-ing what it soft-deleted (transaction
+  groups, journals and accounts use `SoftDeletes`).
+- **It refuses rather than clobbers.** If any row the operation touched has an `updated_at` newer
+  than the operation — the operator edited it in the browser since — undo returns `conflict`
+  naming the rows, and changes nothing. Undoing a program's write must never destroy a human's.
+- **It only reaches plane writes.** A change made in the browser is not in the log and cannot be
+  undone here; `GET /undo/last` says so plainly when the most recent change to a row was a human's.
+- Undo is a **write**-tier route with no `dry_run` (§7.2) and is built in the same phase as the first
+  write (P3), never "later".
+- `machine_operations` rows are pruned after 30 days. They contain financial data, and they live in
+  the database, which lives outside the repo (§3.3).
+
+Handles: recording and reversing plane writes.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Undo/OperationLog.php` — `record()`, `last()`, `reverse()`
+Code: `~/BGit/Bryan_git/firefly-iii/database/migrations/2026_09_21_000001_create_machine_operations_table.php`
+
+### 7.6 What writes never do
+
+- **Never delete without the admin tier.** Transaction groups, journals, accounts, budgets,
+  categories, rules, tags, piggy banks, subscriptions, attachments, webhooks — every destructive
+  delete is admin, and the MCP does not have it.
+- **Never write outside the ledger and the staging directory.** The only filesystem writes this
+  plane performs are under `{STATEMENTS_ROOT}/.firefly-staging/` (§11.3), `~/T/_firefly_iii/`
+  (logs, audit) and the attachment disk when an attachment is explicitly uploaded.
+- **Never invent a value.** No plug transaction to make a reconciliation balance (Firefly's own
+  reconciliation transaction is one visible row, created only when asked), no guessed category, no
+  rounded amount. A reported gap is recoverable; a fabricated ledger row is not.
+- **Never fire a webhook from a dry run** (§7.2).
+
+---
+
+## 8. The route catalogue
+
+Conventions for every table below:
+
+- **Tier** is `R` read · `W` write · `A` admin.
+- `{id}` accepts Firefly's numeric id. A **non-numeric** `{id}` path segment (URL-encoded) is
+  resolved as a **name** within the route's entity type, and body/query arguments accept `*_name`
+  beside `*_id` — exact match first, then case-insensitive — failing with `invalid_input` and the
+  candidates if it is ambiguous. Ids are the contract; names are a convenience, and the server,
+  never the client, does the resolving.
+- Every list route takes the universal arguments in §5.5.
+- **Engine** names the Firefly class the route calls (R1). Where upstream's `/api/v1` has the same
+  operation, the plane calls the same repository method its controller calls.
+
+### 8.0 The plane itself
+
+| Route               | M   | Tier | Arguments | Answers                                                                                                                  |
+| ------------------- | --- | ---- | --------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `/ping`             | GET | R    | —         | liveness, key fingerprint, write tier, server version                                                                    |
+| `/whoami`           | GET | R    | —         | operator email, administration id + name, primary currency, tiers, key fingerprint, statements root (configured or null) |
+| `/capabilities`     | GET | R    | —         | §6.3                                                                                                                     |
+| `/health`           | GET | R    | `probe`   | DB reachable and migrated? operator resolved? how many users/administrations exist? what to do next                      |
+| `/search/operators` | GET | R    | —         | the search operators `/search` accepts (§13)                                                                             |
+
+`/ping` versus `/health`: ping proves _the plane is mounted and the key is right_; health proves
+_the app can answer a question about a ledger_. A green `/up` with a 401 from ping is the most likely
+first-run failure and it has to be distinguishable.
+
+**`/ping`, `/whoami`, `/capabilities` and `/health` answer WITHOUT a resolved operator**, by design:
+their job is to report what is wrong, and a diagnostic route that needs the thing it is diagnosing is
+no diagnostic at all. `/health?probe=true` additionally opens the database and runs
+`firefly-iii:verify-database-connection`'s check, reporting a failure as `200` with the reason and
+the remediation, never as a thrown error.
+
+**`healthy` is deliberately narrow**: a reachable database with **no operator resolved** is not
+healthy for the purpose any caller has, and answering "ok" there is how a model concludes an empty
+result means no transactions rather than no ledger.
+
+### 8.1 Administrations
+
+| Route                    | M   | Tier  | Arguments | Notes                                                                                       |
+| ------------------------ | --- | ----- | --------- | ------------------------------------------------------------------------------------------- |
+| `/administrations`       | GET | R     | —         | the operator's administrations (`UserGroupRepository`), marking which one the plane is bound to |
+| `/administrations/{id}`  | GET | R     | —         | one, with member count and primary currency                                                 |
+| `/administrations/{id}`  | PUT | W     | `title`, `primary_currency_code` | rename, or change the primary currency (recalculates `pc_*` amounts — the response says how many) |
+
+**There is no route that switches the bound administration.** The binding is configuration
+(§4.9), so it cannot change under a caller mid-conversation. Switching which books a program is
+editing is an operator act in `.env`, echoed on every response.
+
+### 8.2 Accounts
+
+Firefly accounts are double-entry: **asset** (checking, savings, cash wallets), **liability**
+(loans, debts, mortgages, and credit cards as liabilities or asset-with-negative-balance, per the
+operator's choice), and the counterparties **expense** and **revenue** accounts — Firefly's
+equivalent of payees. Every route that lists accounts takes `type`.
+
+| Route                          | M      | Tier  | Arguments                                                                                                                                  |
+| ------------------------------ | ------ | ----- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/accounts`                    | GET    | R     | `type` (asset\|expense\|revenue\|liability\|cash\|all), `active` (true), `with_balances` (true), `as_of`, `search`                        |
+| `/accounts/{id}`               | GET    | R     | —                                                                                                                                          |
+| `/accounts/{id}/balance`       | GET    | R     | `as_of` — Firefly's running balance at the end of that day, per currency                                                                  |
+| `/accounts/{id}/properties`    | GET    | R     | — counts, first/last transaction date, IBAN last-4, opening balance, virtual balance, liability details                                   |
+| `/accounts/{id}/transactions`  | GET    | R     | `start`, `end`, `type`, `limit`, `offset`                                                                                                  |
+| `/accounts`                    | POST   | W     | `name`, `type`, `account_role`, `currency_code`, `opening_balance` (string), `opening_balance_date`, `iban`, `include_net_worth`, `idempotency_key`, `dry_run` |
+| `/accounts/batch`              | POST   | W     | `accounts[]`, `dry_run` — §12 uses this                                                                                                    |
+| `/accounts/{id}`               | PUT    | W     | `name`, `account_role`, `iban`, `notes`, `include_net_worth`, `order`, `dry_run`                                                            |
+| `/accounts/{id}/deactivate`    | POST   | W     | — (Firefly's "active: false" — hidden from the UI, history intact)                                                                        |
+| `/accounts/{id}/activate`      | POST   | W     | —                                                                                                                                          |
+| `/accounts/{id}/move`          | POST   | W     | `order`                                                                                                                                    |
+| `/accounts/{id}`               | DELETE | **A** | `move_transactions_to`, `confirm_token` — Firefly's delete can move history to another account; without it the history is deleted with it |
+
+**Reconciliation** — a composed route (R1's named exception), because upstream computes it in the
+web-only `Account\ReconcileController` and `Json\ReconcileController::overview()`, which `/api/v1`
+cannot reach:
+
+| Route                              | M    | Tier | Arguments                                                                          |
+| ---------------------------------- | ---- | ---- | ---------------------------------------------------------------------------------- |
+| `/accounts/{id}/reconcile/plan`    | POST | R    | `start`, `end`, `target_balance` (string), `journal_ids[]` (the rows the operator ticked; default: every uncleared row in range) |
+| `/accounts/{id}/reconcile/apply`   | POST | W    | `confirm_token`, `create_reconciliation` (true)                                    |
+| `/accounts/{id}/unreconcile/{journal_id}` | POST | W | — the UI's "unreconcile" on one journal                                          |
+
+`plan` returns Firefly's own start balance, end balance, the sum of the selected journals, the
+operator's figure, the signed difference, and a `confirm_token` — the numbers the UI's Reconcile
+screen shows, from the same code. `apply` does what the UI's submit does: marks the selected journals
+`reconciled` and, if the difference is non-zero and `create_reconciliation` is true, creates
+**Firefly's own reconciliation transaction** — one visible row of type `reconciliation`, never a plug
+hidden inside another row.
+
+Handles: reconciling an account against a statement balance.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Account/ReconcileController.php` — `reconcile()`, `submit()` (exist today; the plane calls the same repository methods `submit()` calls)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Json/ReconcileController.php` — `overview()` (exists today; the difference arithmetic `plan` reuses)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Controllers/AccountController.php` — `reconcilePlan()`, `reconcileApply()`
+
+### 8.3 Transactions
+
+Firefly's unit of entry is the **transaction group**: one or more **journals** (a split transaction
+is a group with several), each with a type (`withdrawal`, `deposit`, `transfer`, `opening balance`,
+`reconciliation`), a source and a destination account, an amount, and optional category, budget,
+tags, notes, bill, piggy bank and metadata. Amounts are **positive**; direction is the type (§14.1).
+
+| Route                                       | M      | Tier  | Arguments                                                                                                                                                                                                                                             |
+| ------------------------------------------- | ------ | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/transactions`                             | GET    | R     | `start`, `end`, `type`, `account_id` \| `account_ids[]`, `category_id`, `without_category`, `budget_id`, `without_budget`, `tag`, `without_tag`, `bill_id`, `min_amount`, `max_amount`, `currency_code`, `reconciled`, `search`, `limit`, `offset`, `order` |
+| `/transactions/{group_id}`                  | GET    | R     | — the group with every split                                                                                                                                                                                                                          |
+| `/transaction-journals/{journal_id}`        | GET    | R     | — one split, with its group id                                                                                                                                                                                                                        |
+| `/transactions/{group_id}/links`            | GET    | R     | — the journal links (Firefly's "relates to", "refunds", "reimburses"…)                                                                                                                                                                                |
+| `/transactions/export`                      | GET    | R     | same filters, `format=csv` — Firefly's own exporter (`ExportDataGenerator`)                                                                                                                                                                           |
+| `/transactions`                             | POST   | W     | `transactions[]` (the splits), `group_title`, `apply_rules` (true), `error_if_duplicate_hash` (**true, pinned** — §11.7), `idempotency_key`, `dry_run`                                                                                                |
+| `/transactions/{group_id}`                  | PUT    | W     | any field, `transactions[]` to re-split, `apply_rules` (false), `dry_run`                                                                                                                                                                             |
+| `/transactions/{group_id}/convert`          | POST   | W     | `to_type` (withdrawal\|deposit\|transfer), `source_id`, `destination_id`, `dry_run` — the UI's "convert"                                                                                                                                              |
+| `/transactions/{group_id}/clone`            | POST   | W     | `date`, `dry_run` — the UI's "clone"                                                                                                                                                                                                                  |
+| `/transactions/bulk`                        | POST   | W     | `journal_ids[]` \| `filter{}`, `set{ category_id?, budget_id?, tags_add[]?, tags_remove[]?, tags_replace[]? }`, `max_changes`, `dry_run` — the UI's bulk edit (`TransactionController@update` under `/api/v1/data/bulk`)                             |
+| `/transactions/categorize`                  | POST   | W     | `journal_ids[]` \| `filter{}`, `category_id` \| `category_name`, `max_changes`, `dry_run`                                                                                                                                                              |
+| `/transactions/set-budget`                  | POST   | W     | `journal_ids[]` \| `filter{}`, `budget_id` \| `null`, `max_changes`, `dry_run`                                                                                                                                                                         |
+| `/transaction-links`                        | POST   | W     | `link_type_id`, `inward_id`, `outward_id`, `notes`                                                                                                                                                                                                    |
+| `/transaction-links/{id}`                   | DELETE | W     | — (a link is metadata; the transactions survive)                                                                                                                                                                                                      |
+| `/transactions/{group_id}`                  | DELETE | **A** | `confirm_token`                                                                                                                                                                                                                                       |
+| `/transaction-journals/{journal_id}`        | DELETE | **A** | `confirm_token` — removes one split                                                                                                                                                                                                                   |
+| `/transactions/mass-delete`                 | POST   | **A** | `group_ids[]`, `confirm_token`                                                                                                                                                                                                                        |
+
+Notes that matter:
+
+- **`without_category: true` is a first-class filter**, not a client-side scan. "What have I not
+  categorised?" is the single commonest real question. `without_budget` and `without_tag` exist for
+  the same reason — upstream's insight routes (`insight/expense/no-category`, `no-budget`, `no-tag`)
+  prove the question is real.
+- **`filter{}` on a bulk write takes the same shape as the `GET` query.** One filter language, so
+  "show me these" and "change these" cannot select different sets. A bulk write with a `filter`
+  always dry-runs first by default and reports the exact count.
+- **`apply_rules` defaults true on create**, because that is what the UI and upstream's API do, and a
+  program adding a transaction should get the same categorisation a human would. It defaults
+  **false on update**, because re-running every rule on a row the operator is hand-editing is a side
+  effect nobody asked for.
+- **Splits go through `transactions[]` on the group**, never as separate groups. Firefly owns the
+  invariants — every split in a group shares a type, and a transfer's splits share accounts — and
+  its validators enforce them.
+- **Transfers are one row, not two.** A transfer is one journal with an asset source and an asset
+  destination. A caller that creates a withdrawal from checking and a deposit into savings has
+  created two unrelated transactions that double-count spending; the route's hint says so when both
+  counterparties are asset accounts.
+
+Handles: storing a transaction group with Firefly's validation, rules and duplicate check.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Api/V1/Controllers/Models/Transaction/StoreController.php` — `store()` (exists today; the reference for what the plane calls)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Factory/TransactionGroupFactory.php` — `create()` (exists today; the engine)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Controllers/TransactionController.php` — `store()`, `bulk()`, `convert()`
+
+### 8.4 Categories
+
+| Route                          | M      | Tier  | Arguments                                    |
+| ------------------------------ | ------ | ----- | -------------------------------------------- |
+| `/categories`                  | GET    | R     | `search`                                     |
+| `/categories/{id}`             | GET    | R     | `start`, `end` — with spent/earned in range, per currency |
+| `/categories/{id}/transactions`| GET    | R     | `start`, `end`, `limit`, `offset`            |
+| `/categories`                  | POST   | W     | `name`, `notes`, `dry_run`                   |
+| `/categories/{id}`             | PUT    | W     | `name`, `notes`, `dry_run`                   |
+| `/categories/merge`            | POST   | W     | `keep_id`, `merge_ids[]`, `dry_run` — re-points every journal, then removes the merged categories |
+| `/categories/{id}`             | DELETE | **A** | `confirm_token` — journals keep their amounts and lose the category |
+
+### 8.5 Budgets — limits, available money, and the budget period
+
+Firefly's budgeting is period-based: a **budget** is an envelope name; a **budget limit** is the
+amount allotted to it for one period in one currency; an **available budget** is the income the
+operator expects to hand out over a period; and an **auto-budget** can reset, roll over or adjust a
+limit each period. This is the family upstream's API exposes piecemeal and a budgeter uses every
+month, so it is the reason this spec has a composed "budget period" route.
+
+| Route                                    | M      | Tier  | Arguments                                                                                                                                  |
+| ---------------------------------------- | ------ | ----- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/budgets`                               | GET    | R     | `active` (true)                                                                                                                            |
+| `/budgets/{id}`                          | GET    | R     | `start`, `end` — with its limits and spent in range                                                                                       |
+| `/budgets/{id}/limits`                   | GET    | R     | `start`, `end`                                                                                                                             |
+| `/budget-period`                         | GET    | R     | `start`, `end` (default: the operator's current `viewRange` period) — **composed**: per budget, per currency: `limit` (**string or null**), `spent`, `left`, `auto_budget`; plus `available`, `budgeted_total`, `spent_total`, `left_to_spend` per currency — the numbers on the UI's Budgets page, from `BudgetController`'s own repositories |
+| `/budget-period/gaps`                    | GET    | R     | `start`, `end`, `min_spent` — budgets with spending and **no limit** in the period, and withdrawals with **no budget at all** (R3 made into a route) |
+| `/available-budgets`                     | GET    | R     | `start`, `end`                                                                                                                             |
+| `/budgets`                               | POST   | W     | `name`, `active`, `auto_budget_type` (none\|reset\|rollover\|adjusted), `auto_budget_amount`, `auto_budget_period`, `auto_budget_currency_code`, `dry_run` |
+| `/budgets/{id}`                          | PUT    | W     | same fields, `dry_run`                                                                                                                     |
+| `/budgets/{id}/limits`                   | PUT    | W     | `start`, `end`, `currency_code`, `amount` (string) — **set**, not add: creates or replaces the limit for exactly that period, `dry_run`    |
+| `/budgets/{id}/limits/{limit_id}`        | DELETE | W     | — removes one period's limit; the budget and its transactions are untouched. The response says the budget is now **unbudgeted** for that period, which is different from budgeted zero |
+| `/available-budgets`                     | PUT    | W     | `start`, `end`, `currency_code`, `amount`, `dry_run` — set the income-to-budget for a period                                              |
+| `/budget-period/copy-previous`           | POST   | W     | `start`, `end`, `budget_ids[]`, `dry_run` — every limit from the previous period of the same length into this one                          |
+| `/budget-period/set-average`             | POST   | W     | `start`, `end`, `periods` (3\|6\|12\|N), `budget_ids[]`, `dry_run` — each limit set to the average **spent** over the previous N periods     |
+| `/budget-period/reset`                   | POST   | W     | `start`, `end`, `budget_ids[]`, `dry_run` — removes every limit in the period (the whole period becomes unbudgeted, stated as such)          |
+| `/budgets/{id}`                          | DELETE | **A** | `confirm_token`                                                                                                                            |
+
+**`copy-previous`, `set-average` and `reset` are machine additions**, not UI buttons — the Firefly
+UI sets limits one budget at a time, and auto-budget covers the recurring case. They are here
+because "build next month's budget from the last six months" is the single commonest budgeting
+sentence, and without them a caller would compute averages itself (R1, §10). Each one is one call to
+`BudgetLimitRepository` per budget inside one transaction, previewed through the dry-run harness,
+and each says in its response how many budgets it would leave unbudgeted.
+
+**`limit: null` is never `"0"`.** A budget with no limit in the period is unbudgeted — "I have not
+decided" — and a limit of `"0.00"` is "I decided nothing". `/budget-period` returns both faithfully
+and counts them separately (`budgets_with_limit`, `budgets_without_limit`).
+
+Handles: the composed budget-period view.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Budget/IndexController.php` — `index()` (exists today; the UI page whose numbers `/budget-period` reproduces)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Repositories/Budget/OperationsRepositoryInterface.php` — `sumExpenses()` (exists today; the "spent" figure)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Controllers/BudgetController.php` — `period()`, `gaps()`, `copyPrevious()`, `setAverage()`
+
+### 8.6 Subscriptions, piggy banks, recurring transactions
+
+**Subscriptions** (called "bills" in older Firefly and still `bills` in the schema; upstream's API
+serves both `/bills` and `/subscriptions`)
+
+| Route                               | M      | Tier  | Arguments                                                                                 |
+| ----------------------------------- | ------ | ----- | ----------------------------------------------------------------------------------------- |
+| `/subscriptions`                    | GET    | R     | `start`, `end` — each with `amount_min`, `amount_max`, `repeat_freq`, `paid_dates`, `pay_dates`, `next_expected_match` |
+| `/subscriptions/{id}`               | GET    | R     | `start`, `end`                                                                            |
+| `/subscriptions/{id}/transactions`  | GET    | R     | `start`, `end`                                                                            |
+| `/subscriptions/status`             | GET    | R     | `start`, `end` — paid, unpaid, and expected-but-not-seen for the period                   |
+| `/subscriptions`                    | POST   | W     | `name`, `amount_min`, `amount_max`, `date`, `repeat_freq`, `skip`, `currency_code`, `dry_run` |
+| `/subscriptions/{id}`               | PUT    | W     | same, `active`, `dry_run`                                                                 |
+| `/subscriptions/{id}`               | DELETE | **A** | `confirm_token`                                                                           |
+
+**Piggy banks** — savings goals attached to asset accounts
+
+| Route                               | M      | Tier  | Arguments                                                               |
+| ----------------------------------- | ------ | ----- | ----------------------------------------------------------------------- |
+| `/piggy-banks`                      | GET    | R     | — each with `target_amount`, `current_amount`, `left_to_save`, `target_date`, `save_per_month` |
+| `/piggy-banks/{id}`                 | GET    | R     | —                                                                       |
+| `/piggy-banks/{id}/events`          | GET    | R     | — every add/remove, with dates                                          |
+| `/piggy-banks`                      | POST   | W     | `name`, `accounts[]`, `target_amount`, `target_date`, `dry_run`         |
+| `/piggy-banks/{id}`                 | PUT    | W     | same, `dry_run`                                                         |
+| `/piggy-banks/{id}/add`             | POST   | W     | `account_id`, `amount` — the UI's "add money"; refuses beyond what the account can spare, with the figure |
+| `/piggy-banks/{id}/remove`          | POST   | W     | `account_id`, `amount`                                                  |
+| `/piggy-banks/{id}`                 | DELETE | **A** | `confirm_token`                                                         |
+
+**Recurring transactions**
+
+| Route                               | M      | Tier  | Arguments                                                               |
+| ----------------------------------- | ------ | ----- | ----------------------------------------------------------------------- |
+| `/recurrences`                      | GET    | R     | — each with its next occurrences                                        |
+| `/recurrences/{id}`                 | GET    | R     | `count` (5) — the next N dates                                          |
+| `/recurrences/{id}/transactions`    | GET    | R     | `start`, `end`                                                          |
+| `/recurrences`                      | POST   | W     | `recurrence` (Firefly's recurrence shape), `dry_run`                    |
+| `/recurrences/{id}`                 | PUT    | W     | `recurrence`, `dry_run`                                                 |
+| `/recurrences/{id}/trigger`         | POST   | W     | `date` — create the occurrence now (Firefly's `TriggerController`). No `dry_run` (§7.2) |
+| `/recurrences/{id}`                 | DELETE | **A** | `confirm_token`                                                         |
+
+### 8.7 Rules and rule groups — the categorisation engine
+
+Rules are why an import lands categorised. Firefly's rule engine is powerful (triggers over
+description, amount, account, date, tags, notes, and expression-language actions) and it already has
+a **test** endpoint — a real preview — which the plane uses as-is.
+
+| Route                           | M      | Tier  | Arguments                                                                                     |
+| ------------------------------- | ------ | ----- | --------------------------------------------------------------------------------------------- |
+| `/rule-groups`                  | GET    | R     | — with their rules, in execution order                                                        |
+| `/rules`                        | GET    | R     | `rule_group_id`, `search`, `trigger` (store-journal\|update-journal\|manual)                  |
+| `/rules/{id}`                   | GET    | R     | —                                                                                             |
+| `/rules/validate`               | POST   | R     | `rule` — validates triggers, actions and any expression (`ExpressionController`) without saving |
+| `/rules/preview`                | POST   | R     | `rule` (unsaved) \| `rule_id`, `start`, `end`, `account_ids[]`, `limit` — which existing journals it would match and what each action would change. Built on `TriggerController::testRule()` |
+| `/rule-groups/{id}/preview`     | POST   | R     | `start`, `end`, `account_ids[]` — the same for a whole group                                  |
+| `/rules`                        | POST   | W     | `rule`, `dry_run`                                                                             |
+| `/rules/{id}`                   | PUT    | W     | `rule`, `dry_run`                                                                             |
+| `/rules/{id}/move`              | POST   | W     | `order`, `rule_group_id`                                                                      |
+| `/rules/run`                    | POST   | W     | `rule_ids[]` \| `rule_group_id`, `start`, `end`, `account_ids[]`, `max_changes`, `dry_run` — Firefly's trigger endpoint, previewed through the harness |
+| `/rule-groups`                  | POST   | W     | `title`, `order`, `dry_run`                                                                   |
+| `/rule-groups/{id}`             | PUT    | W     | `title`, `order`, `active`, `dry_run`                                                         |
+| `/rules/{id}`                   | DELETE | **A** | `confirm_token`                                                                               |
+| `/rule-groups/{id}`             | DELETE | **A** | `move_rules_to`, `confirm_token`                                                              |
+
+`/rules/preview` is read-tier and is the route that makes rule authorship safe from a program: write
+the rule, see the 340 journals it would touch and what it would do to each, _then_ save it.
+
+Code: `~/BGit/Bryan_git/firefly-iii/app/Api/V1/Controllers/Models/Rule/TriggerController.php` — `testRule()`, `triggerRule()` (exist today; the preview and the run)
+Code: `~/BGit/Bryan_git/firefly-iii/app/TransactionRules/Engine/SearchRuleEngine.php` — the rule engine (exists today)
+
+### 8.8 Reference data
+
+**Tags** — `GET /tags` (R, `search`), `GET /tags/{tag}` (R, with spent/earned in range),
+`POST /tags` (W), `PUT /tags/{tag}` (W — rename is a rename, and every journal keeps it),
+`DELETE /tags/{tag}` (**A**).
+
+**Object groups** (the grouping for piggy banks and subscriptions) — `GET /object-groups` (R),
+`PUT /object-groups/{id}` (W), `DELETE /object-groups/{id}` (**A**).
+
+**Currencies and exchange rates** — `GET /currencies` (R, `enabled`), `GET /currencies/primary` (R),
+`POST /currencies/{code}/enable` · `/disable` (W), `GET /exchange-rates` (R, `from`, `to`, `start`,
+`end`), `POST /exchange-rates` (W, `from`, `to`, `date`, `rate` as a **string**),
+`DELETE /exchange-rates/{id}` (**A**). Changing the **primary** currency is on
+`PUT /administrations/{id}` (§8.1) because it recalculates every converted amount in the books.
+
+**Transaction link types** — `GET /link-types` (R), `POST /link-types` (W), `PUT` (W), `DELETE` (**A**).
+
+**Attachments** — `GET /attachments` (R, `attachable_type`, `attachable_id`), `GET /attachments/{id}`
+(R, metadata only), `GET /attachments/{id}/download` (R — streamed, the one read route whose body is
+not the envelope; it says so and sets `Content-Disposition`), `POST /attachments` (W, `attachable_type`,
+`attachable_id`, `filename`, then an upload), `DELETE /attachments/{id}` (**A**).
+
+**Preferences** — `GET /preferences` (R), `PUT /preferences/{name}` (W, allowlisted names only:
+`viewRange`, `listPageSize`, `language`, `locale`, `frontpageAccounts`, `fiscalYearStart`,
+`customFiscalYear`). 2FA, email and password preferences are never reachable (§9).
+
+### 8.9 Reports
+
+Firefly's six report types — default, audit, budget, category, tag, and "expense/revenue" (the
+`double` report) — are rendered by web controllers from `report-data/*` JSON endpoints and the
+`chart/report` family, none of which `/api/v1` exposes. The plane exposes the **numbers**; the HTML
+stays in the UI.
+
+| Route                  | M   | Tier | Arguments                                                    | Answers                                                             |
+| ---------------------- | --- | ---- | ------------------------------------------------------------ | ------------------------------------------------------------------- |
+| `/reports/default`     | GET | R    | `account_ids[]`, `start`, `end`                              | income, expenses, per-account balance changes, budgets, categories  |
+| `/reports/audit`       | GET | R    | `account_ids[]`, `start`, `end`                              | every journal with the running balance after it — the reconciliation aid |
+| `/reports/budget`      | GET | R    | `account_ids[]`, `budget_ids[]`, `start`, `end`              | per budget per period: limit, spent, left                           |
+| `/reports/category`    | GET | R    | `account_ids[]`, `category_ids[]`, `start`, `end`            | spent and earned per category per period                            |
+| `/reports/tag`         | GET | R    | `account_ids[]`, `tags[]`, `start`, `end`                    | the same per tag                                                    |
+| `/reports/double`      | GET | R    | `account_ids[]`, `counterparty_ids[]`, `start`, `end`        | per expense/revenue account: in, out, net                           |
+
+Each calls the same `ReportGenerator` / `report-data` code the UI calls, and returns what it
+computed. These are the routes a "monthly report" sentence becomes.
+
+### 8.10 Webhooks (read-only surface)
+
+`GET /webhooks` (R), `GET /webhooks/{id}/messages` (R), `GET /webhooks/{id}/messages/{mid}/attempts`
+(R). Creating, editing, submitting and deleting webhooks is **admin**-tier: a webhook is an
+outbound network call carrying financial data to a URL, which makes creating one a data-egress
+decision, not a bookkeeping one.
+
+### 8.11 Admin
+
+| Route                      | M    | Tier  | Notes                                                                                             |
+| -------------------------- | ---- | ----- | ------------------------------------------------------------------------------------------------- |
+| `/admin/key/rotate`        | POST | **A** | mint a new machine key; response is the fingerprint only                                          |
+| `/admin/cron`              | POST | **A** | run Firefly's cron now (recurring transactions, auto-budgets, bill warnings) — `firefly-iii:cron` |
+| `/admin/correct-database`  | POST | **A** | `firefly-iii:correct-database` — the integrity repairs; the response lists what each corrector changed |
+| `/admin/data/destroy`      | POST | **A** | `objects` (Firefly's `data/destroy` list), `confirm_token`                                        |
+| `/admin/data/purge`        | POST | **A** | permanently removes soft-deleted rows — **after which `/undo` of those rows is impossible**, and the response says so |
+| `/admin/users`             | GET  | **A** | the install's users (for choosing `FIREFLY_MACHINE_OPERATOR`)                                    |
+| `/admin/configuration`     | GET  | **A** | the install's dynamic configuration values                                                        |
+
+Every `DELETE` in this spec is admin-tier and is listed with its family rather than here, because a
+caller looks for "how do I delete a tag" under tags.
+
+### 8.12 The mirror — upstream's reads, on day one
+
+`GET /machine/v1/mirror/{path}` answers **any `GET` under upstream's `/api/v1`** — the 150-odd read
+routes, including every `insight/*`, `chart/*`, `autocomplete/*`, `search/*` and `summary/*` —
+executed **in-process** as the bound operator, and wrapped in the plane's envelope.
+
+- **Reads only, forever.** A non-`GET` method is `forbidden`. Writes go through typed routes with dry
+  runs, because a passthrough write would bypass §7 entirely.
+- **In-process, not a loopback HTTP call.** The mirror builds an internal sub-request for
+  `/api/v1/{path}`, binds the operator on the `api` guard with `setUser()`, and dispatches it through
+  the kernel — so it passes upstream's own validators and transformers, and never needs a Passport
+  token to exist.
+- **A denylist, by path:** `about/user` is served (it is the operator), but `users/*`,
+  `configuration/*`, `cron/*` and `data/export/*` are `forbidden` with the hint naming the typed
+  route. A test walks upstream's route list and asserts every `GET` is either mirrored or denied by
+  name — so an upstream release that adds a route is a test failure, not a silent new surface.
+- **The mirror is a coverage floor, not the interface.** Its responses are upstream's JSON:API shape
+  (`data[].attributes`), flattened one level; it has no `without_category` filter, no dry run, no
+  provenance. Typed routes replace mirrored ones family by family, and `/capabilities` says which
+  is which.
+
+Handles: the read-only passthrough to upstream's API.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Controllers/MirrorController.php` — `mirror()`, `const DENIED_PREFIXES`
+Code: `~/BGit/Bryan_git/firefly-iii/routes/api.php` — upstream's route table (exists today; the source the parity test walks)
+
+---
+
+## 9. Coverage — every UI action, and the route that carries it
+
+This is the matrix the Goal is measured against, organised by where the action lives in the web UI
+so it can be walked screen by screen.
+
+| UI screen / action                                          | Route                                                         | Status               |
+| ----------------------------------------------------------- | ------------------------------------------------------------- | -------------------- |
+| **Dashboard** — the boxes (balance, bills, left to spend, net worth) | `GET /analytics/summary`                              | ✅ (§10)             |
+| Dashboard — account charts, budget and category charts      | `GET /charts/*`                                               | ✅ (§10.5)           |
+| **Accounts** — list by type, with balances                  | `GET /accounts`                                               | ✅                   |
+| Accounts — create asset / liability account                 | `POST /accounts`                                              | ✅                   |
+| Accounts — edit, reorder                                    | `PUT /accounts/{id}`, `/move`                                 | ✅                   |
+| Accounts — deactivate / reactivate                          | `POST /accounts/{id}/deactivate` · `/activate`                | ✅                   |
+| Accounts — delete (and move history)                        | `DELETE /accounts/{id}` (admin)                               | ✅                   |
+| Account page — the transaction list for a period            | `GET /accounts/{id}/transactions`                             | ✅                   |
+| Account page — **Reconcile**                                | `/accounts/{id}/reconcile/plan` + `/apply`                    | ✅ (composed, §8.2)  |
+| Transaction — unreconcile                                   | `POST /accounts/{id}/unreconcile/{journal_id}`                | ✅                   |
+| **Transactions** — list, filter, search                     | `GET /transactions`, `GET /search`                            | ✅                   |
+| Transactions — create withdrawal / deposit / transfer       | `POST /transactions`                                          | ✅                   |
+| Transactions — edit, including splits                       | `PUT /transactions/{id}`                                      | ✅                   |
+| Transactions — convert type                                 | `POST /transactions/{id}/convert`                             | ✅                   |
+| Transactions — clone                                        | `POST /transactions/{id}/clone`                               | ✅                   |
+| Transactions — link to another transaction                  | `POST /transaction-links`                                     | ✅                   |
+| Transactions — mass edit / bulk edit                        | `POST /transactions/bulk`                                     | ✅                   |
+| Transactions — mass delete                                  | `POST /transactions/mass-delete` (admin)                      | ✅                   |
+| Transactions — attach a file                                | `POST /attachments`                                           | ✅                   |
+| **Budgets** — the budget page for a period                  | `GET /budget-period`                                          | ✅ (composed, §8.5)  |
+| Budgets — set a budget's amount for the period              | `PUT /budgets/{id}/limits`                                    | ✅                   |
+| Budgets — set available (income to budget)                  | `PUT /available-budgets`                                      | ✅                   |
+| Budgets — create / edit / auto-budget / reorder / disable   | `/budgets` family                                             | ✅                   |
+| Budgets — transactions without a budget                     | `GET /transactions?without_budget=true`                       | ✅                   |
+| **Categories** — create / edit / delete, spent per period   | `/categories` family                                          | ✅                   |
+| **Tags** — create / rename / delete, tag cloud              | `/tags` family                                                | ✅                   |
+| **Subscriptions** — create / edit / paid-unpaid status      | `/subscriptions` family                                       | ✅                   |
+| **Piggy banks** — create / edit / add money / remove money  | `/piggy-banks` family                                         | ✅                   |
+| **Recurring transactions** — create / edit / trigger now    | `/recurrences` family                                         | ✅                   |
+| **Rules** — create / edit / reorder / test / run            | `/rules`, `/rule-groups`, incl. `/rules/preview`              | ✅                   |
+| **Reports** — default, audit, budget, category, tag, double | `/reports/*`                                                  | ✅ (§8.9)            |
+| **Search** — the search bar with operators                  | `GET /search`                                                 | ✅ (§13)             |
+| **Currencies** — enable / disable / primary                 | `/currencies`, `PUT /administrations/{id}`                    | ✅                   |
+| **Exchange rates** — list / add                             | `/exchange-rates`                                             | ✅                   |
+| **Object groups**                                           | `/object-groups`                                              | ✅                   |
+| **Export** — CSV of transactions                            | `GET /transactions/export`                                    | ✅                   |
+| **Preferences** — view range, page size, locale, fiscal year| `PUT /preferences/{name}`                                     | ✅                   |
+| **Administrations** — view, rename                          | `/administrations`                                            | ✅                   |
+| Administrations — switch which one I am in                  | —                                                             | ⛔ deliberate        |
+| **Webhooks** — view messages and attempts                   | `GET /webhooks` family                                        | ✅                   |
+| Webhooks — create / edit / delete                           | `/webhooks` family (admin)                                    | ✅ (admin)           |
+| **Profile** — password, email, 2FA, OAuth clients and tokens| —                                                             | ⛔ deliberate        |
+| **System** — users, configuration, cron                     | `/admin/*`                                                    | ✅ (admin)           |
+| **Data Importer** (separate app)                            | `/ingest/*`                                                   | ✅ (§11)             |
+| Anywhere — "undo what I just did"                           | `POST /undo` — plane writes only                              | ✅ (§7.5)            |
+
+**The deliberate omissions**, stated as decisions rather than gaps:
+
+1. **Switching administrations** — the bound administration is configuration (§4.9); changing which
+   books a program edits is an operator act, not an API call.
+2. **Password, email, 2FA, OAuth clients and Personal Access Tokens** — credentials for humans and
+   for upstream's clients. A program that can mint an OAuth token has escaped this plane's
+   loopback-only guarantee, and a program that can change the password can lock the operator out.
+3. **Registering users and inviting members** — identity is a human act.
+4. **Undoing a browser action** — Firefly keeps no record that would make it possible (§7.5).
+
+Every other cell is a route, and a new UI feature upstream that this table cannot absorb is a
+change to this spec before it is a change to any client.
+
+---
+
+## 10. The analytics and charting plane
+
+### 10.1 Why it exists (LOCKED)
+
+Upstream computes much of its analysis in PHP already — the `insight/*` routes, `summary/basic`,
+the `chart/*` routes — which is more than most finance apps give an API. What it does not give is a
+single, consistent contract: some routes take `start`/`end`, some take a `period`; some return
+per-currency arrays, some return primary-currency sums; none report what they excluded. And the
+questions an operator most often asks — "where is my money going", "how long could I last", "what
+subscriptions do I have that I did not tell you about" — have no route at all.
+
+The thin-client rule says a client never sums. So the sums live here, once. Three consequences, all
+intended:
+
+- The CLI, the MCP and the browser agree on a total because there is one implementation.
+- A model never does arithmetic on money. It asks a question and repeats an answer. This is the
+  single highest-value safety property in the whole stack.
+- A ten-year aggregate is one HTTP call returning 120 rows, not 12,007 rows the caller must reduce.
+
+### 10.2 The analytics routes
+
+All read-tier. All take `start` and `end` (`YYYY-MM-DD`, inclusive), and optional `account_ids[]`,
+`category_ids[]`, `budget_ids[]`, `tags[]`, `currency_code`, `include_transfers` (false).
+
+| Route                              | Extra arguments                                                    | Answers                                                                         | Built on (upstream, exists today)            |
+| ---------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------- | -------------------------------------------- |
+| `/analytics/summary`               | —                                                                  | the dashboard boxes: balance, bills paid/unpaid, left to spend, net worth       | `Summary\BasicController::basic()`           |
+| `/analytics/spending-by-category`  | `interval` (month\|quarter\|year\|none), `top_n`                   | spent per category per interval, plus "no category"                            | `Insight\Expense\CategoryController`         |
+| `/analytics/spending-by-budget`    | `interval`, `top_n`                                                | spent per budget, plus "no budget"                                             | `Insight\Expense\BudgetController`           |
+| `/analytics/spending-by-tag`       | `interval`, `top_n`                                                | spent per tag, plus "no tag"                                                   | `Insight\Expense\TagController`              |
+| `/analytics/payee-leaderboard`     | `top_n` (20), `direction` (out\|in)                                | per expense (or revenue) account — who got the money                           | `Insight\Expense\AccountController::expense()` |
+| `/analytics/income-vs-expense`     | `interval`                                                         | in, out, net, per interval                                                     | `Insight\*\PeriodController::total()`        |
+| `/analytics/cash-flow`             | `interval`                                                         | opening, in, out, closing, per interval, over asset accounts                   | account balances + `PeriodController`        |
+| `/analytics/net-worth`             | `interval`                                                         | assets, liabilities, net, per interval and per account (`include_net_worth` honoured) | `Chart\BalanceController`, `NetWorth` helper |
+| `/analytics/category-trend`        | `category_id`, `interval`                                          | one category over time, with mean and median                                   | category insight per interval                |
+| `/analytics/budget-performance`    | `budget_ids[]`                                                     | limit vs spent vs left per budget per period, and the variance                 | `/budget-period` per period                  |
+| `/analytics/subscriptions`         | —                                                                  | per subscription: expected, paid, missed, annualised cost                      | `BillRepository`                             |
+| `/analytics/recurring`             | `min_occurrences` (3), `tolerance_days` (3)                        | detected recurring payments **not yet** a subscription, with evidence          | **new** — journals grouped by counterparty + amount band |
+| `/analytics/runway`                | `basis` (3\|6\|12 months)                                          | liquid asset balance ÷ trailing average outflow, in months                      | **new**, from the two figures above           |
+| `/analytics/uncategorized-summary` | —                                                                  | count and total of uncategorised withdrawals, by account and by month          | `insight/expense/no-category` per interval   |
+| `/analytics/anomalies`             | `z` ("2.0"), `min_amount`                                          | categories and payees unusually far from their own trailing norm               | **new**, over the trend routes               |
+| `/analytics/piggy-progress`        | —                                                                  | per piggy bank: saved, target, left, on-track for its target date              | `PiggyBankRepository`                        |
+
+### 10.3 The rules these obey
+
+- **Every figure is a decimal string with a currency code, and the answer is per currency.** A
+  Firefly install routinely has two or three currencies; a sum across them is meaningless. Every
+  analytics response is keyed by `currency_code`. A **primary-currency** total is included only when
+  Firefly itself has converted every contributing row (`pc_amount` present), and it is labelled
+  `converted_to` with the primary currency — never silently mixed in.
+- **No percentages as floats.** A share is returned as its two strings (`amount` and `total`), and
+  the _presentation layer_ divides. A ratio like runway is returned as a decimal string with the
+  numerator and denominator beside it.
+- **Transfers are excluded by default.** Counting a transfer from checking to savings as spending is
+  the classic way a finance tool doubles someone's expenses. In Firefly a transfer is its own type,
+  so excluding it is exact rather than heuristic; `include_transfers: true` exists, and the response
+  echoes which it did.
+- **Opening balances and reconciliation transactions are never spending.** They are excluded from
+  every spending figure by type, and the response says so.
+- **Every response carries its own provenance**: the resolved date range, the account ids actually
+  included, the filters applied, the currencies found, and the row count. A number that cannot say
+  what it counted is a number nobody should paste into a decision.
+- **`/analytics/recurring` and `/analytics/anomalies` are detectors, not oracles**, and say so in
+  their response: each item carries its evidence (the occurrences, the trailing mean, the deviation)
+  so the caller can show its work.
+- The three **new** routes are implemented in PHP with `bcmath` over Firefly's repositories, in
+  `app/Machine/Analytics/`, and a fix upstream to an insight route is inherited by every route built
+  on it.
+
+### 10.4 Why this family is where the fork grows
+
+The operator's stated direction for this fork is **more APIs, MCP support, and eventually more
+charting** than upstream ships. The analytics routes are the data layer for all three: an MCP tool
+answers from them, a CLI verb prints them, and a chart draws them. Growing the fork's charting means
+growing this family first and drawing second — a chart whose numbers do not come from a route here is
+a chart that can disagree with the terminal.
+
+### 10.5 The chart routes — chart-ready series
+
+Upstream has two chart surfaces: `/api/v1/chart/{account,balance,budget,category}` (API) and a much
+larger `/chart/*` family of web-only JSON endpoints (`chart/account`, `chart/bill`, `chart/budget`,
+`chart/category`, `chart/double`, `chart/piggy-bank`, `chart/report`, `chart/tag`,
+`chart/transactions`) that feed the UI's Chart.js canvases. The plane exposes **chart-ready series**
+built on both, in one shape:
+
+```jsonc
+{
+  "ok": true,
+  "data": {
+    "chart": "spending-by-category",
+    "x": { "kind": "period", "labels": ["2026-07", "2026-08", "2026-09"] },
+    "series": [
+      { "key": "groceries", "label": "Groceries", "currency_code": "USD", "values": ["612.40", "588.10", "641.95"] },
+      { "key": "dining",    "label": "Dining",    "currency_code": "USD", "values": ["210.00", null, "184.20"] }
+    ],
+    "provenance": { "start": "2026-07-01", "end": "2026-09-30", "accounts": [1, 2], "transfers": "excluded" }
+  }
+}
+```
+
+- **`values` are decimal strings, and `null` is "no data", never `"0"`** (R3) — a month with no
+  dining transactions is a gap in the line, not a dip to zero, and the chart must be able to draw it
+  that way.
+- One route per chart the UI draws (`/charts/account-balances`, `/charts/net-worth`,
+  `/charts/budget-overview`, `/charts/category-overview`, `/charts/spending-by-category`,
+  `/charts/income-vs-expense`, `/charts/piggy-bank/{id}`, `/charts/subscription/{id}`,
+  `/charts/tag-overview`), plus a generic `/charts/series` that turns any §10.2 analytics route into
+  this shape (`source=/analytics/cash-flow&interval=month`).
+- **Rendering is not the plane's job.** It returns series; the CLI can print a sparkline, the MCP
+  hands the series to a model or an artifact, and the web UI keeps its own canvases. The shape is
+  deliberately neutral so the same series can feed Chart.js, a terminal, or a document.
+- New charting work in this fork lands **here first**, as a route with a test and a hand-computed
+  fixture, before any client draws it.
+
+Code: `~/BGit/Bryan_git/firefly-iii/app/Api/V1/Controllers/Chart/` — `AccountController`, `BalanceController`, `BudgetController`, `CategoryController` (exist today)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Chart/` — the web-only chart controllers (exist today; the plane reuses their generators, never their views)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Controllers/ChartController.php` — `series()`, one method per chart
+
+---
+
+## 11. The ingest plane — statements into the ledger
+
+The flagship. cli.mdx §10 describes the operator-facing pipeline; **this section is the engine
+behind it.**
+
+### 11.0 Firefly already has an importer — and why this is not it
+
+Upstream's answer to importing is the **Firefly III Data Importer** — a separate application
+(`firefly-iii/data-importer`) that reads CSV, camt.053, GoCardless, SimpleFIN and Spectre, and posts
+to `/api/v1/transactions` with a Personal Access Token. It is good at what it does. We do not fork
+it, wrap it, or run it, for three reasons:
+
+1. **It is a second app to install and a human OAuth grant to give it**, which is the exact
+   credential story §4.1 rejects.
+2. **It has no dry run against the ledger.** It can preview how it parsed a file; it cannot preview
+   what Firefly's duplicate check and rule engine will do to each row, because that only happens on
+   `store`. This plane can, because the dry run _is_ the store, rolled back (§7.2).
+3. **It knows files, not archives.** A decade of statements across entities, institutions and
+   accounts, with the same month scanned twice, needs statement-level de-duplication before a row
+   ever reaches Firefly (§11.5). That is this plane's job.
+
+What we **do** take from it is its lesson: send every row with `error_if_duplicate_hash: true`, and
+make the payload deterministic so the hash means something (§11.6).
+
+### 11.1 Two modes, because two kinds of tree exist
+
+| Mode           | Input                                                                                                              | What we do                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| **`prepared`** | a tree that already holds importable files (`.ofx` / `.qfx` / `.csv` / camt.053 `.xml`) and a manifest describing them | read the manifest, parse each file into canonical rows, store             |
+| **`raw`**      | a tree of statement PDFs and text sidecars                                                                          | extract → normalise → de-duplicate → stage → store (cli.mdx §10)          |
+
+**`prepared` is the primary mode and is built first**, because a real archive is usually already
+prepared, and re-extracting from PDF what an OFX `FITID` already carries is strictly worse — the
+bank's own id is the best dedupe key that will ever exist for that row. `raw` is for the statements
+that only ever existed as paper.
+
+A prepared tree is _not ours_. It was produced by whatever pipeline the operator ran, it is audit
+evidence, and this plane treats it as **strictly read-only** — it never writes into it, never moves
+a file in it, and never rewrites its manifest. §11.3's staging directory is the only place it writes.
+
+### 11.2 The manifest
+
+A prepared tree describes itself with a manifest — a CSV (or JSON) with one row per account. The
+route cares about these columns, and reports any it could not find rather than guessing:
+
+| Column                                        | Required | Meaning                                                            |
+| --------------------------------------------- | -------- | ------------------------------------------------------------------ |
+| `entity`                                      | ✅       | the legal person or company the account belongs to                 |
+| `institution`                                 | ✅       | the bank                                                           |
+| `label`                                       | ✅       | the account's name in the archive                                  |
+| `last4`                                       | ✅       | the account number's last four digits                              |
+| `kind`                                        | ✅       | `checking` · `savings` · `card` · `brokerage` · `loan` · `mortgage` |
+| `currency`                                    | —        | ISO code; defaults to the administration's primary currency, and says so |
+| `path`                                        | ✅       | the account's directory, relative to the tree root                 |
+| `transactions`, `statements`, `first`, `last` | —        | counts and coverage, used for the plan's preview                   |
+| `reconciled`, `recon_na`                      | —        | how many statements balanced; surfaced as a warning                |
+
+```jsonc
+// GET /ingest/manifest?root=…   (read)
+{
+  "ok": true,
+  "data": {
+    "root": "{STATEMENTS_ROOT}",
+    "manifest_path": "import/accounts.csv",
+    "mode": "prepared",
+    "accounts": [
+      {
+        "entity": "household", "institution": "Northbank", "label": "Checking_x4021", "last4": "4021",
+        "kind": "checking", "currency": "USD", "path": "bank/household/Northbank/Checking_x4021",
+        "statements": 21, "transactions": 368, "first": "2024-10", "last": "2026-06",
+        "files": { "combined": "Checking_x4021_ALL.ofx", "monthly": 21, "formats": ["ofx", "csv"] },
+        "warnings": []
+      }
+    ],
+    "totals": { "accounts": 27, "transactions": 12007, "unreconciled": 12 }
+  }
+}
+```
+
+**Conflict rule (LOCKED).** If the archive already has a directory named `import/` (a real archive
+often does, and it means something else), the staging directory **must not** be `{ROOT}/import/`.
+The default staging path is **`{ROOT}/.firefly-staging/`**, and the route refuses to stage into any
+directory holding files it did not write, returning `conflict` naming both paths. Losing somebody's
+audit evidence to a name collision is not a bug we are willing to have once.
+
+### 11.3 The staging directory
+
+```
+{ROOT}/.firefly-staging/
+├── _manifest.csv     one row per source file ever seen
+├── _rows.csv         every de-duplicated row, across every account
+├── _dupes.csv        what was collapsed, and the rule that collapsed it
+├── _conflicts.csv    the cases that block an apply
+├── _run.log          append-only: run id, timestamp, counts, outcome
+└── {ENTITY}/{INSTITUTION}/{ACCOUNT}/{YYYY}-{MM}.csv
+```
+
+- **Rebuildable at any time.** Deleting it loses nothing but time; nothing downstream treats it as a
+  system of record.
+- **Atomic per file** (temp + rename), so an interrupted run never leaves a half-written CSV.
+- **Gets a `.gitignore` containing `*` on first write**, because the statements tree is usually
+  itself a git repo and these are derived files full of real financial data.
+- **Separate from Firefly's own staging and a sibling app's.** `actual_budget_bryan` stages into
+  `{ROOT}/.actual-staging/`; the two never share a directory, so running both apps against one
+  archive cannot cross-contaminate.
+- In `prepared` mode the staging directory holds only the run log and the plan — the importable
+  files are already the operator's, and we do not copy them.
+
+### 11.4 The routes
+
+| Route                    | M    | Tier | Arguments                                                            |
+| ------------------------ | ---- | ---- | -------------------------------------------------------------------- |
+| `/ingest/roots`          | GET  | R    | — configured statement roots and whether each is readable            |
+| `/ingest/manifest`       | GET  | R    | `root`, `manifest_path`                                              |
+| `/ingest/scan`           | POST | R    | `root`, `mode`, `entity`, `institution`, `account`, `year`           |
+| `/ingest/coverage`       | GET  | R    | `root`, `account` — which account-months are present and missing     |
+| `/ingest/map`            | GET  | R    | `root` — the current statements→Firefly-account map                  |
+| `/ingest/map`            | PUT  | W    | `root`, `map` — written beside the statements, never in the repo     |
+| `/ingest/map/infer`      | POST | R    | `root`, `strategy` — propose a mapping (by IBAN last-4, then name); never saves it |
+| `/ingest/accounts/plan`  | POST | R    | `root`, `naming`, `liability_kinds[]` — §12                          |
+| `/ingest/accounts/apply` | POST | W    | `confirm_token`, `dry_run`                                           |
+| `/ingest/extract`        | POST | R\*  | `root`, `force` — **raw mode only**; writes to staging only          |
+| `/ingest/dupes`          | GET  | R    | `root` — what both de-dupe layers collapsed, and why                 |
+| `/ingest/prefer`         | POST | R\*  | `root`, `path` — the operator's answer to a statement `conflict`: this file wins its account-month. Recorded in `_conflicts.csv` in staging; never touches the archive or the ledger |
+| `/ingest/rows`           | GET  | R    | `root`, `account`, `start`, `end`, `limit`                           |
+| `/ingest/plan`           | POST | R    | `root`, `accounts[]`, `start`, `end`, `apply_rules` (true)           |
+| `/ingest/apply`          | POST | W    | `confirm_token`, `max_changes`, `dry_run`                            |
+| `/ingest/file/plan`      | POST | R    | `account_id`, `path` — one file into one account                     |
+| `/ingest/file/apply`     | POST | W    | `confirm_token`, `dry_run`                                           |
+| `/ingest/runs`           | GET  | R    | the run log                                                          |
+| `/ingest/runs/{id}`      | GET  | R    | one run's full report                                                |
+
+`R*` — `/ingest/extract` and `/ingest/prefer` cannot change a ledger but do write to the staging
+directory. They are the only read-tier routes that touch disk, they say so here, and extract has its
+own ceiling.
+
+**Every path is contained.** A `root` or `path` argument is resolved with `realpath()` and must lie
+inside a configured statements root; `../../.ssh` is refused with `forbidden`, and the clients
+refuse it first for a better message (cli.mdx §16).
+
+### 11.5 Two layers of de-duplication
+
+**Layer one, the statement level.** The same month scanned twice, under two filenames, is one
+statement. Grouping is on `(entity, institution, last4, statement_period)` read from _inside_ the
+document, never from the directory name. Identical bytes → `duplicate_identical`. Different bytes,
+same period → ranked by a fixed rule chain (cli.mdx §10.4), the loser `superseded`, both recorded.
+Two statements that disagree about a _transaction_ → `conflict`, which blocks that account-month and
+names both files. Parsing both is how an archive doubles a month.
+
+**Layer two, the transaction level.** Every row gets a deterministic **`external_id`** — a Firefly
+journal field built for exactly this, stored as journal metadata and shown in the UI:
+
+- In **prepared** mode from OFX/QFX it is the bank's `FITID`, prefixed with the account key:
+  `ofx:{last4}:{FITID}`. **We use the bank's id and never mint our own over it.**
+- Otherwise we mint one from the row's own content plus its ordinal:
+  `ff1:{last4}:{YYYYMMDD}:{amount}:{ordinal}:{sha1_8(normalised_description)}`.
+
+**The ordinal is the whole trick.** Two genuine $5.00 coffees on the same day at the same shop get
+ordinals 0 and 1, so they get two `external_id`s and both import. The ordinal is counted over the
+**merged account-month** (every primary statement feeding that calendar month, concatenated in a
+deterministic order), never per statement, because cycle-dated accounts (a card running the 15th to
+the 14th) feed one calendar month from two statements, and per-statement ordinals would give both
+coffees ordinal 0 and collapse them. cli.mdx §10.6a has the full rule and the fixture.
+
+### 11.6 Firefly's duplicate check is the authority (LOCKED — R7)
+
+We never decide whether a row already exists **in the ledger**. Firefly does, with the check it
+already runs for the Data Importer:
+
+- `TransactionJournalFactory` computes **`import_hash_v2`** — a SHA-256 over the JSON of the
+  submitted journal row — stores it as journal metadata, and, when the request carries
+  `error_if_duplicate_hash: true`, refuses a row whose hash already exists for this user with a
+  `DuplicateTransactionException` naming the original group.
+- The lookup runs **`withTrashed()`**: a transaction the operator **deleted** still holds its hash,
+  so re-importing it is refused as a duplicate. **Firefly already respects deletions** — the thing
+  the sibling Actual Budget fork had to pin an importer option to achieve is Firefly's default
+  behaviour here, and we keep it rather than work around it. The only way a deleted row returns is
+  `/admin/data/purge` (which erases the hash with the row) followed by a re-import — an admin act,
+  never an agent's.
+
+Two consequences shape this plane:
+
+1. **The payload must be canonical, or the hash means nothing.** The hash is over the whole
+   submitted row, so the same transaction submitted with a key in a different order, a trailing
+   space in a description, or a category the rules engine will set anyway, hashes differently and
+   imports twice. The plane therefore submits a **fixed canonical row** — exactly `type`, `date`,
+   `amount`, `currency_code`, `description`, `source_id`/`destination_id` or `*_name`,
+   `external_id`, `notes` (unset), in that key order, normalised — and never includes anything the
+   rule engine decides. The canonicaliser has a golden-vector test: the same row always yields the
+   same hash, and any change to it is a deliberate, reviewed change that re-keys every future import.
+2. **`external_id` is inside the hash, and that is what saves the two coffees.** Two identical
+   coffees differ only in their ordinal, so their `external_id`s differ, so their hashes differ, so
+   Firefly stores both. The same coffee seen in two scans has the same `external_id`, the same hash,
+   and Firefly refuses the second. Firefly decides; our ordinal only makes sure it is asked the right
+   question.
+
+`plan` and `apply` are **the same call with one boolean different**: `/ingest/plan` runs every row
+through `TransactionGroupFactory::create()` with `error_if_duplicate_hash: true` inside the dry-run
+harness and reports, per row, `new` or `duplicate_of: #group`, plus what the rule engine did to it.
+Rows inside one batch are stored in order within the same transaction, so a within-batch duplicate is
+caught exactly as it would be on apply.
+
+**Rejected: query the ledger for our `external_id`s and subtract.** It is the obvious
+implementation, and it is a second duplicate engine that disagrees with the first at the edges —
+rows the operator edited after import, rows imported earlier by the Data Importer with a different
+`external_id`, deleted rows. The disagreement surfaces as a plan that says 117 new and an apply that
+adds 131.
+
+Handles: duplicate detection on store.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Factory/TransactionJournalFactory.php` — `hashArray()`, `errorIfDuplicate()` (exist today; the authority — note the `withTrashed()`)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Exceptions/DuplicateTransactionException.php` (exists today; mapped to `conflict`)
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Ingest/CanonicalRow.php` — `fromStatementRow()`, `KEY_ORDER`
+
+### 11.7 The store options are pinned (LOCKED)
+
+| Option                    | Upstream default | **Ours**   | Why                                                                                                         |
+| ------------------------- | ---------------- | ---------- | ----------------------------------------------------------------------------------------------------------- |
+| `error_if_duplicate_hash` | `false`          | **`true`** | Without it Firefly stores duplicates silently. Every ingest row and every `POST /transactions` pins it on; no argument can turn it off. |
+| `apply_rules`             | `true`           | `true`     | A statement row should be categorised exactly as a hand-entered one would be. Overridable per ingest run.   |
+| `fire_webhooks`           | `true`           | **`false` for ingest** | Replaying a decade into webhooks would announce 12,007 "new" transactions to whatever listens. `true` for single `POST /transactions`. |
+| `batch_submission`        | `false`          | **`true` for ingest**  | Defers the per-journal listeners to one pass at the end of the batch — the same deferral `/api/v1/batch/finish` completes. |
+
+**Where the bank's text goes.** The normalised description (bank noise stripped by a per-bank rule
+table) goes in **`description`**. The **unmodified** bank text goes in **`internal_reference`** — a
+journal meta field that is inside the hash, stable across runs, and never typed by the operator.
+(Upstream's `original_source` field was considered and rejected: `hashArray()` explicitly removes it
+before hashing, and it is meant to name the importing tool, not carry row content.) **`notes` is left
+alone**: it is the operator's field, and an import that writes it would overwrite what a human
+typed. There is a test that writes a note, re-runs the pipeline, and asserts the note survives byte
+for byte.
+
+### 11.8 What ingest never does
+
+- Never writes, moves, renames or deletes anything under `{ROOT}` outside the staging directory.
+- Never deletes a transaction. The pipeline is additive; removing is a human act in a UI.
+- Never guesses a category or a budget. That is the rule engine's job, and it runs on import because
+  rows go through Firefly's own factory.
+- Never invents a date, an amount, or a balancing row. An unreadable row is named in
+  `_conflicts.csv` and counted — never silently dropped, never rounded into existence.
+- Never uploads a statement anywhere, and never stores a statement PDF as a Firefly attachment
+  unless the operator asks for exactly that file. Extraction is local, and the plane has no egress.
+
+---
+
+## 12. Account provisioning from a manifest
+
+The question _"create the accounts for my archive"_ deserves its own section, because it is the
+first thing that happens on a new install and the easiest thing to get expensively wrong.
+
+### 12.1 `POST /ingest/accounts/plan` (read)
+
+Reads the manifest, reads the administration's existing accounts, and returns a per-row decision
+with its reasoning. It **creates nothing**.
+
+```jsonc
+{
+  "ok": true,
+  "data": {
+    "plan": [
+      {
+        "manifest": { "entity": "household", "institution": "Northbank", "label": "Checking_x4021", "last4": "4021", "kind": "checking" },
+        "action": "create",
+        "proposed": { "name": "Household · Northbank Checking ••4021", "type": "asset", "account_role": "defaultAsset", "currency_code": "USD", "include_net_worth": true },
+        "reason": "no existing account matched on IBAN last-4 or name"
+      },
+      {
+        "manifest": { "entity": "household", "institution": "Meridian", "label": "Mortgage", "kind": "mortgage" },
+        "action": "create",
+        "proposed": { "name": "Household · Meridian Mortgage", "type": "liability", "liability_type": "mortgage", "liability_direction": "credit" },
+        "reason": "kind=mortgage → liability by the liability_kinds rule"
+      },
+      {
+        "manifest": { "entity": "acme_llc", "institution": "Northbank", "label": "Checking_x7734", "last4": "7734" },
+        "action": "link",
+        "existing": { "id": 14, "name": "Acme LLC Checking" },
+        "reason": "matched on IBAN last-4 7734"
+      }
+    ],
+    "summary": { "create": 24, "link": 3, "ambiguous": 0 },
+    "confirm_token": "cf_01J8…"
+  }
+}
+```
+
+`action` is one of `create` · `link` · `skip` · `ambiguous`. **`ambiguous` never becomes a create.**
+It is returned with every candidate and blocks that row until the caller resolves it — two accounts
+sharing a last-4 across two entities is the normal case in a real archive, not an edge one.
+
+### 12.2 The naming rule
+
+The default is `"{Entity} · {Institution} {Kind} ••{last4}"`, overridable per call with a `naming`
+template and per row with an explicit `name`. It **disambiguates** (two entities each with a Northbank
+Checking), it is **stable** (a re-run yields `link`, not a second set with `(2)` on the end — Firefly
+also refuses duplicate account names within a type, so a collision is a refusal, not a silent twin),
+and it **carries the last-4**, so a human can check a row against a paper statement in one glance.
+
+### 12.3 Asset versus liability, and net worth
+
+| `kind`      | Default Firefly type                                    | Why                                                                      |
+| ----------- | ------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `checking`  | asset, role `defaultAsset`                              | money you spend                                                          |
+| `savings`   | asset, role `savingAsset`                               | still yours; shown under savings                                         |
+| `card`      | asset, role `ccAsset` (credit card, negative balance)   | Firefly's own credit-card model; the monthly payment date is asked for   |
+| `brokerage` | asset, role `sharedAsset`, **`include_net_worth: true`, excluded from budgets by rule** | market movement is not income; it must never land in a spending report |
+| `loan`      | liability, `loan`                                       | tracked for net worth                                                    |
+| `mortgage`  | liability, `mortgage`                                   | tracked for net worth                                                    |
+
+Controlled by `liability_kinds[]` and a per-row override, echoed in the response and explained per
+row in `reason`. Getting this wrong is not small: a brokerage account treated as a checking account
+turns every market swing into spending or income.
+
+### 12.4 `POST /ingest/accounts/apply` (write)
+
+Takes the token, creates the `create` rows in one transaction through `AccountFactory` (with their
+opening balances, if the manifest carries them, as Firefly's own opening-balance transactions),
+links the `link` rows into the map file, and returns the created ids alongside the manifest rows
+they came from. It then **writes the map** (§11.4) beside the statements, so the very next
+`/ingest/plan` has a complete mapping and the operator never hand-writes a YAML file of 27 account
+ids. `dry_run` defaults true here too. The first real run of a ten-year archive is supposed to be a
+deliberate act.
+
+---
+
+## 13. The query escape hatch — Firefly's search language
+
+Firefly III has a real query language: the search bar accepts operators like
+`description_contains:"whole foods" amount_more:50 date_after:2026-01-01 category_is:Groceries
+-has_any_tag:true`, parsed by `OperatorQuerySearch` and executed by the same collector the rule engine
+uses. It is read-only by construction — there is no operator that mutates — which makes it a better
+escape hatch than inventing a query language of our own.
+
+| Route                     | M   | Tier | Arguments                                         |
+| ------------------------- | --- | ---- | ------------------------------------------------- |
+| `/search`                 | GET | R    | `query`, `limit`, `offset`                        |
+| `/search/count`           | GET | R    | `query` — just the number of matches              |
+| `/search/operators`       | GET | R    | — every operator, its argument type, and an example |
+| `/search/accounts`        | GET | R    | `query`, `field` (all\|iban\|name\|number\|id)    |
+
+| Guard           | Rule                                                                                                  |
+| --------------- | ----------------------------------------------------------------------------------------------------- |
+| Read-only       | the language has no mutation operator; the route is read-tier and has no write path                   |
+| Operator report | the response echoes the operators Firefly **parsed**, and lists any words it treated as free text — so a misspelt operator is visible, not silently a text search |
+| Row cap         | `limit`, default 200, cap 5,000, clamped and reported                                                 |
+| Byte cap        | 8 MiB; over it, `truncated` and a narrowing hint                                                      |
+| Timeout         | 10 s                                                                                                  |
+
+`/search/operators` exists **so a caller does not guess.** A model that has read the operator list
+writes a query that runs; a model that has not writes three that do not. It is generated from
+Firefly's own operator table (`config/search.php`), so it cannot drift.
+
+**`/search` is a last resort, and its own description says so.** If a question is asked twice through
+`/search`, that is a signal it should be a typed route in §8 or §10.
+
+Code: `~/BGit/Bryan_git/firefly-iii/app/Support/Search/OperatorQuerySearch.php` — the parser and executor (exists today)
+Code: `~/BGit/Bryan_git/firefly-iii/config/search.php` — the operator table (exists today; `/search/operators` is generated from it)
+
+---
+
+## 14. Money, dates and identifiers
+
+### 14.1 Money is a decimal string in a named currency (LOCKED — R2)
+
+Firefly III does money correctly already, and this plane does not undo it:
+
+- **Amounts are decimal strings, computed with `bcmath`.** `bootstrap/app.php` sets `bcscale(12)`;
+  the database stores `decimal(32,12)`; transformers render strings. `"123.45"` is one hundred
+  twenty-three dollars and forty-five cents. The plane never casts an amount to `float` or `int`,
+  anywhere — a test greps `app/Machine/` for `(float)`, `floatval`, `(int)` on amount variables,
+  `round(` and `number_format(` outside `Money.php`.
+- **Every amount travels with its `currency_code`.** A Firefly install is multi-currency: accounts
+  have currencies, journals can carry a `foreign_amount` in a second currency, and every row also
+  has a `pc_amount` converted into the administration's primary currency. An amount without its code
+  is ambiguous, and the plane never emits one.
+- **Amounts are positive; direction is the type.** Firefly's API takes a positive `amount` and a
+  `type` (`withdrawal`, `deposit`, `transfer`) — upstream's own validator is `IsValidPositiveAmount`.
+  The plane keeps that: a negative or zero `amount` on a transaction is `invalid_input` with a hint
+  showing the positive amount and the type the caller probably meant. **Balances** are signed
+  (a liability or an overdrawn account is negative), and the response says which fields are signed.
+- **Precision on the wire is the currency's.** Firefly stores 12 decimal places and renders each
+  currency at its own `decimal_places` (USD 2, JPY 0, BHD 3). The plane renders at the currency's
+  places for display fields and never rounds a value it will send back. Input with more places than
+  the currency allows is `invalid_input`, never silently rounded.
+- **Never summed across currencies.** A total is per currency, always. A cross-currency total exists
+  only as Firefly's own primary-currency conversion (`pc_*`), labelled with the primary currency and
+  the rate date.
+- **No decimal numbers in JSON, only strings.** `123.45` as a JSON number is a float to every parser
+  on the other side, and the other side is sometimes a language model. A schema test asserts every
+  amount field in every response is a JSON string.
+- The **only** parse/format point is `Money.php`, and the _clients_ never convert amounts at all —
+  they format the string for display by inserting separators, character by character (cli.mdx §13.3).
+
+### 14.2 Absent is not zero (LOCKED — R3)
+
+A budget with **no limit** for a period returns `limit: null`. A budget limited to zero returns
+`limit: "0.00"`. They are different facts and a budgeter acts differently on each: `null` means "you
+have not decided", `"0.00"` means "you decided nothing".
+
+The same rule applies everywhere absence is possible: a balance we could not compute is an error,
+not `"0"`; a date range with no transactions returns an empty array and `count: 0`, never a
+fabricated row of zeros; an account with no transactions has `current_balance: "0.00"` (a real
+balance) and `first_transaction: null` (a real absence); a chart point with no data is `null`
+(§10.5). `GET /budget-period/gaps` turns the rule into an answer.
+
+### 14.3 Dates
+
+`YYYY-MM-DD` on the wire, always. Ranges are **inclusive on both ends** and every response echoes
+the range it resolved. No relative dates on the wire — "last month" is the client's job to resolve,
+and the response says which month it decided. Firefly stores journal dates with a time and a
+timezone (`date_tz`); the plane reads and writes the date in the **administration's** timezone
+(`APP_TIMEZONE` / the user's preference), so a transaction at 23:30 on the 31st is on the 31st, and
+says so. "The current period" is the operator's `viewRange` preference (1M by default), resolved
+server-side and echoed.
+
+### 14.4 Identifiers
+
+Firefly's numeric ids, opaque to every caller. Transaction **group** ids and **journal** ids are
+different namespaces; every route names which one it takes (`group_id`, `journal_id`) and the
+response carries both. Where a name is accepted instead, resolution is exact-match first, then
+case-insensitive, and **ambiguity is an error carrying the candidates** — never a silent pick.
+
+---
+
+## 15. Concurrency, limits and performance
+
+- **One administration per request.** The binding is per request (§4.9), so there is no "loaded
+  ledger" state to switch and no global side effect.
+- **Writes are serialised, concurrency 1.** A plane write takes `Cache::lock('machine:write', 120)`
+  before opening its transaction. A second write waits; if it waits past its timeout it gets
+  `conflict` with a retry hint, never a partial apply. Reads never take the lock.
+- **No cache of ledger data.** Firefly has its own caches (`laravel-model-caching`, the
+  `CacheProperties` helper) and invalidates them on its own writes; the plane adds none, because a
+  second copy that can be stale is the thing the whole design avoids. The plane's only cache entries
+  are confirm tokens and idempotency keys (§7.3, §5.6).
+- **Long routes stream progress.** `/ingest/apply` and `/ingest/extract` can run for minutes. They
+  accept `Accept: application/x-ndjson` and emit progress lines, ending with the normal envelope — so
+  a client can render a progress bar and never look hung. They raise PHP's `max_execution_time` for
+  themselves only, and `just run` sets `PHP_CLI_SERVER_WORKERS` so a long import does not block the
+  web UI.
+- **SQLite and a long import.** SQLite serialises writers; a ten-year apply holds the write lock in
+  batches of 500 journals (each its own transaction, each its own `machine_operations` row), so the
+  operator can keep using the UI between batches. The run log records every batch.
+
+| Limit                    | Value       | Behaviour over it                        |
+| ------------------------ | ----------- | ---------------------------------------- |
+| `limit` on a list        | cap 5,000   | clamped, `truncated: true`               |
+| Response bytes           | 8 MiB       | `truncated: true` + narrowing hint       |
+| Request bytes            | 8 MiB       | `invalid_input`                          |
+| `max_changes` on a write | default 200 | `conflict`, **reporting the real count** |
+| Per-call timeout         | 30 s        | `upstream_error`; ingest routes exempt   |
+| `/search` timeout        | 10 s        | `upstream_error`                         |
+
+---
+
+## 16. Security
+
+### 16.1 Threat model
+
+| #   | Threat                                              | Control                                                                                            |
+| --- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| 1   | Another computer reaches port 7373                  | Gate 1, on `REMOTE_ADDR`, not `X-Forwarded-For`; `artisan serve` bound to `127.0.0.1`              |
+| 2   | A web page the operator has open calls the plane    | Gate 2 (origin + host) and gate 3 (the key it cannot read); `machine/*` outside `cors.paths`       |
+| 3   | Another user on this machine                        | Gate 3; the key file is `0600` and ownership-checked                                               |
+| 4   | An agent writes something the operator did not want | Gates 4 and 6: two tier switches, `dry_run` default, a token only a plan can produce, a ceiling    |
+| 5   | A malicious description or note steers a model      | §16.3 — untrusted fields are marked, never executed                                                |
+| 6   | A secret leaks into a log, an error or a context    | §16.4 — fingerprints only, generic internals, Laravel's debug page never reaches a plane caller    |
+| 7   | A bad plan is applied against a changed ledger      | §7.3 — fingerprint recomputed at apply                                                             |
+| 8   | The operator's archive is damaged                   | §11.2's conflict rule, path containment, and §11.8's never-list                                   |
+| 9   | A dry run leaks an outside effect                   | §7.2 — webhooks, mail, jobs held by recorders; asserted per route                                  |
+| 10  | A webhook becomes an exfiltration channel           | creating or editing a webhook is admin-tier (§8.10)                                                |
+| 11  | A machine key authenticates to the wrong app        | per-app credentials file and key path (§4.3); a sibling app's key never matches                    |
+
+### 16.2 What is never exposed
+
+User passwords or their hashes; Passport client secrets, personal access tokens and OAuth keys
+(`storage/oauth-*.key`); `APP_KEY`; `STATIC_CRON_TOKEN`; 2FA secrets and backup codes; the MFA
+recovery state; mail and database credentials; any `.env` value; absolute filesystem paths outside
+the statements root; SQL strings; stack traces; Laravel exception class names.
+
+There is a **canary test** that calls every route in `/capabilities` against a fixture ledger and
+greps every response for the key pattern, for `secret`, `password`, `token` (outside
+`confirm_token`), `APP_KEY`, `/Users/`, and `Illuminate\`.
+
+### 16.3 Prompt-injection posture
+
+A description, a note, an account name, a tag and a statement line are **operator-supplied data
+that may have been written by a third party** — a merchant chose that descriptor, not the operator.
+
+- Responses mark them: `meta.untrusted: ["description", "notes", "internal_reference", "account_name", "tags"]`.
+- The plane never interprets them as instructions, never uses them to choose a route, and never
+  reflects them into a `hint`.
+- [ai/mcp_prompt_firefly.md](../ai/mcp_prompt_firefly.md) carries the matching instruction on the
+  model's side: text from the ledger is _evidence about money_, never a directive.
+- Firefly's rule **expression language** (`ExpressionController`) evaluates operator-authored
+  expressions on rule actions. A rule is data the operator wrote; `/rules/validate` runs Firefly's
+  own validator on it, and the plane never evaluates an expression it received anywhere else.
+
+### 16.4 The audit trail
+
+Every write — and every refused write — appends one line to `~/T/_firefly_iii/machine.audit`:
+
+```
+2026-09-21T18:41:02.118Z  route=/ingest/apply  tier=write  caller=mcp  op=417  admin=1  token=cf_01J8…  changed=117  ok=true  took_ms=8412
+```
+
+No amounts, no descriptions, no account names — **what happened, not what it was about.** The file
+answers "what did the agent do last Tuesday" without being a second copy of the ledger. `caller`
+comes from an optional `X-Firefly-Client` header and is advisory: it is for reading a log, never for
+granting anything (the one exception, §6.1, only ever takes privilege away). `op` joins to
+`machine_operations` for the full before-image, which lives in the database, outside the repo.
+
+Laravel's own log (`storage/logs/laravel.log`) is upstream's and may hold stack traces; the plane's
+exception renderer logs there, never to the caller.
+
+---
+
+## 17. Open-source safety (LOCKED)
+
+This repo is a public fork. Four rules, each with a test:
+
+1. **No secret in the tree.** No config key under `app/Machine/`, `config/` or `.env.example` can hold
+   the machine key. The key lives in `~/.credentials/`, minted per machine. A test greps the repo for
+   64-character hex literals outside test fixtures that are visibly fake (`0000…`, `feed…`).
+2. **No private path in the code.** The statements root, the operator email, the administration id,
+   the entity names and the account last-fours are **all configuration, none constants**. **Every
+   entity name, institution name and account number in this spec is invented** — `household`,
+   `acme_llc`, `Northbank`, `Meridian`, `••4021` — and is there to show a shape. A test greps
+   `app/Machine/` and `routes/machine.php` for `/Users/`, for the archive directory name, and for the
+   entity names used on this machine, failing on a hit outside a fixture or a doc comment.
+3. **No financial data in the repo tree.** The SQLite database, the attachment disk and the export
+   disk are configured **outside** the repo (§3.3); the statements tree and staging directory are
+   outside it by construction and staging writes its own `.gitignore` anyway. Upstream's default
+   `storage/database/database.sqlite` is inside the tree — `just setup` refuses to create it there,
+   and `ffx doctor` fails if it finds one. Fixtures use synthetic statements with invented banks and
+   invented amounts, committed deliberately.
+4. **The fork's additions are AGPL-3.0 like the rest of the app.** Firefly III is licensed under the
+   GNU AGPL v3; everything under `app/Machine/`, `cli/`, `mcp/` and `pm/` is part of this fork and
+   carries the same license. Anything we would like upstream to take goes as a normal PR to
+   `firefly-iii/firefly-iii` on its `develop` branch, following upstream's contribution rules and its
+   AI-disclosure request in [../agents.md](../agents.md).
+
+---
+
+## 18. Testing
+
+PHPUnit (the repo's `phpunit.xml`), under `tests/Machine/`, against SQLite in memory with a temp
+credentials file via `FIREFLY_MACHINE_CREDENTIALS_FILE`.
+
+| Layer                    | What it holds                                                                                                                                                                                                                                                                                                                        |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Gate ladder**          | every gate, in order, with a negative for each: non-loopback `REMOTE_ADDR` → 404; non-loopback carrying `X-Forwarded-For: 127.0.0.1` with `TRUSTED_PROXIES=*` → 404; `Origin: https://evil.example` → 404; `Sec-Fetch-Site: cross-site` → 404; a rebinding `Host` → 404; key in the query string → 404; no key → 401 constant body; wrong key → the same body **byte for byte**; write with tier off → `write_disabled`; admin with write tier only → `forbidden`; admin with `X-Firefly-Client: mcp` → `forbidden` |
+| **CORS pin**             | a `machine/*` response never carries `Access-Control-Allow-Origin`, and `config/cors.php` `paths` does not match `machine/*`                                                                                                                                                                                                         |
+| **Operator binding**     | one user → bound; two users and no setting → `not_ready` naming both; blocked user → refused; administration not a member → refused                                                                                                                                                                                                  |
+| **Credentials**          | mint shape and entropy source (`random_bytes`); the merge preserves an unrelated product's keys; `0644` is refused; a symlink is refused at read and at write; concurrent minters converge on one key; no mint on a console or test boot                                                                                             |
+| **Envelope**             | every route returns the envelope, including 404 and 500; no response is HTML; the error vocabulary is exactly nine; mcp.mdx's is a strict superset                                                                                                                                                                                   |
+| **Capability parity**    | `/capabilities` lists exactly the routes the router mounts — one array, asserted both directions                                                                                                                                                                                                                                    |
+| **Coverage parity**      | §9's matrix is a committed fixture; a ✅ row whose route is not in `/capabilities` fails the build                                                                                                                                                                                                                                   |
+| **Mirror parity**        | every `GET` in upstream's `routes/api.php` is either mirrored or denied by name; a new upstream route fails the test                                                                                                                                                                                                                |
+| **Contract drift**       | golden JSON for one entity per family; an upstream transformer change shows up as a diff on the merge                                                                                                                                                                                                                                |
+| **Money**                | every amount field in every response is a JSON string with a sibling `currency_code`; a canary greps `app/Machine/` for float casts, `round(` and `number_format(` outside `Money.php`; a negative transaction amount is refused with the positive amount in the hint; a JPY amount with decimals is refused |
+| **Absent ≠ zero**        | a budget with no limit returns `null`, one limited to zero returns `"0.00"`, and `/budget-period/gaps` distinguishes them; a chart gap is `null`                                                                                                                                                                                    |
+| **Dry-run purity**       | for every write route: a dry run leaves a full-table hash unchanged, sends zero webhooks, zero mail, queues zero jobs                                                                                                                                                                                                                |
+| **Write protocol**       | dry run defaults true; no token refused; expired token refused; a token whose fingerprint no longer matches refused **with the new counts**; a token minted under a rotated key refused; the ceiling refuses and reports the real number                                                                                              |
+| **plan ≡ apply**         | over an unchanged ledger, `/ingest/plan` and `/ingest/apply` report identical counts                                                                                                                                                                                                                                                |
+| **Duplicate authority**  | a row stored twice is refused the second time with the original group id; **a row deleted in the UI is refused on re-import** (Firefly's `withTrashed()`); two same-day coffees with ordinals 0 and 1 both store                                                                                                                     |
+| **Canonical hash**       | the canonicaliser's golden vectors: the same row always hashes the same; key order, whitespace and rule-set fields cannot change it                                                                                                                                                                                                  |
+| **`notes` untouched**    | write a note, re-run so the row is re-planned, assert the note survives byte for byte                                                                                                                                                                                                                                                |
+| **Ordinal scope**        | a cycle-dated fixture (15th–14th statements) with two identical same-day amounts arriving from two statements in one calendar month produces two `external_id`s and both import                                                                                                                                                    |
+| **Determinism**          | the whole pipeline twice over the fixture tree — `_rows.csv` byte-identical, second apply reports `created: 0`                                                                                                                                                                                                                      |
+| **Provisioning**         | 27 fixture rows across 5 entities with two accounts sharing a last-4 → exactly one `ambiguous`, zero silent creates; re-running yields `link`                                                                                                                                                                                        |
+| **Reconcile**            | plan reproduces the UI's `overview()` numbers for a fixture; apply marks the journals reconciled and creates exactly one reconciliation transaction when the difference is non-zero, none when it is zero                                                                                                                           |
+| **Analytics**            | each route against a fixture ledger with a hand-computed expected answer, per currency; transfers, opening balances and reconciliations excluded from spending, and the exclusion echoed                                                                                                                                           |
+| **Undo**                 | every write route followed by `/undo` returns the ledger to its prior state under a full-table hash; undo after a browser edit to a touched row returns `conflict` and changes nothing                                                                                                                                              |
+| **Leak canary**          | every route in `/capabilities` called against a fixture; responses grepped per §16.2                                                                                                                                                                                                                                                |
+| **Open-source canaries** | the §17 greps                                                                                                                                                                                                                                                                                                                         |
+| **Integration**          | `php artisan serve` on an ephemeral port with a temp `.env`, temp SQLite and temp credentials file; the full ladder end to end from the Node clients' test suites                                                                                                                                                                     |
+
+---
+
+## 19. Use cases
+
+Each row is a real sentence an operator says, and the route sequence that answers it. The same
+scenarios mcp.mdx §18 dramatises for a model and cli.mdx §19 for a terminal — here they are the wire.
+
+| #   | "…"                                                      | Routes                                                                                                                             |
+| --- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Is this thing even on?                                   | `GET /ping` → `GET /whoami`                                                                                                        |
+| 2   | Set my books up from my statement archive                | `GET /ingest/manifest` → `POST /ingest/accounts/plan` → `POST /ingest/accounts/apply` → `POST /ingest/plan` → `POST /ingest/apply` |
+| 3   | Import last month's downloads                            | `POST /ingest/file/plan` → `POST /ingest/file/apply`                                                                               |
+| 4   | What did I spend on groceries this year, by month?       | `GET /analytics/spending-by-category?interval=month&category_ids=…`                                                                |
+| 5   | Where is my money actually going?                        | `GET /analytics/spending-by-category?top_n=10` + `GET /analytics/payee-leaderboard`                                                |
+| 6   | What subscriptions am I paying for?                      | `GET /analytics/subscriptions` + `GET /analytics/recurring`                                                                        |
+| 7   | What have I not categorised?                             | `GET /analytics/uncategorized-summary` → `GET /transactions?without_category=true`                                                 |
+| 8   | Categorise every Whole Foods transaction as Groceries    | `POST /rules/preview` → `POST /rules` → `POST /rules/run` (dry run, then token)                                                    |
+| 9   | Northbank says $4,211.08 as of the 31st                  | `POST /accounts/{id}/reconcile/plan` → `POST /accounts/{id}/reconcile/apply`                                                       |
+| 10  | Build next month's budget from the last six months       | `POST /budget-period/set-average` (dry run) → token                                                                                |
+| 11  | How much is left in Dining this month?                   | `GET /budget-period`                                                                                                               |
+| 12  | Which budgets am I spending in with no limit set?        | `GET /budget-period/gaps`                                                                                                          |
+| 13  | How long could I go if income stopped?                   | `GET /analytics/runway`                                                                                                            |
+| 14  | Anything weird this month?                               | `GET /analytics/anomalies`                                                                                                         |
+| 15  | Did my net worth go up this year? Show me a chart.       | `GET /charts/net-worth?interval=month`                                                                                             |
+| 16  | That was a transfer, not a withdrawal                    | `POST /transactions/{id}/convert` (dry run) → token                                                                                |
+| 17  | Put $200 into the vacation piggy bank                    | `POST /piggy-banks/{id}/add`                                                                                                       |
+| 18  | Undo that                                                | `GET /undo/last` → `POST /undo`                                                                                                    |
+| 19  | Which months of statements am I missing?                 | `GET /ingest/coverage`                                                                                                             |
+| 20  | Something nobody anticipated                             | `GET /search/operators` → `GET /search?query=…`                                                                                    |
+| 21  | Give me my monthly report                                | `GET /reports/default?start=…&end=…`                                                                                               |
+
+---
+
+## 20. Acceptance criteria
+
+The plane is done when all of these hold:
+
+1. On a machine with no `~/.credentials/firefly_iii.json`, `just run` followed by one browser page
+   load leaves the file at `0600` with a 64-hex key, and `GET /ping` answers with it — **no manual
+   key step**.
+2. With the file already present, a restart **reuses** the existing key and never replaces it.
+3. `GET /ping` 404s without a key from a non-loopback peer, 401s with a constant body with a wrong
+   key, and answers with the right one.
+4. `GET /capabilities` lists every mounted route, and the coverage fixture in §9 matches it exactly.
+5. Every route in §8 exists, validates its input, and returns the envelope — including its errors,
+   and including Laravel exceptions.
+6. **Every ✅ cell in §9's matrix is exercised by a test** that performs the action and asserts the
+   ledger changed the way the UI would have changed it.
+7. Every write defaults to `dry_run: true`, refuses without a token, and reports the real count when
+   it refuses on the ceiling; every dry run is side-effect free per §18.
+8. `/ingest/plan` and `/ingest/apply` report identical counts over an unchanged ledger, and a full
+   archive import of the fixture tree is idempotent: the second run creates zero.
+9. A transaction deleted in the UI is **not** re-created by any ingest run.
+10. `POST /undo` restores the ledger to an identical state after every write route, and refuses when
+    a human has since edited a touched row.
+11. No float and no JSON number appears in any amount field of any response; every amount has a
+    `currency_code`.
+12. The gate ladder's full negative suite passes, including the `X-Forwarded-For`, `Origin` and CORS
+    cases.
+13. The leak canary and the §17 canaries pass.
+14. Upstream's `/api/v1` behaves exactly as before: its own test suite passes unmodified, and a
+    Passport token is refused by `/machine/v1`.
+15. `just build && just run && ffx doctor` is green on a machine that has never run this before.
+
+---
+
+## 21. Build phases
+
+| Phase   | Delivers                                                                                                                                       | Depends on |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| **P0**  | the root `justfile`, SQLite outside the repo, the provider, `CredentialsFile` (mint-on-boot), gates 1–3, the envelope, `/ping`, fail-closed, the CORS pin | —          |
+| **P1**  | operator binding (§4.9), `TierGate`, validation, `RouteTable` (the one array), `/whoami`, `/capabilities`, `/health`, planned routes            | P0         |
+| **P2**  | the mirror (§8.12) and the typed read families: accounts, transactions, categories, budgets + `/budget-period`, subscriptions, piggy banks, rules, reference data, `/search` | P1         |
+| **P3**  | `DryRun`, `ConfirmTokens`, `OperationLog` + migration; the first writes — `POST /transactions`, budget limits — **and `/undo`**                 | P2         |
+| **P4**  | the ingest plane, `prepared` mode: manifest, scan, coverage, map, canonical rows, plan, apply, file import                                     | P3         |
+| **P5**  | account provisioning (§12) and the map writer                                                                                                  | P4         |
+| **P6**  | the budget writers — limits, available budgets, copy-previous, set-average, reset, auto-budget                                                 | P3         |
+| **P7**  | the analytics plane (§10.2) and the chart series (§10.5)                                                                                       | P2         |
+| **P8**  | rules (`/rules/preview` first), bulk, categorise, convert, clone, links, piggy-bank money, reconcile, reports                                  | P3         |
+| **P9**  | `raw` ingest mode (PDF extraction, both de-dupe layers, staging)                                                                               | P4         |
+| **P10** | admin tier, batch, NDJSON progress, the audit trail, the full canary suite                                                                     | P3         |
+| **P11** | a Docker-compatible transport (Unix socket), and the charting routes beyond parity with the UI                                                 | P7         |
+
+P2 and P7 are what make the MCP genuinely useful; P4 and P5 are what make the _first evening_ useful.
+Build in that order and the thing is valuable before it is complete.
+
+---
+
+## 22. Invariants recap (LOCKED)
+
+1. Loopback only, forever, judged on `REMOTE_ADDR`. No flag changes it.
+2. 256 bits from `random_bytes()`, 64 hex characters — longer than a UUID — in a `0600` file unique
+   to this app in the home directory, minted by the web app on its own first run, reused if present,
+   never in the repo.
+3. The key is compared with `hash_equals` over digests and never logged except as a fingerprint.
+4. Five gates before any handler, six before any write. Fail closed at every one.
+5. One operator user and one administration per request, from configuration, never guessed.
+6. One envelope. Nine error codes. Every error names a fix. No HTML, ever.
+7. Money is a decimal string with a currency code, positive on transactions, never a float, never
+   summed across currencies.
+8. `null` is not `"0"`. Absence is a fact and it is reported as one.
+9. Every write has a dry run, and the dry run is the write inside a rolled-back transaction with its
+   outside effects held.
+10. A write needs two tier switches, a `dry_run: false` and a token it could only get from a plan.
+11. Firefly's `import_hash_v2` check, with `error_if_duplicate_hash: true` and `withTrashed()`, is
+    the sole authority on what is a duplicate — and it already refuses rows the operator deleted.
+12. One service call per route; composed routes say so and are named in this spec.
+13. Nothing is computed twice. If a client would have to sum it, it becomes a route here — and
+    charting grows here first.
+14. Every cap is reported. No silent truncation, ever.
+15. Deleting is admin-tier, and the MCP does not have it.
+16. `/api/v1` is untouched; the upstream delta is one line in `bootstrap/providers.php`.
+17. No secret, no private path and no financial data in this repo tree.
+
+---
+
+## 23. Related specs
+
+- [cli.mdx](./cli.mdx) — `ffx`, the terminal client of this plane.
+- [mcp.mdx](./mcp.mdx) — `firefly_iii`, the agent client of this plane.
+- [ai/mcp_prompt_firefly.md](../ai/mcp_prompt_firefly.md) — what the MCP tells the model about money,
+  and how it asks.
+- [../CLAUDE.md](../CLAUDE.md) — what this fork is for, where things live on this machine, and the
+  private-data boundary this spec's §17 implements.
+- [../agents.md](../agents.md) — upstream's instructions for AI-assisted contributions sent upstream.
+- `routes/api.php` — upstream's REST API, the mirror's source and the shape our transformers keep.
+- Upstream API docs: https://api-docs.firefly-iii.org/ — the reference for every `/api/v1` shape the
+  plane reuses.
+- Sister specs this one was learned from: `~/BGit/Bryan_git/actual_budget_bryan/pm/apis.mdx` (the
+  same machine-plane design on Actual Budget) and `~/BGit/Bryan_git/ezbookkeeping/pm/`.

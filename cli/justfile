@@ -1,0 +1,38 @@
+# ffx — the operator CLI (pm/cli.mdx). Run `just` to list.
+#
+# This exists so the CLI can be worked on alone. The ROOT justfile also builds
+# it, because the CLI must never be stale relative to the app (§2.3).
+
+set shell := ["bash", "-uc"]
+
+root := justfile_directory()
+
+default:
+    @just --list
+
+# Install the dev toolchain (TypeScript, @types/node). No runtime dependencies exist.
+setup:
+    cd "{{root}}" && npm install
+
+# Compile code/src + code/test -> code/dist.
+build:
+    cd "{{root}}" && ./node_modules/.bin/tsc -p code/tsconfig.json
+
+# Typecheck without emitting.
+typecheck:
+    cd "{{root}}" && ./node_modules/.bin/tsc -p code/tsconfig.json --noEmit
+
+# Unit tests, the fake-plane integration tests, and the canaries (the canaries grep the BUILT output).
+test: build
+    cd "{{root}}" && node --test code/dist/test/
+
+# Run the CLI from source: `just run accounts list`.
+run *ARGS:
+    cd "{{root}}" && ./ffx {{ARGS}}
+
+# Print the PATH line to add to ~/.zshrc (never edits the profile itself).
+install-path:
+    @echo 'export PATH="{{root}}:$PATH"   # add to ~/.zshrc'
+
+clean:
+    rm -rf "{{root}}/code/dist"

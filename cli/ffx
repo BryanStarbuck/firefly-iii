@@ -1,0 +1,10 @@
+#!/bin/sh
+# ffx — the operator CLI for this install of Firefly III (pm/cli.mdx).
+# A shim, so cli/ can go on PATH with only the callables in it.
+# Resolve symlinks so a link to this file in ~/bin still finds ffx.mjs.
+self="$0"
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+done
+exec node "$(dirname "$self")/ffx.mjs" "$@"

@@ -1,0 +1,20 @@
+{
+  "name": "ffx-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ffx — the operator CLI for THIS install of Firefly III. A thin client of the /machine/v1 plane. See pm/cli.mdx.",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "build": "tsc -p code/tsconfig.json",
+    "typecheck": "tsc -p code/tsconfig.json --noEmit",
+    "test": "tsc -p code/tsconfig.json && node --test code/dist/test/"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

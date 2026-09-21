@@ -19,8 +19,44 @@ description: >
 
 ---
 
+## Simple instructions
+
+There is **no preset login, no "admin" user, and no default or special admin password**. Firefly III
+logs in with an **email address** and a password that *you* choose. The first person to register
+becomes the owner (the admin); after that the "Register" link disappears.
+
+**Get it running (once):**
+
+1. `brew install php composer` (PHP 8.5 + Composer).
+2. `cd ~/BGit/Bryan_git/firefly-iii && just setup`
+3. `just run` — it prints the URL. Open **http://127.0.0.1:7373/** (use `127.0.0.1`, not `localhost`).
+
+**Log in:**
+
+- **Brand-new database** → the page sends you to **Register**. Type your email and a password twice.
+  That account is now the owner/admin. Done — from now on, log in with that email and password.
+- **You see "Sign in to start your session" with no Register link** → someone already registered on
+  this database (registration closes after the first user). Use that email and password.
+  - Don't know the email? Run `cli/ffx whoami` — it prints it as `operator`.
+  - "These credentials do not match our records" and you never chose a password? The account was
+    probably registered by a script or an AI agent (for example `curl` against `/register` while
+    setting the app up), with a password nobody told you. Nobody else can register here, because
+    the app only listens on `127.0.0.1`. The fix is the same as for a forgotten password.
+  - Don't know the password? Use a one-time reset link, and type the new password only in the
+    browser. `php artisan tinker` is **not** installed in this fork, so run the script in §4.2.
+    It prints a `http://127.0.0.1:7373/password/reset/…` URL. Open it, set a password, and log in.
+    Your data is untouched.
+  - Nothing in the database worth keeping? Start over instead: `just stop`, delete
+    `~/T/_firefly_iii/db/firefly.sqlite`, `just setup`, `just run` — you land on Register again.
+
+Everything below is the long version: why it works this way (§3), other reset routes (§4), and how
+this one login is also who the CLI and MCP act as (§5).
+
+---
+
 ## Table of Contents
 
+- [Simple instructions](#simple-instructions)
 - [Introduction](#introduction)
 - [Goal](#goal)
 - [Overview](#overview)
@@ -182,20 +218,26 @@ directory. Mail transport: `~/BGit/Bryan_git/firefly-iii/config/mail.php`, maile
 Throttling: a second request inside Laravel's reset throttle window is refused and logged
 (`passwords.throttled`); wait a minute and try once.
 
-### 4.2 Set a new password from the terminal
+### 4.2 Mint a reset link from the terminal
 
-When the log route is inconvenient (log rotated, server not running):
+When the log route is inconvenient (log rotated, mail not configured). `php artisan tinker`
+(laravel/tinker) is **not** a dependency of this fork, so boot the app from a throwaway script
+kept **outside the repo**, for example `~/T/_firefly_iii/reset.php`:
 
+```php
+<?php
+require getenv('HOME').'/BGit/Bryan_git/firefly-iii/vendor/autoload.php';
+$app = require getenv('HOME').'/BGit/Bryan_git/firefly-iii/bootstrap/app.php';
+$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+$u = FireflyIII\User::where('email', $argv[1])->firstOrFail();
+$t = Illuminate\Support\Facades\Password::broker()->createToken($u);
+echo "http://127.0.0.1:7373/password/reset/{$t}?email=".urlencode($u->email).PHP_EOL;
 ```
-cd ~/BGit/Bryan_git/firefly-iii
-php artisan tinker
->>> $u = \FireflyIII\User::where('email', 'you@example.com')->firstOrFail();
->>> $u->password = \Illuminate\Support\Facades\Hash::make('a-new-long-passphrase');
->>> $u->save();
-```
 
-This writes one bcrypt hash and nothing else. It is the same operation the reset form performs.
-Never paste a real email or passphrase into a file inside the repo, a commit, or a spec.
+Run `php ~/T/_firefly_iii/reset.php you@example.com`, open the printed URL, and set the new password
+in the browser. The script writes only a reset token, which expires after 60 minutes. The new
+password goes into the form and never reaches a shell history or a transcript. Never paste a real
+email or passphrase into a file inside the repo, a commit, or a spec.
 
 ### 4.3 Start over — only if the ledger is empty
 
@@ -317,7 +359,7 @@ Profile: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/ProfileController.ph
 | Symptom                                                        | Cause                                                              | Fix                                                                                  |
 |----------------------------------------------------------------|--------------------------------------------------------------------|--------------------------------------------------------------------------------------|
 | Login page, no "Register" link, don't know the email           | One user exists; single-user mode hides registration.              | `ffx whoami` → `operator`. Or `grep FIREFLY_MACHINE_OPERATOR .env`. That is the email. |
-| Email known, password unknown                                  | Password lives only as a hash.                                     | §4.1 (reset link from the log) or §4.2 (tinker).                                     |
+| Email known, password unknown                                  | Password lives only as a hash.                                     | §4.1 (reset link from the log) or §4.2 (reset script).                                   |
 | "The Host-header does not match the host in the APP_URL"       | Opened `localhost:7373`; `APP_URL` is `127.0.0.1`.                 | Use http://127.0.0.1:7373/ for everything.                                           |
 | Reset requested, nothing in the log                            | Wrong log, or throttled.                                           | Check both files in §4.1; wait a minute; confirm `MAIL_MAILER=log` in `.env`.        |
 | `/login` redirects straight to `/register`                     | `users` is empty — a fresh database.                               | This is first run (§3). Register. If unexpected, `DB_DATABASE` in `.env` points at the wrong file. |

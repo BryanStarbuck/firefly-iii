@@ -1,0 +1,381 @@
+---
+title: Firefly III — sign-in accounts, the operator, and getting started
+description: >
+  What you type into http://127.0.0.1:7373/login, why the "Register" link is not there, how to get
+  back in when the password is forgotten, and how the ONE sign-in user of this install becomes the
+  OPERATOR that the machine plane (apis.mdx), the CLI (cli.mdx) and the MCP server (mcp.mdx) all
+  act as. This spec is about USER accounts — the row in the `users` table that logs into the web UI.
+  It is NOT about ledger accounts (checking, savings, credit cards) — those are Firefly's
+  asset/expense/revenue/liability accounts, provisioned from the statements manifest in apis.mdx
+  §12 and listed by `ffx accounts` in cli.mdx §9. Upstream Firefly III is a multi-user web app with
+  its own registration, login, password reset and MFA; this fork changes NONE of that. It only
+  adds the rule that a headless client acts as exactly one of those users, chosen by
+  FIREFLY_MACHINE_OPERATOR or, when there is exactly one user, by that fact alone.
+---
+
+# Firefly III — sign-in accounts, the operator, and getting started
+
+`~/BGit/Bryan_git/firefly-iii/` · web UI **http://127.0.0.1:7373/** · login **/login**
+
+---
+
+## Table of Contents
+
+- [Introduction](#introduction)
+- [Goal](#goal)
+- [Overview](#overview)
+- [1. Three things called "account" in this world, and never confusing them](#1-three-things-called-account-in-this-world-and-never-confusing-them)
+- [2. The direct answer — what to type on the login page](#2-the-direct-answer--what-to-type-on-the-login-page)
+- [3. First run — how the one user came to exist](#3-first-run--how-the-one-user-came-to-exist)
+- [4. Forgotten password — three ways back in](#4-forgotten-password--three-ways-back-in)
+- [5. The operator — how one sign-in user drives the CLI and the MCP](#5-the-operator--how-one-sign-in-user-drives-the-cli-and-the-mcp)
+- [6. A second user, and single-user mode](#6-a-second-user-and-single-user-mode)
+- [7. Getting started after the first login](#7-getting-started-after-the-first-login)
+- [8. Upstream account features we keep as-is](#8-upstream-account-features-we-keep-as-is)
+- [9. Troubleshooting](#9-troubleshooting)
+- [10. Security and open-source safety (LOCKED)](#10-security-and-open-source-safety-locked)
+- [11. Acceptance criteria](#11-acceptance-criteria)
+- [12. Related specs](#12-related-specs)
+
+---
+
+## Introduction
+
+This install of Firefly III runs on one computer, for one person, and is driven three ways: the
+browser at http://127.0.0.1:7373/, the `ffx` CLI, and the `firefly_iii` MCP server inside Claude
+Code. Only the browser ever asks for a password. The CLI and the MCP never see one — they hold the
+machine key (apis.mdx §4) and the app decides which USER they act as. That user is the same row
+in the `users` table that the browser logs in with.
+
+So the question "what username and email do I log in with?" has a short answer (§2) and a longer
+one that explains why the page looks the way it does (§3), what to do when the password is gone
+(§4), and how that one login is also the identity behind every `ffx` command and every `ff_` tool
+(§5). Everything here is upstream Firefly III behaviour except §5 and §6, which are this fork's
+additions and are the contract the other three specs rely on.
+
+---
+
+## Goal
+
+- Anyone standing at the login page knows, from this document alone, what to type and why there
+  is no "Register" link.
+- A forgotten password never means a reinstall or a lost ledger. There are three documented ways
+  back in, none of which touch the database file by hand.
+- The identity model is stated once: one sign-in user, one administration, one operator — and the
+  web UI, the CLI and the MCP agree on who that is.
+- Nothing in this spec, or in the repo, contains a real email, password, or hash. The examples use
+  `you@example.com`.
+
+---
+
+## Overview
+
+| Question                                   | Answer                                                                                      |
+|--------------------------------------------|---------------------------------------------------------------------------------------------|
+| Username?                                  | There is none. Firefly III logs in by **email address**.                                    |
+| Which email?                               | The one the install was registered with. It is also `FIREFLY_MACHINE_OPERATOR` in `.env`.   |
+| Which password?                            | The one chosen on the registration page at first run. It is stored only as a bcrypt hash.   |
+| Why no "Register" link?                    | Single-user mode (the default) hides registration once one user exists (§3).                |
+| Forgot it?                                 | "I forgot my password" → the reset link is written to the server log, not sent (§4.1).      |
+| Who does `ffx` / the MCP act as?           | The operator: `FIREFLY_MACHINE_OPERATOR`, or the sole user when there is only one (§5).     |
+| Where do I see who that is?                | `ffx whoami` → `GET /machine/v1/whoami` (apis.mdx §8.0).                                    |
+
+---
+
+## 1. Three things called "account" in this world, and never confusing them
+
+1. **A sign-in user** — a row in `users`: email, bcrypt password hash, optional MFA secret, a
+   `blocked` flag, and a role (`owner` for the first one). This spec is about these.
+   Model: `~/BGit/Bryan_git/firefly-iii/app/User.php`, class `User`.
+2. **An administration** (upstream calls it a *user group*) — a set of books. Every user has at
+   least one; a user can be a member of several with roles. The machine plane binds to exactly one
+   (`FIREFLY_MACHINE_ADMINISTRATION`, default: the operator's own). apis.mdx §4 and §8.1.
+   Model: `~/BGit/Bryan_git/firefly-iii/app/Models/UserGroup.php`.
+3. **A ledger account** — asset, expense, revenue, liability, cash. Checking accounts and credit
+   cards live here. Provisioned from the statements manifest (apis.mdx §12), listed by
+   `ffx accounts list` (cli.mdx §9), exposed as `ff_list_accounts` (mcp.mdx §9).
+   Model: `~/BGit/Bryan_git/firefly-iii/app/Models/Account.php`.
+
+When a spec, a command, or an MCP tool says "account" without qualification it means the third
+kind. This document is the only place where the bare word means the first.
+
+---
+
+## 2. The direct answer — what to type on the login page
+
+- **Email**: the address the install was registered with. On this machine it is the value of
+  `FIREFLY_MACHINE_OPERATOR` in the git-ignored `.env` at the repo root (the setup recipe writes
+  the line for you to fill in; when it is set, it is set to that same address). To read it without
+  opening `.env`: `ffx whoami` prints it as `operator`.
+- **Password**: whatever was typed twice on the registration page at first run (§3). It exists
+  nowhere but the bcrypt hash in the database. Nobody — not `.env`, not the credentials file, not
+  this repo — can tell you what it is. If it is gone, go to §4.
+- **Remember me**: fine on this machine; the session cookie is scoped to the loopback host.
+- **Which URL**: use **http://127.0.0.1:7373/login**, not `localhost`. Login itself works from
+  either, but `APP_URL` is `http://127.0.0.1:7373` and upstream checks the `Host` header against it
+  on the password-reset path (§4.1) — from `localhost` that check fails with a "Host-header does
+  not match" error. One host, always, avoids the surprise.
+
+The login form and its gating are upstream code:
+`~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Auth/LoginController.php`, class
+`LoginController`, method `showLoginForm()` (the login-by-email field comes from `username()`).
+
+---
+
+## 3. First run — how the one user came to exist
+
+Firefly III has no seeded admin account and no default password. The sequence on a fresh
+database is:
+
+1. `just setup` migrates the schema. The `users` table is empty.
+2. The first visit to `/login` counts users; with zero users and the `web` guard it **redirects to
+   `/register`**. Whoever fills in that form becomes user #1 with the `owner` role and their own
+   administration.
+   Implemented in `LoginController::showLoginForm()` (the `0 === $count` redirect) and
+   `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Auth/RegisterController.php`, class
+   `RegisterController`, methods `showRegistrationForm()` / `register()`.
+3. From then on **single-user mode** — `config('firefly.configuration.single_user_mode')`, default
+   `true`, overridable per install in *Settings → Configuration* — makes `allowedToRegister()`
+   return `false` once `User::count() > 0`, so `/register` refuses and the "Register" link
+   disappears from the login page.
+   Gate: `RegisterController::allowedToRegister()`; the link toggle is the `allowRegistration`
+   view variable in `LoginController::showLoginForm()`.
+
+Consequence: the email on file is the one email that can log in, and it is that email because a
+human typed it at step 2. This install's `.env` records the same address as
+`FIREFLY_MACHINE_OPERATOR` so the plane can name it without querying (§5).
+
+`php artisan system:create-first-user {email}` exists upstream but refuses outside
+`APP_ENV=testing`; it is not part of any flow here.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Console/Commands/System/CreatesFirstUser.php`.
+
+---
+
+## 4. Forgotten password — three ways back in
+
+None of these delete or edit the SQLite file by hand. The ledger is never at risk from a lost
+password.
+
+### 4.1 The "I forgot my password" link (preferred)
+
+This install has `MAIL_MAILER=log`: Firefly III "sends" mail by writing the whole message to the
+application log. So the reset email is never delivered anywhere — it lands in a file you can read.
+
+1. Open **http://127.0.0.1:7373/password/reset** (the link under the login form). Must be
+   `127.0.0.1`, see §2.
+2. Enter the email from §2 and submit. The page always says the same neutral thing whether or not
+   the email exists.
+3. Find the link in the log. The `stack` channel writes to both of these; either works:
+   - `~/T/_firefly_iii/server.log` (stdout of the detached server — `just logs` follows it)
+   - `~/BGit/Bryan_git/firefly-iii/storage/logs/ff3-cli-server-YYYY-MM-DD.log` (the daily file;
+     git-ignored)
+   Search for `password/reset/` and open that URL. It contains a one-time token and expires
+   (Laravel default: 60 minutes).
+4. Set the new password on the form it opens.
+
+Implemented in `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Auth/ForgotPasswordController.php`,
+class `ForgotPasswordController`, method `sendResetLinkEmail()` (`validateHost()` is the Host
+check); the token form is `ResetPasswordController::showResetForm()` / `reset()` in the same
+directory. Mail transport: `~/BGit/Bryan_git/firefly-iii/config/mail.php`, mailer `log`, channel
+`MAIL_LOG_CHANNEL` (default `stack`).
+
+Throttling: a second request inside Laravel's reset throttle window is refused and logged
+(`passwords.throttled`); wait a minute and try once.
+
+### 4.2 Set a new password from the terminal
+
+When the log route is inconvenient (log rotated, server not running):
+
+```
+cd ~/BGit/Bryan_git/firefly-iii
+php artisan tinker
+>>> $u = \FireflyIII\User::where('email', 'you@example.com')->firstOrFail();
+>>> $u->password = \Illuminate\Support\Facades\Hash::make('a-new-long-passphrase');
+>>> $u->save();
+```
+
+This writes one bcrypt hash and nothing else. It is the same operation the reset form performs.
+Never paste a real email or passphrase into a file inside the repo, a commit, or a spec.
+
+### 4.3 Start over — only if the ledger is empty
+
+If the database holds nothing worth keeping (a fresh `just setup` that was registered with a
+typo, say), stop the server (`just stop`), remove `~/T/_firefly_iii/db/firefly.sqlite`, and run
+`just setup` again; `/login` will redirect to `/register` (§3). This destroys every transaction.
+Do not do this to recover a password on a populated ledger — §4.1 or §4.2 always works.
+
+---
+
+## 5. The operator — how one sign-in user drives the CLI and the MCP
+
+The machine plane never authenticates a person; it authenticates the *machine* (the key,
+apis.mdx §4) and then acts **as a user** — the operator. Resolution, in order (apis.mdx §4,
+table "Which user"):
+
+1. `FIREFLY_MACHINE_OPERATOR` (an email) in `.env` → that user, if it exists and is not blocked.
+2. Unset, and the install has **exactly one** user → that user.
+3. Otherwise → the plane refuses with "Not ready", naming the candidate emails in `details`, and
+   every `ffx` command and `ff_` tool reports it (apis.mdx §5, "Not ready").
+
+Then the administration: `FIREFLY_MACHINE_ADMINISTRATION` (an id) if set, else the operator's own.
+
+Implemented in `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Middleware/` (the gate ladder —
+the operator step is the last rung before a handler runs); configuration keys in
+`~/BGit/Bryan_git/firefly-iii/config/machine.php` (`operator`, `administration`).
+
+What this means at the login page: **the email you log in with and the operator are the same
+person.** A transaction the MCP creates shows up in the browser because both are the same user in
+the same administration. There is no second login for the CLI, and no API token to mint — the
+machine key is the whole credential, and it is not tied to a password.
+
+To see the resolved identity without a browser:
+
+```
+ffx whoami            # operator, administrationId/Name, primaryCurrency, key fingerprint
+ffx status            # includes operatorResolved: yes/no and what to do if no
+```
+
+Both are `GET /machine/v1/whoami` and `/health` (apis.mdx §8.0); the MCP mirrors them as
+`ff_whoami` and `ff_health` (mcp.mdx §9).
+
+---
+
+## 6. A second user, and single-user mode
+
+This install is one person's books and stays in single-user mode. If a second user is ever
+wanted (a spouse, an accountant with read access):
+
+1. Log in as the owner, open *Settings → Configuration* (`/settings/configuration`), turn
+   **single user mode** off, save. `/register` is now open.
+   Code: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Admin/ConfigurationController.php`,
+   method `postIndex()` writes `single_user_mode`.
+2. Register the second user (or have them register), then turn single-user mode back **on** so
+   the login page stops offering registration to anyone who reaches the port.
+3. Set `FIREFLY_MACHINE_OPERATOR=you@example.com` explicitly in `.env` (§5 rule 3: with two users
+   and no operator set, the plane refuses on purpose). `ffx status` confirms.
+4. Owner-only admin pages — *Settings → Users* (`/settings/users`) lists users and lets the owner
+   block or delete one. The plane's admin tier exposes the same list read-only as
+   `GET /admin/users` (apis.mdx §8, "A" tier) precisely so an operator can be chosen from a
+   terminal.
+   Code: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Admin/UserController.php`;
+   plane route in `~/BGit/Bryan_git/firefly-iii/app/Machine/Routes/AdminRoutes.php`.
+
+Sharing one *administration* between two users (memberships and roles) is upstream's
+`/administrations` UI; the plane reads it as `GET /administrations` (apis.mdx §8.1). This fork
+adds no write there.
+
+---
+
+## 7. Getting started after the first login
+
+The first login lands on an empty dashboard. In order:
+
+1. **Primary currency.** Upstream defaults to **EUR**. Open *Currencies* (`/currencies`), enable
+   USD, make it the default. `ffx whoami` shows `primaryCurrency` — check it reads `USD` before
+   importing anything; a statement imported under the wrong primary currency is a nuisance to fix.
+   Code: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/TransactionCurrency/` (the
+   `makeDefault` action).
+2. **Ledger accounts.** Do not create them by hand in the UI when the statements archive has a
+   manifest. `ffx statements manifest` → `ffx accounts plan` / `apply` provisions every asset and
+   liability account named in `import/accounts.csv` with the exact naming rule (apis.mdx §12,
+   cli.mdx §10). Hand-made accounts with slightly different names are the first cause of
+   duplicated books.
+3. **Statements.** `ffx statements roots` → `scan` → `plan` → `apply` (cli.mdx §10). Every apply is
+   a dry run first, with a confirm token; duplicates are decided by Firefly's own `import_hash_v2`.
+4. **The MCP.** `just build` registered `firefly_iii` read-only with Claude Code; restart Claude
+   Code or `/mcp`. `ff_whoami` should name the same operator the browser is logged in as. Writes
+   need both `FIREFLY_MACHINE_ALLOW_WRITE=1` in `.env` and `just mcp-register 1` (mcp.mdx §5).
+5. **Optional: MFA.** *Options → Profile* lets the user enable TOTP two-factor. It protects the
+   browser login only; the machine plane is unaffected (it never logs in). §8.
+
+The `justfile` at the repo root is the checklist's engine: `just setup` (once), `just run`,
+`just url`, `just status`, `just doctor`.
+
+---
+
+## 8. Upstream account features we keep as-is
+
+| Feature                     | Where in the UI                 | Notes for this install                                                                 |
+|-----------------------------|---------------------------------|----------------------------------------------------------------------------------------|
+| Email + password login      | `/login`                        | The only credential a human ever types.                                                |
+| Registration                | `/register`                     | Open only while `users` is empty, or with single-user mode off (§3, §6).               |
+| Password reset by email     | `/password/reset`               | "Email" is the server log here (§4.1). Host must match `APP_URL`.                      |
+| Change password / email     | *Options → Profile*             | Changing the email means updating `FIREFLY_MACHINE_OPERATOR` too, or the plane refuses. |
+| Two-factor (TOTP)           | *Options → Profile*             | Browser only. Recovery codes are shown once; keep them outside the repo.               |
+| Blocking a user             | *Settings → Users*              | A blocked operator makes the plane "Not ready" (§5).                                   |
+| Demo user role              | —                               | `DEMO_USERNAME` / `DEMO_PASSWORD` in `.env`, unset here. Demo users cannot reset passwords. |
+| External auth guards        | `AUTHENTICATION_GUARD`          | Stays `web`. `remote_user_guard` / `ldap` disable registration and reset entirely.     |
+| OAuth clients / API tokens  | *Options → Profile → OAuth*     | Upstream's `/api/v1` credential. Not used by `ffx` or the MCP, which use the machine key. |
+
+Two-factor code: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/Auth/TwoFactorController.php`.
+Profile: `~/BGit/Bryan_git/firefly-iii/app/Http/Controllers/ProfileController.php`.
+
+---
+
+## 9. Troubleshooting
+
+| Symptom                                                        | Cause                                                              | Fix                                                                                  |
+|----------------------------------------------------------------|--------------------------------------------------------------------|--------------------------------------------------------------------------------------|
+| Login page, no "Register" link, don't know the email           | One user exists; single-user mode hides registration.              | `ffx whoami` → `operator`. Or `grep FIREFLY_MACHINE_OPERATOR .env`. That is the email. |
+| Email known, password unknown                                  | Password lives only as a hash.                                     | §4.1 (reset link from the log) or §4.2 (tinker).                                     |
+| "The Host-header does not match the host in the APP_URL"       | Opened `localhost:7373`; `APP_URL` is `127.0.0.1`.                 | Use http://127.0.0.1:7373/ for everything.                                           |
+| Reset requested, nothing in the log                            | Wrong log, or throttled.                                           | Check both files in §4.1; wait a minute; confirm `MAIL_MAILER=log` in `.env`.        |
+| `/login` redirects straight to `/register`                     | `users` is empty — a fresh database.                               | This is first run (§3). Register. If unexpected, `DB_DATABASE` in `.env` points at the wrong file. |
+| Every page is a 500                                            | `public/build/` missing (Vite assets), not an account problem.      | `just setup` builds them.                                                            |
+| "419 Page Expired" on submit                                   | Session/CSRF cookie stale, often after switching host names.       | Reload the login page on `127.0.0.1` and try again.                                  |
+| `ffx status` says operator not resolved                        | Two users and no `FIREFLY_MACHINE_OPERATOR`, or operator blocked/renamed. | Set `FIREFLY_MACHINE_OPERATOR` to the exact current email; `just status`.       |
+| Browser and MCP disagree on what exists                        | Logged into a different user or administration than the operator.   | `ffx whoami` vs the profile page; align `FIREFLY_MACHINE_OPERATOR` / `_ADMINISTRATION`. |
+
+---
+
+## 10. Security and open-source safety (LOCKED)
+
+- The login email is personal data. It appears in `.env` (git-ignored, mode 0600) and in the
+  SQLite file under `~/T/_firefly_iii/` — nowhere else. Never in a spec, a test fixture, a commit
+  message, or a log line committed to the repo. Examples use `you@example.com`.
+- The password exists only as a bcrypt hash in the database. Nothing in the repo, the credentials
+  file, or the state directory holds a plaintext password, and no recipe prints one.
+- The machine key (`~/.credentials/firefly_iii.json`) is not a substitute for the password and
+  cannot log a browser in; the password cannot call the machine plane. Two credentials, two doors,
+  no bridge between them (apis.mdx §4, §16).
+- The machine plane never authenticates a person. It never reads or verifies `password`, never
+  issues a session, and never bypasses MFA — it acts as the operator in-process, on loopback, with
+  the key, and every write is audited to `~/T/_firefly_iii/machine.audit` (apis.mdx §7).
+- Registration stays closed (single-user mode on) whenever the install is not actively adding a
+  user. The port is loopback-only, but closed is still the right default.
+- Password-reset links in the server log are one-time and time-limited. The log files are
+  git-ignored and live outside the repo (`~/T/_firefly_iii/`) or in git-ignored `storage/logs/`.
+- Upstream's `/api/v1` OAuth clients and personal access tokens are untouched by this fork and not
+  used by it; the CLI and MCP never hold one.
+
+---
+
+## 11. Acceptance criteria
+
+1. With one user in the database and single-user mode on, `/login` shows no "Register" link and
+   `/register` refuses; the login form accepts that user's email and password.
+2. With zero users, `/login` redirects to `/register`, and the first registration creates the
+   owner and their administration.
+3. `ffx whoami` prints as `operator` the same email the browser logs in with, and the same
+   `administrationId` the browser's profile shows as current.
+4. A reset requested at http://127.0.0.1:7373/password/reset produces a `password/reset/{token}`
+   URL in `~/T/_firefly_iii/server.log`; following it lets the user set a new password; the ledger
+   is unchanged.
+5. The same request from `http://localhost:7373` fails with the Host-header error — and this spec
+   says so, so it is not filed as a bug.
+6. With two users and `FIREFLY_MACHINE_OPERATOR` unset, the plane returns "Not ready" naming both
+   emails; setting the variable resolves it without a restart of anything but the server.
+7. The repo's real-data canary (cli.mdx §17 — a grep for the operator's real domains across
+   pm/, cli/, mcp/, app/Machine/, tests/Machine/) finds nothing, this file included.
+
+---
+
+## 12. Related specs
+
+- `apis.mdx` — §4 the machine key and operator resolution; §8.0 `/whoami` and `/health`; §8
+  admin tier `/admin/users`; §12 provisioning ledger accounts from the manifest; §16 security.
+- `cli.mdx` — §3 bring-up (`ffx up`), §4 the key, §9 `ffx accounts` (ledger accounts), §10 the
+  statements pipeline, §12 `ffx whoami` / `status` / `doctor`.
+- `mcp.mdx` — §5 registering with Claude Code, §6 the same key, §9 `ff_whoami` / `ff_health`.
+- Root `CLAUDE.md` — running locally, the state directory, the private-data boundary.
+- Root `justfile` — `setup`, `run`, `url`, `status`, `doctor`, `logs`.

@@ -111,8 +111,15 @@ Upstream code worth knowing when working on the plane:
 * Runtime: `php artisan serve --host=127.0.0.1 --port=7373` with `PHP_CLI_SERVER_WORKERS=4`. Needs
   PHP 8.5 and Composer on the host (`brew install php composer`). Docker is not supported for the
   machine plane: requests arrive from the bridge IP, so the loopback gate fails closed.
-* Root `justfile` (ours; upstream has none): `just setup`, `just build`, `just run`, `just server-bg`,
-  `just stop`, `just status`, `just doctor`, `just test`.
+* Root `justfile` (ours; upstream has none): `just setup`, `just build`, `just run`, `just dev`, `just url`,
+  `just open`, `just stop`, `just status`, `just doctor`, `just logs`, `just test`, `just mcp-register`.
+  * `just build` compiles the CLI and the MCP server AND registers the MCP server with Claude Code
+    (user scope, read-only, idempotent). `just mcp-register 1` re-registers it with writes on.
+  * `just run` builds, starts the web app DETACHED via `ffx up` (the terminal comes back), and prints
+    the URL block: `http://127.0.0.1:7373/`, `/up`, `/machine/v1`, MCP registration state, log path.
+    `just dev` is the foreground server (Ctrl-C stops it).
+  * Ports across the sister forks never collide: Actual Budget 3001 (+5006 sync), ezBookkeeping 8080,
+    Firefly III 7373.
 * `just setup` also builds the web UI's Vite assets (`public/build/` is git-ignored upstream; without it
   every page 500s) and mints the machine key.
 * Tests: `just test` runs the CLI suite (`cli/`), the plane suite (`php vendor/bin/phpunit -c

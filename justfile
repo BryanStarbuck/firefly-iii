@@ -3,6 +3,12 @@
 #
 #   One process serves everything on http://127.0.0.1:7373/ :
 #   the web UI, upstream's /api/v1, Laravel's /up health route, and /machine/v1.
+#   Sister forks use other ports so all three can run at once:
+#   Actual Budget 3001 (+ sync server 5006), ezBookkeeping 8080, Firefly III 7373.
+#
+#   `just build`  compiles the CLI + MCP server and registers the MCP server with Claude Code.
+#   `just run`    builds, starts the web app detached (terminal returns), prints the URL.
+#   `just dev`    foreground server (Ctrl-C stops).   `just stop` / `just status` / `just logs`.
 #
 #   Private data never lives in this repo: the SQLite database, the logs and the
 #   pid file live under ~/T/_firefly_iii/, and the machine key in
@@ -14,6 +20,7 @@ root  := justfile_directory()
 state := env_var("HOME") + "/T/_firefly_iii"
 host  := "127.0.0.1"
 port  := "7373"
+mcp_name := "firefly_iii"
 
 default:
     @just --list
@@ -63,18 +70,92 @@ setup:
     [ "$fresh_env" = 1 ] && echo "wrote .env — set FIREFLY_MACHINE_OPERATOR there if this install has more than one user" || true
     echo "setup done. Next: just run   (or: just server-bg)"
 
-# Build the CLI (and the MCP server when present). The CLI must never be stale relative to the app.
-build:
+# After this, `firefly_iii` (ff_* tools) is usable from Claude Code — restart Claude Code, or /mcp, to pick it up.
+# Build the CLI and the MCP server, then register the MCP server with Claude Code.
+build: build-cli build-mcp mcp-register
+
+# Compile the CLI (cli/code/src → cli/code/dist). The CLI must never be stale relative to the app.
+build-cli:
     cd "{{root}}/cli" && ./node_modules/.bin/tsc -p code/tsconfig.json
+
+# Compile the MCP server (mcp/src → mcp/dist, instructions from ai/mcp_prompt_firefly.md).
+build-mcp:
     if [ -f "{{root}}/mcp/package.json" ]; then cd "{{root}}/mcp" && npm run --silent build; fi
 
-# Serve the app in the FOREGROUND on http://127.0.0.1:7373/ (Ctrl-C stops it).
+# Read-only by default. For writes: just mcp-register 1  (the app's .env needs FIREFLY_MACHINE_ALLOW_WRITE=1 too).
+# Register the MCP server with Claude Code (user scope) if not registered yet. Idempotent.
+mcp-register write="0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    entry="{{root}}/mcp/dist/index.js"
+    if ! command -v claude >/dev/null 2>&1; then
+      echo "  mcp          claude CLI not on PATH — not registered. Later: just mcp-register"; exit 0
+    fi
+    [ -f "$entry" ] || { echo "  mcp          $entry missing — run: just build-mcp" >&2; exit 1; }
+    if claude mcp get {{mcp_name}} >/dev/null 2>&1 && ! claude mcp get {{mcp_name}} 2>&1 | grep -q '^No MCP server'; then
+      if [ "{{write}}" = "1" ] && ! claude mcp get {{mcp_name}} 2>&1 | grep -q 'FFMCP_ALLOW_WRITE=1'; then
+        claude mcp remove --scope user {{mcp_name}} >/dev/null 2>&1 || claude mcp remove {{mcp_name}} >/dev/null 2>&1 || true
+      else
+        echo "  mcp          {{mcp_name}} already registered with Claude Code (claude mcp get {{mcp_name}})"; exit 0
+      fi
+    fi
+    if [ "{{write}}" = "1" ]; then
+      claude mcp add --scope user {{mcp_name}} -e FFMCP_ALLOW_WRITE=1 -- "$entry" serve >/dev/null
+      echo "  mcp          {{mcp_name}} registered with Claude Code (user scope, WRITES ENABLED)"
+    else
+      claude mcp add --scope user {{mcp_name}} -- "$entry" serve >/dev/null
+      echo "  mcp          {{mcp_name}} registered with Claude Code (user scope, read-only)"
+    fi
+    echo "               restart Claude Code (or run /mcp) so it starts the server"
+
+# Remove the MCP server from Claude Code.
+mcp-unregister:
+    claude mcp remove --scope user {{mcp_name}} 2>/dev/null || claude mcp remove {{mcp_name}}
+
+# Web UI + /api/v1 + /machine/v1 all on one port. Logs → ~/T/_firefly_iii/server.log. Same code path as `ffx up`.
+# Build everything, start the web app DETACHED (the terminal comes back), print the URL.
 run: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    "{{root}}/cli/ffx" up >/dev/null
+    just --justfile "{{root}}/justfile" url
+
+# Alias of `run` (kept for the spec's name; pm/cli.mdx §3).
+server-bg: run
+
+# Serve the app in the FOREGROUND (Ctrl-C stops it). Use `just run` to get the terminal back.
+dev: build-cli
+    @echo "  Firefly III (foreground):  http://{{host}}:{{port}}/   Ctrl-C stops it"
     cd "{{root}}" && PHP_CLI_SERVER_WORKERS=4 php artisan serve --host={{host}} --port={{port}}
 
-# Serve the app DETACHED — logs to ~/T/_firefly_iii/server.log, pid in server.pid. Same code path as `ffx up`.
-server-bg: build
-    "{{root}}/cli/ffx" up
+# Print the URLs: web app, health, machine plane, plus MCP registration state.
+url:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    up=down; pid=""
+    if curl -fsS -m 2 "http://{{host}}:{{port}}/up" >/dev/null 2>&1; then up=UP; fi
+    [ -f "{{state}}/server.pid" ] && pid="$(cat "{{state}}/server.pid" 2>/dev/null)"
+    mcp=not\ registered
+    if command -v claude >/dev/null 2>&1 && ! claude mcp get {{mcp_name}} 2>&1 | grep -q '^No MCP server'; then mcp=registered; fi
+    echo
+    echo "  ============================================================"
+    echo "  Firefly III is $up${pid:+  (pid $pid)}"
+    echo "  web app       http://{{host}}:{{port}}/"
+    echo "  also          http://localhost:{{port}}/"
+    echo "  health        http://{{host}}:{{port}}/up"
+    echo "  machine API   http://{{host}}:{{port}}/machine/v1   (loopback + key only)"
+    echo "  MCP server    {{mcp_name}}  $mcp in Claude Code   (ff_* tools)"
+    echo "  log           ~/T/_firefly_iii/server.log"
+    echo "  stop          just stop        status  just status        open  just open"
+    echo "  ============================================================"
+    echo
+
+# Open the web app in the default browser (starts it first if it is down).
+open:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    curl -fsS -m 2 "http://{{host}}:{{port}}/up" >/dev/null 2>&1 || "{{root}}/cli/ffx" up >/dev/null
+    open "http://{{host}}:{{port}}/"
 
 # Stop OUR instance (the recorded pid tree) — never a foreign process on the port.
 stop:
@@ -93,7 +174,7 @@ logs:
     "{{root}}/cli/ffx" logs --follow
 
 # The CLI's tests and canaries; the machine plane's PHPUnit suite when it exists.
-test: build
+test: build-cli build-mcp
     cd "{{root}}/cli" && node --test code/dist/test/
     if [ -d "{{root}}/tests/Machine" ] && [ -x "{{root}}/vendor/bin/phpunit" ]; then cd "{{root}}" && php vendor/bin/phpunit -c phpunit.machine.xml; fi
     if [ -f "{{root}}/mcp/package.json" ]; then cd "{{root}}/mcp" && npm test --silent; fi

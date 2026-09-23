@@ -2,6 +2,7 @@
  * THE one array of verbs. The parser, `ffx help`, and the tests read it;
  * there is no second list (pm/cli.mdx §7.3).
  */
+import { signInVerbs } from './commands/accounts.js';
 import { analyticsVerbs } from './commands/analytics.js';
 import { ledgerVerbs } from './commands/ledger.js';
 import { orientationVerbs } from './commands/orientation.js';
@@ -19,6 +20,7 @@ export const REGISTRY: readonly VerbDef[] = Object.freeze([
   ...analyticsVerbs,
   ...statementsVerbs,
   ...writeVerbs,
+  ...signInVerbs,
 ]);
 
 /** Fails loudly at startup (and in tests) if two verbs claim the same path. */

@@ -33,6 +33,7 @@ use FireflyIII\Machine\Envelope;
 use FireflyIII\Machine\ErrorFile\ErrorFile;
 use FireflyIII\Machine\MachineException;
 use FireflyIII\Machine\Operator;
+use FireflyIII\Machine\SignIn\SignInUsers;
 use FireflyIII\Machine\WriteResult;
 use FireflyIII\Models\Webhook;
 use FireflyIII\Models\WebhookMessage;
@@ -445,16 +446,150 @@ final class AdminController extends MachineController
         $transformer->setParameters(new ParameterBag());
         $operatorId  = Operator::user($request)?->id;
         $rows        = [];
-        foreach ($repository->all() as $user) {
+
+        // Every account, blocked ones INCLUDED. UserRepository::all() filters `blocked = false`,
+        // which is right for the admin UI's "pick a user" lists and wrong here: the one moment a
+        // caller most needs this list is when the account they are locked out of is the blocked
+        // one (accounts.mdx §4.3).
+        foreach (User::query()->orderBy('id')->get() as $user) {
             /** @var User $user */
-            $row                  = $transformer->transform($user);
+            $row                      = $transformer->transform($user);
             unset($row['links']);
             $row['administration_id'] = null === $user->user_group_id ? null : (int) $user->user_group_id;
             $row['is_operator']       = $operatorId === $user->id;
+            $row['is_owner']          = SignInUsers::isOwner($user);
+            $row['has_mfa']           = '' !== (string) $user->mfa_secret;
             $rows[]                   = $row;
         }
 
         return $this->ok(['users' => $this->applyList($rows, $params), 'operator_setting' => 'FIREFLY_MACHINE_OPERATOR']);
+    }
+
+    // -------------------------------------------------- sign-in accounts ---
+
+    /**
+     * POST /admin/first-user — the bootstrap (apis.mdx §8.11a, accounts.mdx §4.3).
+     *
+     * WRITE tier, not admin, and that is the whole design of this route: it refuses unless the
+     * install has ZERO sign-in accounts, so the only thing it can do is the thing upstream's own
+     * /register page does for nobody at all on a fresh database. It can never be used against an
+     * install that has data, because an install that has data has a user.
+     */
+    public function createFirstUser(Request $request): JsonResponse
+    {
+        $args  = $this->input($request, self::accountRules());
+        $route = $this->routeKey($request);
+
+        $user  = $this->locked(function () use ($args, $route, $request): User {
+            $count = SignInUsers::count();
+            if (0 !== $count) {
+                Audit::line($request, ['route' => $route, 'tier' => 'write', 'ok' => false, 'code' => 'conflict']);
+
+                throw MachineException::conflict(
+                    sprintf('This install already has %d sign-in account%s, so there is no first account to create.', $count, 1 === $count ? '' : 's'),
+                    'To change an existing account\'s password: POST /machine/v1/admin/users/{id}/password (ffx admin set-password), which is admin-tier',
+                    ['users' => $count],
+                );
+            }
+
+            return DB::transaction(static fn (): User => SignInUsers::create((string) $args['email'], (string) $args['password'], true));
+        }, true);
+
+        Audit::line($request, ['route' => $route, 'tier' => 'write', 'ok' => true, 'changed' => 1]);
+
+        return $this->ok([
+            'created'  => true,
+            'user'     => SignInUsers::describe($user),
+            'sign_in'  => rtrim((string) config('app.url'), '/').'/login',
+            'note'     => 'This account is the owner of the install. Sign in with that email address and the password you just set; the password is not in this answer, in any log, or in the audit trail.',
+            'next'     => SignInUsers::operatorAdvice($user),
+        ]);
+    }
+
+    /**
+     * POST /admin/users — a further sign-in account, on an install that already has one.
+     * Admin tier: every account added here can read and write the whole ledger it is given.
+     */
+    public function createUser(Request $request): JsonResponse
+    {
+        $args  = $this->input($request, self::accountRules() + ['owner' => ['sometimes', new IsBoolean()]]);
+        $route = $this->routeKey($request);
+
+        $user  = $this->locked(static fn (): User => DB::transaction(
+            static fn (): User => SignInUsers::create((string) $args['email'], (string) $args['password'], (bool) ($args['owner'] ?? false)),
+        ), true);
+
+        Audit::line($request, ['route' => $route, 'tier' => 'admin', 'ok' => true, 'changed' => 1]);
+
+        return $this->ok([
+            'created' => true,
+            'user'    => SignInUsers::describe($user),
+            'sign_in' => rtrim((string) config('app.url'), '/').'/login',
+            'note'    => 'The password is not in this answer, in any log, or in the audit trail.',
+            'next'    => SignInUsers::operatorAdvice($user),
+        ]);
+    }
+
+    /**
+     * POST /admin/users/{id}/password — the way back in (accounts.mdx §4.3).
+     *
+     * `{id}` is the numeric id or the email address. There is no dry run: a password has no
+     * preview, and the one thing a preview could show — "this will replace the hash" — is the
+     * whole operation. The old hash is NOT kept anywhere, so this cannot be undone; the answer
+     * says so.
+     */
+    public function setUserPassword(Request $request, string $id): JsonResponse
+    {
+        $args    = $this->input($request, [
+            'password'  => SignInUsers::PASSWORD_RULES,
+            'clear_mfa' => ['sometimes', new IsBoolean()],
+            'unblock'   => ['sometimes', new IsBoolean()],
+        ]);
+        $route   = $this->routeKey($request);
+        $user    = SignInUsers::require($id);
+
+        $changed = $this->locked(static fn (): array => DB::transaction(static fn (): array => SignInUsers::setPassword(
+            $user,
+            (string) $args['password'],
+            (bool) ($args['clear_mfa'] ?? false),
+            (bool) ($args['unblock'] ?? false),
+        )), true);
+
+        Audit::line($request, ['route' => $route, 'tier' => 'admin', 'ok' => true, 'changed' => 1]);
+
+        $notes   = ['The old password stopped working now. It was a one-way hash, so this cannot be undone — and the new password is not in this answer, in any log, or in the audit trail.'];
+        if ($changed['mfa_cleared']) {
+            $notes[] = 'Two-factor authentication was switched off for this account; set it up again in the web UI under Options → Profile.';
+        }
+        if ($changed['unblocked']) {
+            $notes[] = 'The account was blocked and has been unblocked.';
+        }
+        if (!$changed['mfa_cleared'] && SignInUsers::describe($user)['has_mfa']) {
+            $notes[] = 'This account still has two-factor authentication on, so signing in also needs its authenticator code. Repeat with clear_mfa: true if that device is gone.';
+        }
+        if (!$changed['unblocked'] && SignInUsers::isBlocked($user)) {
+            $notes[] = 'This account is BLOCKED, so the new password will not sign in until it is unblocked. Repeat with unblock: true.';
+        }
+
+        return $this->ok([
+            'password_set' => true,
+            'user'         => SignInUsers::describe($user),
+            'sign_in'      => rtrim((string) config('app.url'), '/').'/login',
+            'undoable'     => false,
+            'notes'        => $notes,
+            'next'         => SignInUsers::operatorAdvice($user),
+        ]);
+    }
+
+    /**
+     * The arguments both create routes take. `password` is never echoed, and Redactor::SECRET_KEY
+     * already refuses any key matching /pass(word)?/ in the error file.
+     *
+     * @return array<string, mixed>
+     */
+    private static function accountRules(): array
+    {
+        return ['email' => SignInUsers::EMAIL_RULES, 'password' => SignInUsers::PASSWORD_RULES];
     }
 
     public function configuration(Request $request): JsonResponse

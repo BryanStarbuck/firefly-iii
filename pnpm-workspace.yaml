@@ -1,0 +1,4 @@
+# pnpm reads workspaces from here, not from package.json's "workspaces" field.
+# npm (the package manager this repo uses, see package-lock.json) keeps using package.json.
+packages:
+  - "resources/assets/v3"

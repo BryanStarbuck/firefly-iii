@@ -46,6 +46,7 @@ the Firefly III app itself
 - [6. Tiers, capabilities and negotiation](#6-tiers-capabilities-and-negotiation)
 - [7. The write protocol](#7-the-write-protocol)
 - [8. The route catalogue](#8-the-route-catalogue)
+  - [8.11a Sign-in accounts — the bootstrap and the way back in](#811a-sign-in-accounts--the-bootstrap-and-the-way-back-in)
 - [9. Coverage — every UI action, and the route that carries it](#9-coverage--every-ui-action-and-the-route-that-carries-it)
 - [10. The analytics and charting plane](#10-the-analytics-and-charting-plane)
 - [11. The ingest plane — statements into the ledger](#11-the-ingest-plane--statements-into-the-ledger)
@@ -959,10 +960,15 @@ will do disagrees with it exactly where it matters — a rule with a `stop proce
 duplicate hash computed over a field the predictor forgot, a split whose amounts do not sum — and
 the disagreement surfaces as a plan that says 117 and an apply that does 131.
 
-The two routes that have **no** `dry_run`, and say so in their schema rather than accepting a flag
-they would ignore: `POST /undo` (the preview is the thing itself; its plan is `GET /undo/last`) and
+The routes that have **no** `dry_run`, and say so in their schema rather than accepting a flag they
+would ignore: `POST /undo` (the preview is the thing itself; its plan is `GET /undo/last`),
 `POST /recurrences/{id}/trigger` (Firefly's trigger creates the next occurrence and its preview is
-`GET /recurrences/{id}` showing the next date).
+`GET /recurrences/{id}` showing the next date), `POST /admin/key/rotate` (the new key IS the
+result), and the three sign-in-account routes of §8.11a (a password has no preview).
+
+On all of them `dry_run` and `confirm_token` are *unknown arguments*, refused by gate 5 (§5.7),
+never ignored: a caller who sent `dry_run: true` and got a silent success would believe a preview
+had run.
 
 Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/DryRun.php` — `DryRun::run(callable $write): DryRunResult`, `holdSideEffects()`
 
@@ -1503,11 +1509,91 @@ decision, not a bookkeeping one.
 | `/admin/correct-database`  | POST | **A** | `firefly-iii:correct-database` — the integrity repairs; the response lists what each corrector changed |
 | `/admin/data/destroy`      | POST | **A** | `objects` (Firefly's `data/destroy` list), `confirm_token`                                        |
 | `/admin/data/purge`        | POST | **A** | permanently removes soft-deleted rows — **after which `/undo` of those rows is impossible**, and the response says so |
-| `/admin/users`             | GET  | **A** | the install's users (for choosing `FIREFLY_MACHINE_OPERATOR`)                                    |
+| `/admin/users`             | GET  | **A** | every sign-in account, blocked ones included (this is how `FIREFLY_MACHINE_OPERATOR` is chosen, so it answers with NO operator bound) |
 | `/admin/configuration`     | GET  | **A** | the install's dynamic configuration values                                                        |
+
+The three routes that *write* a sign-in account have their own section: §8.11a.
 
 Every `DELETE` in this spec is admin-tier and is listed with its family rather than here, because a
 caller looks for "how do I delete a tag" under tags.
+
+### 8.11a Sign-in accounts — the bootstrap and the way back in
+
+The rows in the `users` table that log into the web UI. Not ledger accounts (§8.2). The full
+rationale, the CLI surface and the troubleshooting live in **accounts.mdx §4.3**; this section is
+the wire contract.
+
+| Route                        | M    | Tier  | Dry run | Operator | Body                                            |
+| ---------------------------- | ---- | ----- | ------- | -------- | ----------------------------------------------- |
+| `/admin/first-user`          | POST | **W** | none    | not bound | `email`, `password`                             |
+| `/admin/users`               | POST | **A** | none    | not bound | `email`, `password`, `owner?`                   |
+| `/admin/users/{id}/password` | POST | **A** | none    | not bound | `password`, `clear_mfa?`, `unblock?`            |
+
+`{id}` is the account's numeric id or its email address (§14.4's id-or-name rule: exact email,
+then case-insensitive, and two case-insensitive matches are `invalid_input` with the candidates,
+never a guess).
+
+**Why these exist at all.** Upstream's only way to choose a password is a browser form, and there
+are exactly two of them: `/register`, which closes for good after the first account (§8.11's
+single-user mode), and `/password/reset`, which needs a mail server. An install whose first
+account was created by a setup script or an agent therefore has a password nobody knows and no
+terminal route to change it. These three are that route.
+
+**Why the bootstrap is the write tier.** `POST /admin/first-user` refuses `conflict` unless
+`User::count() === 0`, so the only thing it can ever do is what upstream's `/register` already
+does unauthenticated for whoever reaches the port first, on an install with no data. Putting it
+behind `FIREFLY_MACHINE_ALLOW_ADMIN` would mean editing `.env` before the app can be used at all.
+The other two are the admin tier, and so are refused to the MCP (§6.1): taking over the sign-in
+account that owns the books is not an agent's decision.
+
+**Why none of them binds an operator.** They run when nothing is configured: the bootstrap runs
+before any user exists, and `GET /admin/users` is how the operator is chosen (§4.9). A route that
+needed a bound operator could never be the route that makes one possible.
+
+**Why none of them has a dry run** (§7.2's named exception, with `/admin/key/rotate` and
+`/recurrences/{id}/trigger`). A password has no preview: the change set is one row, the preview
+and the write are the same sentence. `dry_run` and `confirm_token` are therefore *unknown
+arguments* on these routes (gate 5 refuses them, §5.7) rather than ignored ones — a caller who
+sends `dry_run: true` and got a silent success would believe a preview had run. The answer says
+`undoable: false`: no old hash is kept, so `/undo` has nothing to restore, and the operation log
+gets no row (§7.5).
+
+**What creating an account means.** `POST /admin/first-user` and `POST /admin/users` fire
+upstream's `NewUserRegistered` event rather than re-implementing it (R1), so a created account is
+byte-for-byte the shape the browser's own `/register` makes: the `owner` role on the first
+account, its own administration and the membership that goes with it, and the seeded exchange
+rates. The two notifications the event also sends are swallowed by upstream's `NotificationSender`
+when mail is not configured, so a mail problem can never lose an account that was already created.
+
+**Validation is upstream's** (`RequestInformation::validator()`): `email` is a valid address at
+most 255 characters, `password` is at least **16** characters — what `/register` and *Options →
+Profile* both demand, so a password set here is always one the browser would have accepted — and
+at most **72 bytes**, which is bcrypt's own limit and beyond which a passphrase's tail is silently
+ignored. Upstream's `secure_password` rule is deliberately not copied: it is named in upstream's
+validators but never registered with the validator, so it matches everything.
+
+**The secret never leaves the request (LOCKED).** The plaintext is validated, hashed and dropped.
+It is absent from the response, from the audit line (§16.4 records route, tier and outcome, never
+a body), and from the error file (whose redactor refuses any field name matching `/pass(word)?/`
+before a line is written). So is the bcrypt hash — a hash is a secret too (§16.2). Three separate
+assertions in `tests/Machine/Admin/SignInAccountsTest.php` hold each of those.
+
+**Answers.** Every one returns the account as `user` — `id`, `email`, `is_owner`, `blocked`,
+`blocked_code`, `has_mfa` (a boolean, never the secret), `administration_id`,
+`administration_title`, `created_at` — plus `sign_in` (the login URL), `notes`, and `next`: a
+sentence naming what `FIREFLY_MACHINE_OPERATOR` must become, or `null` when nothing needs doing.
+Creating an account never changes which user the clients act as; that is configuration (§4.9), and
+saying so in the answer is cheaper than the `not_ready` the next call would otherwise return.
+
+`clear_mfa` and `unblock` default to false and are reported rather than assumed: when the account
+has MFA on, or is blocked, and the caller did not ask, the answer's `notes` say that the new
+password will not sign in on its own — because it will not.
+
+Handles: creating sign-in accounts and replacing their passwords.
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/SignIn/SignInUsers.php` — `create()`, `setPassword()`, `require()`, `describe()`, `operatorAdvice()`, `const PASSWORD_RULES`
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Http/Controllers/AdminController.php` — `createFirstUser()`, `createUser()`, `setUserPassword()`, `users()`
+Code: `~/BGit/Bryan_git/firefly-iii/app/Machine/Routes/AdminRoutes.php` — the four `RouteDef`s
+Code: `~/BGit/Bryan_git/firefly-iii/app/Listeners/Security/System/HandlesNewUserRegistration.php` — upstream's listener: `attachUserRole()`, `createGroupMembership()`
 
 ### 8.12 The mirror — upstream's reads, on day one
 
@@ -2206,6 +2292,11 @@ There is a **canary test** that calls every route in `/capabilities` against a f
 greps every response for the key pattern, for `secret`, `password`, `token` (outside
 `confirm_token`), `APP_KEY`, `/Users/`, and `Illuminate\`.
 
+The three routes of §8.11a are the only ones that *receive* a password, and they are held to the
+same rule in the other direction: the plaintext is validated, hashed and dropped, so it is in no
+response, no audit line and no error-file record, and neither is the resulting bcrypt hash. An
+account's MFA state is published as the boolean `has_mfa`, never as the secret.
+
 ### 16.3 Prompt-injection posture
 
 A description, a note, an account name, a tag and a statement line are **operator-supplied data
@@ -2383,6 +2474,7 @@ The plane is done when all of these hold:
 | **P9**  | `raw` ingest mode (PDF extraction, both de-dupe layers, staging)                                                                               | P4         |
 | **P10** | admin tier, batch, NDJSON progress, the audit trail, the full canary suite                                                                     | P3         |
 | **P11** | a Docker-compatible transport (Unix socket), and the charting routes beyond parity with the UI                                                 | P7         |
+| **P12** | sign-in accounts (§8.11a): the first-user bootstrap, further accounts, and setting a password — plus `ffx admin …` (cli.mdx §13)               | P10        |
 
 P2 and P7 are what make the MCP genuinely useful; P4 and P5 are what make the _first evening_ useful.
 Build in that order and the thing is valuable before it is complete.

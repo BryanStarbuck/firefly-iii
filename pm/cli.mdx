@@ -49,6 +49,7 @@ description: >
 - [10. The statements pipeline — `ffx statements`](#10-the-statements-pipeline--ffx-statements)
 - [11. The write verbs](#11-the-write-verbs)
 - [12. The operational verbs](#12-the-operational-verbs)
+  - [12.4 `ffx admin` — the sign-in accounts](#124-ffx-admin--the-sign-in-accounts)
 - [13. Output contracts](#13-output-contracts)
 - [14. Exit codes](#14-exit-codes)
 - [15. Progress, logging, and what a failure leaves behind](#15-progress-logging-and-what-a-failure-leaves-behind)
@@ -528,6 +529,10 @@ ORIENTATION
   ffx up | stop                         bring the app up / take it down (§3.3)
   ffx logs [--follow] [--lines N] [--errors | --laravel | --cli]
   ffx key init | show | rotate --yes    the machine key (§4)
+  ffx admin users                       every sign-in account of this install (§12.4)
+  ffx admin create-first-user --email E   the bootstrap, on an install with no accounts (§12.4)
+  ffx admin create-user --email E [--owner]
+  ffx admin set-password --email E [--clear-mfa] [--unblock]   the way back in (§12.4)
   ffx whoami                            operator, administration, primary currency, tiers
   ffx capabilities [--planned]          what this server build can do
   ffx help [verb] | install-path
@@ -982,6 +987,70 @@ Tails `~/T/_firefly_iii/server.log` by default. `--errors` tails the fault trail
 `created_by`, `label` — **never the key**), `rotate --yes` (mint a new one, merge-write, print the
 new fingerprint).
 
+### 12.4 `ffx admin` — the sign-in accounts
+
+The row in the `users` table that logs into the web UI, not a ledger account. `ffx accounts` is
+checking and savings; `ffx admin` is who can sign in. The whole rationale is **accounts.mdx §4.3**
+and the wire contract is **apis.mdx §8.11a**; this is the CLI surface.
+
+```
+ffx admin users                                              GET  /admin/users
+ffx admin create-first-user --email E                 --write POST /admin/first-user
+ffx admin create-user       --email E [--owner]       --write POST /admin/users
+ffx admin set-password      --email E|--id N
+                            [--clear-mfa] [--unblock] --write POST /admin/users/{id}/password
+```
+
+**Why these exist.** Upstream chooses a password in a browser and nowhere else: at `/register`,
+which closes for good after the first account, and at `/password/reset`, which needs a mail
+server. An install whose first account was made by a setup script or an agent therefore has a
+password nobody knows and no terminal way in. `ffx admin set-password` is that way in, and it
+needs nothing but the machine key that is already on this disk.
+
+**Where the password comes from**, in order (`readPassword()`):
+
+| Source                       | When                                             | Why in this order                                    |
+| ---------------------------- | ------------------------------------------------ | ----------------------------------------------------- |
+| `--password-stdin`           | a pipe or a file, up to the first newline        | a script's right answer; nothing in argv              |
+| the prompt, asked twice      | a terminal, and no password flag                 | a person's right answer; echoes nothing, refuses a mismatch |
+| `--password X`               | explicitly asked for                             | works, and **warns**: argv is world-readable on this machine and the line lands in the shell history |
+| nothing, and no terminal     | —                                                | refuses with the `--password-stdin` recipe rather than hanging on a read |
+
+`ffx` checks the length itself (at least 16, at most 72 bytes) before any call, so a too-short
+passphrase costs a round trip and not a plane error — but the server validates it again, because
+the server is the contract (§5.4 stays intact: `ffx` re-states a documented server rule to fail
+early, it does not invent one).
+
+**`--write` is the confirmation, and there is no token.** These three routes have no dry run
+(apis.mdx §7.2): a password has no preview. So the usual two-step (§11.1) does not apply, and
+`ffx help` says so per verb rather than printing the generic "apply with `--token`" blurb that
+would be a lie here. Without `--write` each verb prints what it would do, the command to do it,
+and exits `0` having changed nothing — and, importantly, **never asks for the password at all**,
+so a dry run cannot leave a passphrase in a scrollback.
+
+**What `ffx` prints afterwards** is the account (id, email, owner, blocked, `has_mfa`,
+administration), the login URL, the server's notes, and a `NEXT:` line when
+`FIREFLY_MACHINE_OPERATOR` needs to change for `ffx` and the MCP to act as this account. It never
+prints the password or the hash — neither is in the answer to print (apis.mdx §16.2).
+
+**`ffx admin users` is the one to run first when you are lost**: it lists blocked accounts too, and
+it answers on an install with two accounts and no configured operator — the exact situation in
+which `ffx whoami` refuses, and the reason you needed the list.
+
+**The tiers, and the one asymmetry.** `create-first-user` is the write tier, because it refuses
+unless the install has no accounts at all; the other three are the admin tier and need
+`FIREFLY_MACHINE_ALLOW_ADMIN=1` in the app's `.env` plus `ffx stop && ffx up`. When it is off, the
+plane's refusal already names the variable and the restart, and `ffx` prints it (R6).
+
+**The MCP has none of this.** The admin tier is refused to it by the server (apis.mdx §6.1), and
+mcp.mdx §9 lists no `ff_` tool for these routes. Taking over the sign-in account that owns the
+books is a thing a person does in a terminal.
+
+Handles: the four sign-in-account verbs, the password sources, and the per-verb write note.
+Code: `~/BGit/Bryan_git/firefly-iii/cli/code/src/commands/accounts.ts` — `signInVerbs`, `readPassword()`, `promptTwice()`, `accountOutcome()`
+Code: `~/BGit/Bryan_git/firefly-iii/cli/code/src/verbs.ts` — `VerbDef.writeNote`
+Code: `~/BGit/Bryan_git/firefly-iii/cli/code/src/help.ts` — `verbHelp()` prefers `writeNote`
+
 ---
 
 ## 13. Output contracts
@@ -1110,6 +1179,7 @@ integration run against a real `php artisan serve` when PHP is present.
 | **Money**                | amounts pass through `json`/`csv` byte-identical; `table` adds separators without changing digits; negative and malformed `--amount` refused; the `dist/` canary for `parseFloat`/`Number(`/`toFixed` |
 | **Absent ≠ zero**        | a `null` limit renders `—` in table, empty in CSV, `null` in JSON                                                                     |
 | **Write protocol**       | no `--write` → dry run only; `--write` without token when piped → exit 2 naming the token; stale token → exit 4                      |
+| **Sign-in accounts**     | a dry run never reaches the plane and never prompts; `--password-stdin` strips only the trailing newline and sends `password` alone, with no `dry_run`/`confirm_token`; `--password` warns about argv; too short / over 72 bytes is refused before any call; no password and no terminal → exit 2 with the stdin recipe; `--email` and `--id` together → exit 2; `ffx admin users` renders blocked accounts; `ffx help admin set-password` shows the admin note and NOT the token blurb; no answer echoes the password |
 | **Dates**                | every relative word resolves correctly on month and year boundaries and is echoed                                                     |
 | **stdout purity**        | greps the built `dist/` for `console.log(` and `process.stdout.write(` outside `render.ts`                                            |
 | **Bring-up**             | foreign holder refusal; missing php/vendor refusals; pid file written; `stop` never kills a pid it did not record                     |
@@ -1156,6 +1226,19 @@ no prompt, non-zero exit on anything but success.
 **UC-10 — An agent asks the same question.** Claude Code uses the MCP server, which reads the same
 key and calls the same routes. The answers are identical because the engine is.
 
+**UC-11 — Locked out of the browser.** The install was set up by a script, so the login page shows
+an email nobody chose a password for, there is no Register link and no mail server. `ffx admin
+users` names the account (it answers even with no operator resolved). `FIREFLY_MACHINE_ALLOW_ADMIN=1`
+goes into the app's `.env`, `ffx stop && ffx up`, then `ffx admin set-password --email … --write`
+asks twice, echoes nothing, and prints the login URL. The browser signs in on the next try and the
+ledger is untouched. **This is the case §12.4 exists for.**
+
+**UC-12 — A brand-new install, without a browser.** Zero users. `ffx admin create-first-user
+--email you@example.com --write` creates the owner, the administration and the membership in one
+call — the write tier only, because an install with no accounts has nothing to protect — and
+`ffx whoami` then resolves that account as the operator without any `.env` change, because it is
+the only one.
+
 ---
 
 ## 20. Acceptance criteria
@@ -1175,6 +1258,18 @@ key and calls the same routes. The answers are identical because the engine is.
 11. Every flag in §6 is declared on its verb; `ffx help <verb>` lists exactly the declared flags.
 12. The §17 canaries pass; `cli/package.json` is private.
 13. `just build` leaves `cli/code/dist/` newer than every source file.
+14. `ffx admin set-password --email …` without `--write` prints the plan, never asks for a
+    password, and changes nothing; with `--write` and no `--password` it asks twice, echoes
+    nothing, and refuses a mismatch without calling the plane.
+15. `--password X` works and prints the argv warning on stderr; `--password-stdin` reads a piped
+    password; with neither and no terminal, the verb refuses with the `--password-stdin` recipe
+    instead of blocking on a read.
+16. A password shorter than 16 characters or longer than 72 bytes is refused by `ffx` before any
+    call, with the same limits the server states.
+17. `ffx help admin set-password` shows the admin-tier note and does NOT show the generic
+    "apply with --token" blurb — there is no token on these routes.
+18. `ffx admin users` prints a table including blocked accounts, on an install where
+    `ffx whoami` refuses for want of a configured operator.
 
 ---
 
@@ -1190,6 +1285,7 @@ key and calls the same routes. The answers are identical because the engine is.
 | **P6 — statements, read**      | roots, manifest, scan, missing, dupes, map, extract, plans                                          | AC 10           |
 | **P7 — the write protocol**    | dry-run/token flow, every §11 verb, statements apply, undo                                          | AC 7, 8, 9      |
 | **P8 — hardening**             | every canary, integration against a real app                                                        | AC 12, 13       |
+| **P9 — sign-in accounts**      | §12.4: `ffx admin users / create-first-user / create-user / set-password`, `VerbDef.writeNote`      | AC 14–18        |
 
 The CLI can be built ahead of the plane: every route it calls is in apis.mdx, and the fake plane in
 the test suite speaks that contract. Verbs whose route the server publishes as `planned` print the

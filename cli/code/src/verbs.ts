@@ -76,6 +76,12 @@ export interface VerbDef {
   flags?: Readonly<Record<string, FlagDef>>;
   /** This verb changes the ledger (dry run unless --write). */
   writes?: boolean;
+  /**
+   * Replaces the generic write blurb in `ffx help <verb>`. For the writes that have no dry run
+   * and so no confirm token (the sign-in account verbs): --write does it, and there is nothing
+   * to hold a token over (pm/cli.mdx §13).
+   */
+  writeNote?: readonly string[];
   examples?: readonly string[];
   run(ctx: Ctx): Promise<Outcome>;
 }

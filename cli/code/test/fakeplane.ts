@@ -127,6 +127,29 @@ function defaultRoutes(): Map<string, (call: RecordedCall) => [number, unknown]>
       ],
     }),
   );
+  // Sign-in accounts (apis.mdx §8.11a): no dry run, no confirm token — the shape matters.
+  r.set('GET /admin/users', () =>
+    ok({
+      users: [
+        { id: 1, email: 'ops@local', is_owner: true, is_operator: true, blocked: false, blocked_code: null, has_mfa: false, administration_id: 1, created_at: '2026-01-01T00:00:00Z' },
+        { id: 2, email: 'locked@local', is_owner: false, is_operator: false, blocked: true, blocked_code: 'email_changed', has_mfa: true, administration_id: 2, created_at: '2026-02-01T00:00:00Z' },
+      ],
+      operator_setting: 'FIREFLY_MACHINE_OPERATOR',
+    }),
+  );
+  const account = (extra: Record<string, unknown>) => (call: RecordedCall): [number, unknown] => {
+    const body = (call.body ?? {}) as Record<string, unknown>;
+    return ok({
+      user: { id: 1, email: body.email ?? 'ops@local', is_owner: true, blocked: false, blocked_code: null, has_mfa: false, administration_id: 1, administration_title: 'Household', created_at: '2026-01-01T00:00:00Z' },
+      sign_in: 'http://127.0.0.1:7373/login',
+      next: null,
+      ...extra,
+    });
+  };
+  r.set('POST /admin/first-user', account({ created: true, note: 'This account is the owner of the install.' }));
+  r.set('POST /admin/users', account({ created: true }));
+  r.set('POST /admin/users/ops@local/password', account({ password_set: true, undoable: false, notes: ['The old password stopped working now.'] }));
+  r.set('POST /admin/users/1/password', account({ password_set: true, undoable: false, notes: ['The old password stopped working now.'] }));
   r.set('POST /transactions', writeRoute({ created: 1 }));
   r.set('POST /transactions/categorize', writeRoute({ updated: 46 }));
   r.set('PUT /budgets/Groceries/limits', writeRoute({ updated: 1 }, { limits: [{ name: 'Groceries', start: '2026-10-01', end: '2026-10-31', currency_code: 'USD', previous: null, amount: '650.00' }] }));

@@ -762,7 +762,7 @@ action — its description says all three.
 | `ff_create_account` standalone                         | Accounts come from a manifest plan so the asset/liability decision is always explicit and reviewed          |
 | Switching administrations                              | It changes which books every other tool answers about; it is configuration (apis.mdx §4.9)                  |
 | Webhooks create/edit                                   | A webhook is data egress to a URL; admin tier                                                               |
-| Passwords, 2FA, OAuth clients, tokens, users           | Credentials and identity are human acts                                                                     |
+| Passwords, 2FA, OAuth clients, tokens, users           | Credentials and identity are human acts. The plane grew routes for exactly this in apis.mdx §8.11a — creating a sign-in account and setting its password — and they are admin-tier **and** refused outright when the caller says `X-Firefly-Client: mcp`, which this server always does. They belong to `ffx admin …` (cli.mdx §12.4). An agent that can change the sign-in password of the books it is reading can lock its operator out of them; no tool here ever will |
 | Purge, destroy, correct-database, cron, key rotation   | Admin tier, not reachable from here by construction                                                         |
 | Anything that re-imports a deleted transaction         | Deleted stays deleted (§11.3)                                                                               |
 

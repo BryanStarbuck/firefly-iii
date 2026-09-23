@@ -14,7 +14,9 @@
     please visit the following page: https://bit.ly/FF3-broken-base-href
     -->
     <base href="{{ route('index', null, true) }}/">
-    <title>{{ __('firefly.login_page_title')  }}</title>
+    {{-- fork: the page's own title when it has one (Register said "Login" otherwise), and the
+         product name after it, so the browser tab and the history entry both name the app. --}}
+    <title>{{ $pageTitle ?? __('firefly.login_page_title') }} &middot; Firefly III</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes"/>
     <meta name="theme-color" content="#007bff" media="(prefers-color-scheme: light)"/>
     <meta name="theme-color" content="#1a1a1a" media="(prefers-color-scheme: dark)"/>
@@ -30,11 +32,14 @@
 </head>
 <body class="login-page bg-body-secondary">
 <div class="login-box">
+    {{-- fork: upstream shows this block only on the demo site, which leaves a real install's
+         sign-in page with no product name on it at all. The name belongs above the card, where
+         the person looking at the page reads it first. --}}
     <div class="login-logo">
-        @if(true=== ($IS_DEMO_SITE ?? false))
-            <img src="images/logo-session.png" width="68" height="100" alt="Logo" title="Logo"/><br>
-            <a href="{{ route('index', null, true) }}"><strong>Firefly</strong> III</a>
-        @endif
+        <a href="{{ route('index', null, true) }}">
+            <img src="images/logo-session.png" width="41" height="60" alt="Firefly III" title="Firefly III"/><br>
+            <strong>Firefly</strong> III
+        </a>
     </div>
     @yield('content')
 </div>

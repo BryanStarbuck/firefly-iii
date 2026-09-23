@@ -11,6 +11,7 @@ const GROUP_ORDER = [
   'Analytics, charts and reports',
   'The statements pipeline',
   'Writing (dry run unless --write)',
+  'Sign-in accounts (dry run unless --write)',
 ];
 
 function argSpec(def: FlagDef): string {
@@ -69,7 +70,9 @@ function flagLines(flags: Readonly<Record<string, FlagDef>>): string[] {
 
 export function verbHelp(v: VerbDef): string {
   const lines = [`usage: ${usageLine(v)} [flags]`, '', v.summary];
-  if (v.writes) {
+  if (v.writeNote) {
+    lines.push('', ...v.writeNote);
+  } else if (v.writes) {
     lines.push('', 'WRITES to the ledger. Without --write this is a dry run that prints the plan and a confirm token;',
       'apply with --write --token <token>. The server\'s write tier must also be on (FIREFLY_MACHINE_ALLOW_WRITE=1).');
   }

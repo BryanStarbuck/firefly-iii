@@ -329,3 +329,96 @@ describe('local verbs', () => {
     assert.equal(fs.statSync(path.join(sb.stateDir, 'cli.info')).mode & 0o777, 0o600);
   });
 });
+
+describe('sign-in accounts — ffx admin (cli.mdx §12.4)', () => {
+  it('a dry run prints the plan, never asks for a password, and calls nothing', async () => {
+    const before = plane.calls.length;
+    const r = await runCli(['admin', 'set-password', '--email', 'ops@local'], env());
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /Would replace the password of sign-in account ops@local/);
+    assert.match(r.stdout, /cannot be undone/);
+    assert.match(r.stdout, /ffx admin set-password --email ops@local --write/);
+    assert.equal(plane.calls.length, before, 'a dry run must not reach the plane at all');
+    assert.doesNotMatch(r.stderr, /New password/);
+  });
+
+  it('--password-stdin sends the piped password and nothing else', async () => {
+    const r = await runCli(['admin', 'set-password', '--email', 'ops@local', '--password-stdin', '--write'], env(), 'a-long-enough-passphrase\n');
+    assert.equal(r.code, 0, r.stderr);
+    const call = plane.calls.at(-1);
+    assert.equal(call?.method, 'POST');
+    assert.equal(call?.path, '/admin/users/ops%40local/password');
+    const body = call?.body as Record<string, unknown>;
+    assert.deepEqual(Object.keys(body).sort(), ['password']);
+    assert.equal(body.password, 'a-long-enough-passphrase', 'the trailing newline is stripped, nothing else');
+    // No dry_run / confirm_token: these routes have none (apis.mdx §7.2).
+    assert.equal(body.dry_run, undefined);
+    assert.equal(body.confirm_token, undefined);
+  });
+
+  it('--clear-mfa and --unblock travel only when asked', async () => {
+    await runCli(['admin', 'set-password', '--id', '1', '--clear-mfa', '--unblock', '--password-stdin', '--write'], env(), 'a-long-enough-passphrase');
+    const body = plane.calls.at(-1)?.body as Record<string, unknown>;
+    assert.equal(plane.calls.at(-1)?.path, '/admin/users/1/password');
+    assert.equal(body.clear_mfa, true);
+    assert.equal(body.unblock, true);
+  });
+
+  it('--password works and warns that argv is readable', async () => {
+    const r = await runCli(['admin', 'create-user', '--email', 'second@example.com', '--password', 'a-long-enough-passphrase', '--write'], env());
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stderr, /--password puts the password in argv/);
+    assert.equal((plane.calls.at(-1)?.body as Record<string, unknown>).email, 'second@example.com');
+  });
+
+  it('refuses a too-short and an over-long password before any call', async () => {
+    const before = plane.calls.length;
+    const short = await runCli(['admin', 'set-password', '--email', 'ops@local', '--password-stdin', '--write'], env(), 'short');
+    assert.equal(short.code, 2);
+    assert.match(short.stderr, /at least 16/);
+    const long = await runCli(['admin', 'set-password', '--email', 'ops@local', '--password-stdin', '--write'], env(), 'x'.repeat(73));
+    assert.equal(long.code, 2);
+    assert.match(long.stderr, /72 bytes/);
+    assert.equal(plane.calls.length, before, 'neither may reach the plane');
+  });
+
+  it('--write with no password and no terminal refuses with the stdin recipe', async () => {
+    const r = await runCli(['admin', 'set-password', '--email', 'ops@local', '--write'], env(), '');
+    assert.equal(r.code, 2);
+    assert.match(r.stderr, /no terminal to ask at/);
+    assert.match(r.stderr, /--password-stdin/);
+  });
+
+  it('refuses something that is not an email, and refuses naming an account twice', async () => {
+    const notEmail = await runCli(['admin', 'set-password', '--email', 'not-an-email', '--write'], env());
+    assert.equal(notEmail.code, 2);
+    assert.match(notEmail.stderr, /signs in by email, not by username/);
+    const both = await runCli(['admin', 'set-password', '--email', 'ops@local', '--id', '1', '--write'], env());
+    assert.equal(both.code, 2);
+    assert.match(both.stderr, /either --email or --id/);
+  });
+
+  it('lists accounts as a table, blocked ones included', async () => {
+    const r = await runCli(['admin', 'users', '--format', 'table'], env());
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /locked@local/);
+    assert.match(r.stdout, /email_changed/);
+    assert.match(r.stderr, /FIREFLY_MACHINE_OPERATOR/);
+  });
+
+  it('help says admin tier and never promises a confirm token', async () => {
+    const r = await runCli(['help', 'admin', 'set-password'], env());
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /ADMIN TIER/);
+    assert.match(r.stdout, /no dry run and no confirm token/);
+    assert.doesNotMatch(r.stdout, /apply with --write --token/);
+  });
+
+  it('the applied answer shows the account and the login URL, never a secret', async () => {
+    const r = await runCli(['admin', 'set-password', '--email', 'ops@local', '--password-stdin', '--write', '--format', 'table'], env(), 'a-long-enough-passphrase');
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /ops@local/);
+    assert.match(r.stderr, /sign in at http:\/\/127\.0\.0\.1:7373\/login/);
+    assert.doesNotMatch(r.stdout + r.stderr, /a-long-enough-passphrase/);
+  });
+});

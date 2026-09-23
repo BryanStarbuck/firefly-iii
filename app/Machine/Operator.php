@@ -162,7 +162,7 @@ final class Operator
         if (0 === $count) {
             throw MachineException::notReady(
                 'This Firefly III install has no users yet.',
-                'Register the first user in the web UI (http://127.0.0.1:7373/register), then retry',
+                'Create it from the terminal — `ffx admin create-first-user --email you@example.com` (POST /machine/v1/admin/first-user) — or register it in the web UI, then retry',
                 ['users' => 0, 'candidates' => []],
             );
         }

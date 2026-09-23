@@ -114,10 +114,14 @@ final class OperatorTest extends MachineTestCase
         $this->assertSame('someone-elses-books', $env['meta']['administrationName']);
     }
 
-    public function testNoUsersAtAllSaysRegisterFirst(): void
+    public function testNoUsersAtAllNamesBothWaysToMakeTheFirstAccount(): void
     {
         $env = $this->assertPlaneError($this->machine('GET', '/_probe/auth'), 503, 'not_ready');
-        $this->assertStringContainsString('Register', $env['error']['hint']);
+        // The hint has to name the terminal route, because the person reading it is in a terminal
+        // (accounts.mdx §4.3), and the browser, because that still works.
+        $this->assertStringContainsString('ffx admin create-first-user', $env['error']['hint']);
+        $this->assertStringContainsString('/admin/first-user', $env['error']['hint']);
+        $this->assertStringContainsString('web UI', $env['error']['hint']);
     }
 
     private function otherUser(string $email): User

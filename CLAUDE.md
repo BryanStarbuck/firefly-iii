@@ -87,10 +87,29 @@ Claude Code, so this fork grows:
 5. **More analytics, and eventually more charting**, than upstream ships. Every total and every chart
    series is a machine-plane route first (`pm/apis.mdx` §10), so the browser, the CLI and the MCP can
    never disagree about a number.
+6. **A terminal way in and out of the sign-in account.** Upstream only ever chooses a password in a
+   browser: at `/register`, which closes for good after the first account, and at `/password/reset`,
+   which needs a mail server. So an install set up by a script has a password nobody knows and no
+   way to change it. The plane adds `POST /admin/first-user` (write tier, refuses once any account
+   exists), `POST /admin/users` and `POST /admin/users/{id}/password` (admin tier, never the MCP),
+   driven by `ffx admin create-first-user / create-user / set-password / users`. The plaintext is
+   hashed and dropped — never in an answer, the audit line or the error file.
+   Spec: `pm/accounts.mdx` §4.3 (the why), `pm/apis.mdx` §8.11a (the wire), `pm/cli.mdx` §12.4.
+   Code: `app/Machine/SignIn/SignInUsers.php`, `cli/code/src/commands/accounts.ts`.
 
-Upstream's `/api/v1`, web UI and Passport auth stay **untouched**. The upstream delta for the plane is
+Upstream's `/api/v1` and Passport auth stay **untouched**. The upstream delta for the plane is
 meant to be one line in `bootstrap/providers.php` plus new files (`app/Machine/`, `routes/machine.php`,
 one migration). Keep it that way so upstream merges stay trivial.
+
+The whole upstream delta today, and it should stay this short — `git diff --diff-filter=M <fork-point>..HEAD`:
+
+| File                                            | Change                                                                  |
+| ----------------------------------------------- | ----------------------------------------------------------------------- |
+| `bootstrap/providers.php`                       | one line: `MachinePlaneServiceProvider`                                 |
+| `.gitignore`                                    | `.phpunit.cache/`                                                       |
+| `resources/assets/v3/js/boot/bootstrap.js`      | one import: the browser error net (`pm/error_err.mdx`)                  |
+| `resources/assets/v3/js/boot/blank-bootstrap.js`| the same import for the auth/install layout                             |
+| `resources/views/layout/v3/auth.blade.php`      | the sign-in page shows the product name above the card on every install, not only on the demo site; the tab title is the page's own plus "Firefly III" |
 
 Where specs disagree: `pm/apis.mdx` is the contract and wins on anything about the wire;
 `pm/cli.mdx` and `pm/mcp.mdx` win on their own surfaces. `pm/` holds specs only, never code.
